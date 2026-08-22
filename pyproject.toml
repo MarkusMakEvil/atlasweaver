@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "atlasweaver"
+version = "0.1.0"
+description = "Privacy-safe code knowledge graphs with transactional Obsidian projections"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+authors = [{ name = "MarkusMakEvil" }]
+dependencies = ["PyYAML>=6.0,<7", "pathspec>=0.12,<1"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Topic :: Software Development :: Documentation",
+]
+
+[project.urls]
+Homepage = "https://github.com/MarkusMakEvil/atlasweaver"
+Repository = "https://github.com/MarkusMakEvil/atlasweaver"
+Issues = "https://github.com/MarkusMakEvil/atlasweaver/issues"
+
+[project.scripts]
+project-knowledge = "project_knowledge.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/project_knowledge"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[dependency-groups]
+dev = ["pytest>=8,<10"]

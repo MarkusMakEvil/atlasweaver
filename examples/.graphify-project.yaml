@@ -1,0 +1,11 @@
+schema_version: 1
+project_id: demo-project
+display_name: Demo Project
+include_roots:
+  - src
+  - docs
+output_dir: graphify-out
+obsidian_namespace: Projects/demo-project/Generated
+excludes: []
+track_html: false
+graphify_version: 0.9.48

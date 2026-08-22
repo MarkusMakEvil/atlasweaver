@@ -1,0 +1,7 @@
+interface:
+  display_name: "Project Knowledge Graphs"
+  short_description: "Navigate repositories with Graphify and Obsidian"
+  default_prompt: "Use $using-project-knowledge-graphs to inspect this repository's architecture safely."
+
+policy:
+  allow_implicit_invocation: true
