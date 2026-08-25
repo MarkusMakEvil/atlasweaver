@@ -34,4 +34,7 @@ packages = ["src/project_knowledge"]
 testpaths = ["tests"]
 
 [dependency-groups]
-dev = ["pytest>=8,<10"]
+dev = [
+  "pytest>=8,<10",
+  "tomli>=2,<3; python_version < '3.11'",
+]

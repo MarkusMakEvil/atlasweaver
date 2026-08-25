@@ -13,7 +13,6 @@ from pathlib import Path, PurePosixPath
 import posixpath
 import re
 import secrets
-import shutil
 import stat
 import tempfile
 import unicodedata
@@ -179,7 +178,51 @@ class AtlasFileSystem:
         info = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
             raise AtlasOwnershipError("transaction directory must not be a symlink")
-        shutil.rmtree(name, dir_fd=parent_descriptor)
+        descriptor = _open_directory_at(parent_descriptor, name)
+        try:
+            if _directory_identity_from_stat(os.fstat(descriptor)) != (
+                _directory_identity_from_stat(info)
+            ):
+                raise AtlasOwnershipError("transaction directory changed during removal")
+            _remove_tree_contents(descriptor)
+            current = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+            if _directory_identity_from_stat(current) != _directory_identity_from_stat(
+                os.fstat(descriptor)
+            ):
+                raise AtlasOwnershipError("transaction directory changed during removal")
+        finally:
+            os.close(descriptor)
+        os.rmdir(name, dir_fd=parent_descriptor)
+
+
+def _remove_tree_contents(descriptor: int) -> None:
+    """Remove one opened tree without relying on Python 3.11's rmtree dir_fd."""
+    with os.scandir(os.dup(descriptor)) as entries:
+        names = sorted(entry.name for entry in entries)
+    for name in names:
+        info = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+            child = _open_directory_at(descriptor, name)
+            try:
+                if _directory_identity_from_stat(os.fstat(child)) != (
+                    _directory_identity_from_stat(info)
+                ):
+                    raise AtlasOwnershipError(
+                        "transaction directory changed during removal"
+                    )
+                _remove_tree_contents(child)
+                current = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+                if _directory_identity_from_stat(current) != (
+                    _directory_identity_from_stat(os.fstat(child))
+                ):
+                    raise AtlasOwnershipError(
+                        "transaction directory changed during removal"
+                    )
+            finally:
+                os.close(child)
+            os.rmdir(name, dir_fd=descriptor)
+        else:
+            os.unlink(name, dir_fd=descriptor)
 
 REAL_ATLAS_FS = AtlasFileSystem()
 
