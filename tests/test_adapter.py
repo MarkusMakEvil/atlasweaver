@@ -127,6 +127,67 @@ def test_adapter_includes_html_only_when_manifest_tracks_it(tmp_path: Path) -> N
     assert (tmp_path / "adapted/graph.html").is_file()
 
 
+def test_adapter_removes_graphify_empty_source_path_sentinels(tmp_path: Path) -> None:
+    source = raw_candidate(
+        tmp_path / "raw",
+        nodes=[
+            {
+                "id": "function:run",
+                "source_file": "src/app.py",
+                "provenance": "EXTRACTED",
+            },
+            {
+                "id": "external:any",
+                "source_file": "",
+                "source_location": "",
+                "provenance": "EXTRACTED",
+            },
+        ],
+    )
+    stage = staged(tmp_path)
+    destination = tmp_path / "adapted"
+
+    adapt_candidate(source, destination, stage, manifest())
+
+    document = json.loads((destination / "graph.json").read_text(encoding="utf-8"))
+    external = next(node for node in document["nodes"] if node["id"] == "external:any")
+    assert "source_file" not in external
+    validate_candidate(destination, stage, manifest())
+
+
+def test_adapter_canonicalizes_graphify_node_source_aliases(tmp_path: Path) -> None:
+    stage = staged(tmp_path)
+    module_path = PurePosixPath("src/project_knowledge/__init__.py")
+    module = stage.root / module_path
+    module.parent.mkdir(parents=True)
+    module.write_text("\n", encoding="utf-8")
+    stage = StagedInput(
+        root=stage.root,
+        source_digest=stage.source_digest,
+        files=(*stage.files, module_path),
+    )
+    source = raw_candidate(
+        tmp_path / "raw",
+        nodes=[
+            {
+                "id": "module:project_knowledge",
+                "label": "project_knowledge/__init__.py",
+                "norm_label": "project_knowledge/__init__.py",
+                "source_file": module_path.as_posix(),
+                "provenance": "EXTRACTED",
+            }
+        ],
+    )
+    destination = tmp_path / "adapted"
+
+    adapt_candidate(source, destination, stage, manifest())
+
+    document = json.loads((destination / "graph.json").read_text(encoding="utf-8"))
+    assert document["nodes"][0]["label"] == module_path.as_posix()
+    assert document["nodes"][0]["norm_label"] == module_path.as_posix()
+    validate_candidate(destination, stage, manifest())
+
+
 @pytest.mark.parametrize("field", ["project_id", "graphify_version", "source_digest", "extraction_coverage"])
 def test_adapter_rejects_pre_enriched_identity(tmp_path: Path, field: str) -> None:
     source = raw_candidate(tmp_path / "raw", **{field: "forged"})

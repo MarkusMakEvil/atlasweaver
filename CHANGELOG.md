@@ -4,6 +4,11 @@ All notable changes to AtlasWeaver are documented here.
 
 ## Unreleased
 
+## 0.2.2 - 2026-08-25
+
+- Normalized Graphify's empty source-path sentinels and package-relative module
+  aliases before strict candidate validation.
+
 ## 0.2.1 - 2026-08-25
 
 - Added `**/*creds*` to the immutable filename deny set as a defensive layer

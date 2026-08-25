@@ -75,13 +75,16 @@ def adapt_candidate(
         document = _load_json(graph_payload)
         _reject_existing_wrapper_metadata(document)
         nodes, edges = _native_shape(document)
+        _remove_empty_path_sentinels(nodes, edges)
         try:
             graph_health = analyze_graph(nodes, edges)
         except IntegrityError as error:
             raise AdapterError("raw graph integrity is invalid") from error
         if graph_health.dangling_edges or graph_health.missing_endpoints:
             raise AdapterError("raw graph has invalid edge endpoints")
-        represented = _represented_paths(nodes, edges, frozenset(staged.files))
+        staged_files = frozenset(staged.files)
+        represented = _represented_paths(nodes, edges, staged_files)
+        _canonicalize_node_source_aliases(nodes, staged_files)
         skipped = [
             {
                 "path": path.as_posix(),
@@ -226,6 +229,47 @@ def _represented_paths(
     for edge_value in edges:
         collect(edge_value, edge=True)
     return represented
+
+
+def _remove_empty_path_sentinels(
+    nodes: list[dict[str, Any]], edges: list[dict[str, Any]]
+) -> None:
+    def clean(value: Any, *, edge: bool = False) -> None:
+        if isinstance(value, dict):
+            for key in tuple(value):
+                item = value[key]
+                if (
+                    key in _PATH_FIELDS
+                    and not (edge and key in {"source", "target"})
+                    and item == ""
+                ):
+                    del value[key]
+                else:
+                    clean(item)
+        elif isinstance(value, list):
+            for item in value:
+                clean(item)
+
+    for node in nodes:
+        clean(node)
+    for edge_value in edges:
+        clean(edge_value, edge=True)
+
+
+def _canonicalize_node_source_aliases(
+    nodes: list[dict[str, Any]], staged_files: frozenset[PurePosixPath]
+) -> None:
+    for node in nodes:
+        source = node.get("source_file")
+        if (
+            not isinstance(source, str)
+            or PurePosixPath(source) not in staged_files
+        ):
+            continue
+        for key in ("label", "norm_label"):
+            alias = node.get(key)
+            if isinstance(alias, str) and "/" in alias and source.endswith("/" + alias):
+                node[key] = source
 
 
 def _source_path(value: str) -> PurePosixPath:
