@@ -15,9 +15,18 @@ Use the project graph as a privacy-safe navigation layer, not as automatic proof
 
 Read-only detect, query, and health checks are allowed within the task. Begin any proposed bootstrap or refresh with read-only `project-knowledge preflight`; the reference supplies its full invocation. Bootstrap, staging, refresh, export, atlas promotion, registry changes, hooks, instruction edits, and generated-file commits require exact approval for that mutation and destination. Never commit or push implicitly.
 
+Use `project-knowledge scan-secrets` before an approved stage. Its findings are
+redacted fingerprints. High-confidence structured credentials are
+non-bypassable; only an exact reviewed contextual false positive may be
+excepted. Never request or print the matching source literal.
+
 ## Evidence and freshness
 
 Label decisive claims as `Graphify-extracted`, `Graphify-inferred`, or `source-verified`. Verify inferred or decisive claims against current source. If health reports stale or source drift, say so; do not present the graph as current fact.
+
+If health returns `impact_analysis_trusted:false` or the
+`graph_integrity_degraded` issue, use the graph for navigation only and verify
+every impact conclusion against current source.
 
 Refresh at checkpoints after architecture, module boundary, schema, public interface, or substantial documentation changes. Do not rebuild for trivial edits.
 

@@ -11,6 +11,8 @@ import sys
 
 import pytest
 
+from project_knowledge.integrity import analyze_graph
+
 
 SCHEMA_VERSION = 1
 
@@ -102,7 +104,7 @@ else:
     return executable, calls
 
 
-def test_parser_exposes_only_the_eight_workflow_commands() -> None:
+def test_parser_exposes_only_the_ten_workflow_commands() -> None:
     """A missing or accidental extra command would break the skill contract."""
     from project_knowledge.cli import build_parser
 
@@ -116,6 +118,8 @@ def test_parser_exposes_only_the_eight_workflow_commands() -> None:
         "detect",
         "preflight",
         "stage",
+        "adapt",
+        "scan-secrets",
         "validate",
         "promote",
         "atlas-prepare",
@@ -181,6 +185,34 @@ def test_preflight_json_is_non_mutating_and_probes_exact_graphify_argv(
     assert not (repo / ".project-knowledge").exists()
 
 
+def test_scan_secrets_is_read_only_redacted_and_path_confined(tmp_path: Path) -> None:
+    repo = project(tmp_path)
+    secret = "correct-horse-battery-staple"
+    write(repo / "src/settings.ts", f'api_key = "{secret}"\n')
+    before = tree_snapshot(repo)
+
+    result = run_cli(repo, "scan-secrets", "--json")
+
+    assert result.returncode == 0
+    document = payload(result)
+    assert document["command"] == "scan-secrets"
+    assert document["status"] == "scanned"
+    assert document["finding_count"] == 1
+    assert document["excepted_count"] == 0
+    assert document["findings"] == [
+        {
+            "detector": "generic_secret_assignment",
+            "path": "src/settings.ts",
+            "line": 1,
+            "fingerprint": document["findings"][0]["fingerprint"],
+        }
+    ]
+    assert str(document["findings"][0]["fingerprint"]).startswith("sha256:")
+    assert secret not in result.stdout
+    assert str(repo) not in result.stdout
+    assert tree_snapshot(repo) == before
+
+
 def test_stage_is_the_only_command_that_creates_sanitized_input(
     tmp_path: Path,
 ) -> None:
@@ -188,8 +220,17 @@ def test_stage_is_the_only_command_that_creates_sanitized_input(
     repo = project(tmp_path)
     write(repo / "src/api-token.txt", "private\n")
     destination = tmp_path / "safe-input"
+    receipt = tmp_path / "safe-input.receipt.json"
 
-    result = run_cli(repo, "stage", "--destination", destination, "--json")
+    result = run_cli(
+        repo,
+        "stage",
+        "--destination",
+        destination,
+        "--receipt",
+        receipt,
+        "--json",
+    )
 
     assert result.returncode == 0
     document = payload(result)
@@ -199,14 +240,51 @@ def test_stage_is_the_only_command_that_creates_sanitized_input(
     assert document["file_count"] == 1
     assert len(str(document["source_digest"])) == 64
     assert (destination / "src/app.py").is_file()
+    assert receipt.is_file()
     assert not (destination / "src/api-token.txt").exists()
     assert str(destination) not in result.stdout
+    assert str(receipt) not in result.stdout
+
+
+def test_stage_requires_explicit_receipt_path(tmp_path: Path) -> None:
+    result = run_cli(
+        project(tmp_path),
+        "stage",
+        "--destination",
+        tmp_path / "safe-input",
+    )
+
+    assert result.returncode == 2
+    assert "--receipt" in result.stderr
+
+
+def test_stage_receipt_failure_removes_new_staged_tree(tmp_path: Path) -> None:
+    repo = project(tmp_path)
+    destination = tmp_path / "safe-input"
+    receipt = tmp_path / "receipt.json"
+    receipt.write_text("caller owned\n", encoding="utf-8")
+
+    result = run_cli(
+        repo,
+        "stage",
+        "--destination",
+        destination,
+        "--receipt",
+        receipt,
+        "--json",
+    )
+
+    assert result.returncode == 1
+    assert payload(result)["error"]["code"] == "staging_failed"
+    assert not destination.exists()
+    assert receipt.read_text(encoding="utf-8") == "caller owned\n"
 
 
 @pytest.mark.parametrize(
     ("command", "required"),
     [
         ("stage", "--destination"),
+        ("adapt", "--staged-input"),
         ("validate", "--candidate"),
         ("promote", "--candidate"),
         ("atlas-prepare", "--candidate"),
@@ -230,6 +308,9 @@ def write_graph_candidate(candidate: Path, source_digest: str) -> None:
         "source_digest": source_digest,
         "nodes": [{"id": "app", "source_file": "src/app.py"}],
         "edges": [],
+        "graph_health": analyze_graph(
+            [{"id": "app", "source_file": "src/app.py"}], []
+        ).to_dict(),
         "extraction_coverage": {"schema_version": 1, "total_staged_files": 1, "represented_source_paths": ["src/app.py"], "skipped": []},
     }
     write(candidate / "graph.json", json.dumps(graph) + "\n")
@@ -237,11 +318,179 @@ def write_graph_candidate(candidate: Path, source_digest: str) -> None:
     write(candidate / "graph.html", "<!doctype html><title>Demo</title>\n")
 
 
+def write_raw_graph_candidate(candidate: Path) -> Path:
+    graph = {
+        "directed": False,
+        "multigraph": False,
+        "graph": {},
+        "nodes": [
+            {
+                "id": "app",
+                "source_file": "src/app.py",
+                "provenance": "EXTRACTED",
+            }
+        ],
+        "links": [],
+    }
+    write(candidate / "graph.json", json.dumps(graph) + "\n")
+    write(candidate / "GRAPH_REPORT.md", "# Graph Report\n\n`src/app.py`\n")
+    write(candidate / "graph.html", "<!doctype html><title>Demo</title>\n")
+    return candidate
+
+
 def staged_input(repo: Path, tmp_path: Path) -> tuple[Path, str]:
     destination = tmp_path / "safe-input"
-    result = run_cli(repo, "stage", "--destination", destination, "--json")
+    result = run_cli(
+        repo,
+        "stage",
+        "--destination",
+        destination,
+        "--receipt",
+        tmp_path / "safe-input.receipt.json",
+        "--json",
+    )
     assert result.returncode == 0
     return destination, str(payload(result)["source_digest"])
+
+
+def test_adapt_binds_real_stage_receipt_and_writes_separate_candidate(
+    tmp_path: Path,
+) -> None:
+    repo = project(tmp_path)
+    stage = tmp_path / "safe-input"
+    receipt = tmp_path / "safe-input.receipt.json"
+    staged = run_cli(
+        repo,
+        "stage",
+        "--destination",
+        stage,
+        "--receipt",
+        receipt,
+        "--json",
+    )
+    assert staged.returncode == 0
+    raw = write_raw_graph_candidate(tmp_path / "raw")
+    candidate = tmp_path / "candidate"
+
+    result = run_cli(
+        repo,
+        "adapt",
+        "--staged-input",
+        stage,
+        "--receipt",
+        receipt,
+        "--raw-candidate",
+        raw,
+        "--destination",
+        candidate,
+        "--json",
+    )
+
+    assert result.returncode == 0
+    document = payload(result)
+    assert document["status"] == "adapted"
+    assert document["project_id"] == "demo"
+    assert document["node_count"] == 1
+    assert document["edge_count"] == 0
+    assert document["skipped_count"] == 0
+    assert candidate.is_dir()
+    assert (candidate / "graph.json").is_file()
+    assert str(stage) not in result.stdout
+    assert str(receipt) not in result.stdout
+    assert str(raw) not in result.stdout
+    assert str(candidate) not in result.stdout
+
+
+def test_adapt_rejects_repo_source_drift_after_staging(tmp_path: Path) -> None:
+    repo = project(tmp_path)
+    stage = tmp_path / "safe-input"
+    receipt = tmp_path / "safe-input.receipt.json"
+    assert run_cli(
+        repo,
+        "stage",
+        "--destination",
+        stage,
+        "--receipt",
+        receipt,
+        "--json",
+    ).returncode == 0
+    raw = write_raw_graph_candidate(tmp_path / "raw")
+    write(repo / "src/app.py", "def run():\n    return 2\n")
+
+    result = run_cli(
+        repo,
+        "adapt",
+        "--staged-input",
+        stage,
+        "--receipt",
+        receipt,
+        "--raw-candidate",
+        raw,
+        "--destination",
+        tmp_path / "candidate",
+        "--json",
+    )
+
+    assert result.returncode == 1
+    assert payload(result)["error"]["code"] == "staging_failed"
+    assert not (tmp_path / "candidate").exists()
+
+
+def test_adapt_removes_candidate_when_source_drifts_after_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from project_knowledge import cli as cli_module
+    from project_knowledge.staging import StagingError
+
+    repo = project(tmp_path)
+    stage = tmp_path / "safe-input"
+    receipt = tmp_path / "safe-input.receipt.json"
+    assert run_cli(
+        repo,
+        "stage",
+        "--destination",
+        stage,
+        "--receipt",
+        receipt,
+        "--json",
+    ).returncode == 0
+    raw = write_raw_graph_candidate(tmp_path / "raw")
+    destination = tmp_path / "candidate"
+    real_check = cli_module._require_current_input
+    checks = 0
+
+    def drift_after_write(repo_path: Path, manifest: object, expected: object) -> None:
+        nonlocal checks
+        checks += 1
+        if checks == 2:
+            raise StagingError("simulated post-adapt source drift")
+        real_check(repo_path, manifest, expected)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(cli_module, "_require_current_input", drift_after_write)
+
+    result = cli_module.main(
+        [
+            "adapt",
+            "--repo",
+            str(repo),
+            "--staged-input",
+            str(stage),
+            "--receipt",
+            str(receipt),
+            "--raw-candidate",
+            str(raw),
+            "--destination",
+            str(destination),
+            "--json",
+        ]
+    )
+    capsys.readouterr()
+
+    assert result == 1
+    assert checks == 2
+    assert not destination.exists()
 
 
 def test_validate_is_ephemeral_so_the_same_candidate_can_be_promoted(
@@ -435,7 +684,7 @@ def test_console_entrypoint_is_declared_only_with_the_working_module() -> None:
     )
 
     assert result.returncode == 0
-    assert "{detect,preflight,stage,validate,promote,atlas-prepare,atlas-promote,health}" in result.stdout
+    assert "{detect,preflight,stage,adapt,scan-secrets,validate,promote,atlas-prepare,atlas-promote,health}" in result.stdout
     assert "Traceback" not in result.stderr
 
 

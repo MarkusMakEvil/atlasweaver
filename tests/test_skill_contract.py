@@ -85,3 +85,17 @@ def test_skill_keeps_generated_and_human_notes_isolated() -> None:
         "telegram " + "post",
     ):
         assert account_specific not in combined
+
+
+def test_skill_documents_receipt_adapter_secret_and_integrity_contracts() -> None:
+    combined = skill_text() + "\n" + WORKFLOW.read_text(encoding="utf-8")
+    lowered = combined.lower()
+
+    assert "project-knowledge scan-secrets" in combined
+    assert "--receipt" in combined
+    assert "project-knowledge adapt" in combined
+    assert "--raw-candidate" in combined
+    assert "--staged-input" in combined
+    assert "impact_analysis_trusted" in combined
+    assert "graph_integrity_degraded" in combined
+    assert "non-bypassable" in lowered

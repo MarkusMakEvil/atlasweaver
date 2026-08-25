@@ -1,0 +1,6 @@
+graphify-out/
+.project-knowledge/
+.pytest_cache/
+.venv/
+build/
+dist/

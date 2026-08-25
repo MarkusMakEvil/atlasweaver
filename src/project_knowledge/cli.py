@@ -12,6 +12,7 @@ import sys
 import tempfile
 from typing import Callable, Sequence
 
+from .adapter import AdapterError, adapt_candidate
 from .artifacts import ArtifactValidationError, promote_graph, validate_candidate
 from .atlas import (
     AtlasOwnershipError,
@@ -30,7 +31,13 @@ from .health import assess_health, inspect_project_state, safe_input_snapshot
 from .manifest import ManifestError, load_manifest
 from .models import ProjectManifest
 from .privacy import PrivacyError
-from .staging import StagedInput, StagingError, stage_input
+from .receipt import ReceiptError, load_staging_receipt, verify_staged_input
+from .secrets_scan import (
+    SecretExceptionError,
+    load_secret_exceptions,
+    scan_repository,
+)
+from .staging import StagedInput, StagingError, stage_input_with_receipt
 
 
 SCHEMA_VERSION = 1
@@ -50,6 +57,8 @@ def build_parser() -> argparse.ArgumentParser:
         add_detect,
         add_preflight,
         add_stage,
+        add_adapt,
+        add_scan_secrets,
         add_validate,
         add_promote,
         add_atlas_prepare,
@@ -83,6 +92,21 @@ def add_preflight(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> N
 def add_stage(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     parser = _command(sub, "stage")
     parser.add_argument("--destination", type=Path, required=True)
+    parser.add_argument("--receipt", type=Path, required=True)
+
+
+def add_adapt(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    parser = _command(sub, "adapt")
+    parser.add_argument("--staged-input", type=Path, required=True)
+    parser.add_argument("--receipt", type=Path, required=True)
+    parser.add_argument("--raw-candidate", type=Path, required=True)
+    parser.add_argument("--destination", type=Path, required=True)
+
+
+def add_scan_secrets(
+    sub: argparse._SubParsersAction[argparse.ArgumentParser],
+) -> None:
+    _command(sub, "scan-secrets")
 
 
 def _add_graph_candidate_command(
@@ -137,9 +161,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _emit_error(
             arguments, CliFailure("privacy_invalid", "privacy exclusions are invalid")
         )
+    except SecretExceptionError:
+        return _emit_error(
+            arguments,
+            CliFailure("secret_policy_invalid", "secret exception policy is invalid"),
+        )
     except StagingError:
         return _emit_error(
             arguments, CliFailure("staging_failed", "safe input staging failed")
+        )
+    except ReceiptError:
+        return _emit_error(
+            arguments, CliFailure("staging_failed", "safe input receipt validation failed")
+        )
+    except AdapterError:
+        return _emit_error(
+            arguments, CliFailure("adaptation_failed", "Graphify candidate adaptation failed")
         )
     except ArtifactValidationError:
         return _emit_error(
@@ -172,6 +209,8 @@ def _dispatch(
         "detect": _detect,
         "preflight": _preflight,
         "stage": _stage,
+        "adapt": _adapt,
+        "scan-secrets": _scan_secrets,
         "validate": _validate,
         "promote": _promote,
         "atlas-prepare": _atlas_prepare,
@@ -218,13 +257,65 @@ def _preflight(
 def _stage(
     arguments: argparse.Namespace, repo: Path, manifest: ProjectManifest
 ) -> dict[str, object]:
-    staged = stage_input(repo, manifest, arguments.destination)
+    staged = stage_input_with_receipt(
+        repo, manifest, arguments.destination, arguments.receipt
+    )
     return _success(
         "stage",
         "staged",
         project_id=manifest.project_id,
         source_digest=staged.source_digest,
         file_count=len(staged.files),
+    )
+
+
+def _adapt(
+    arguments: argparse.Namespace, repo: Path, manifest: ProjectManifest
+) -> dict[str, object]:
+    receipt = load_staging_receipt(arguments.receipt, manifest)
+    staged = verify_staged_input(arguments.staged_input, receipt)
+    _require_current_input(repo, manifest, staged)
+    adapted = adapt_candidate(
+        arguments.raw_candidate,
+        arguments.destination,
+        staged,
+        manifest,
+        post_write_check=lambda: _require_current_input(repo, manifest, staged),
+    )
+    return _success(
+        "adapt",
+        "adapted",
+        project_id=manifest.project_id,
+        source_digest=adapted.source_digest,
+        node_count=adapted.node_count,
+        edge_count=adapted.edge_count,
+        skipped_count=adapted.skipped_count,
+    )
+
+
+def _scan_secrets(
+    arguments: argparse.Namespace, repo: Path, manifest: ProjectManifest
+) -> dict[str, object]:
+    del arguments
+    findings = scan_repository(repo, manifest)
+    accepted = load_secret_exceptions(repo, findings)
+    unaccepted = [
+        finding for finding in findings if finding.fingerprint not in accepted
+    ]
+    return _success(
+        "scan-secrets",
+        "scanned",
+        finding_count=len(unaccepted),
+        excepted_count=len(findings) - len(unaccepted),
+        findings=[
+            {
+                "detector": finding.detector,
+                "path": finding.path.as_posix(),
+                "line": finding.line,
+                "fingerprint": finding.fingerprint,
+            }
+            for finding in unaccepted
+        ],
     )
 
 

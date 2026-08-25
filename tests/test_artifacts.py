@@ -18,6 +18,7 @@ from project_knowledge.artifacts import (
     promote_graph,
     validate_candidate,
 )
+from project_knowledge.integrity import analyze_graph
 from project_knowledge.models import ProjectManifest
 from project_knowledge.staging import StagedInput
 
@@ -100,12 +101,17 @@ def write_graph(
     ]
     represented = sorted({str(value) for item in [*resolved_nodes, *resolved_edges] if isinstance(item, dict) for key, value in item.items() if key in {"source_file", "source_path", "path", "file"} and isinstance(value, str)})
     skipped = [{"path": path.as_posix(), "reason": "fixture not represented", "approved": True} for path in staged.files if path.as_posix() not in represented]
+    try:
+        graph_health = analyze_graph(resolved_nodes, resolved_edges).to_dict()
+    except (AttributeError, TypeError, ValueError):
+        graph_health = analyze_graph([{"id": "fixture"}], []).to_dict()
     document: dict[str, object] = {
         "project_id": manifest.project_id,
         "graphify_version": manifest.graphify_version,
         "source_digest": staged.source_digest,
         "nodes": resolved_nodes,
         "edges": resolved_edges,
+        "graph_health": graph_health,
         "extraction_coverage": {"schema_version": 1, "total_staged_files": len(staged.files), "represented_source_paths": represented, "skipped": skipped},
     }
     document.update(metadata)
@@ -119,6 +125,41 @@ def test_candidate_requires_complete_staged_extraction_coverage(
     del document["extraction_coverage"]
     write(candidate / "graph.json", json.dumps(document))
     with pytest.raises(ArtifactValidationError, match="coverage"):
+        validate_candidate(candidate, staged, manifest)
+
+
+def test_candidate_requires_recomputed_graph_health(
+    candidate: Path, staged: StagedInput, manifest: ProjectManifest
+) -> None:
+    document = json.loads((candidate / "graph.json").read_text())
+    del document["graph_health"]
+    write(candidate / "graph.json", json.dumps(document))
+
+    with pytest.raises(ArtifactValidationError, match="graph health"):
+        validate_candidate(candidate, staged, manifest)
+
+
+def test_candidate_rejects_forged_graph_health_counter(
+    candidate: Path, staged: StagedInput, manifest: ProjectManifest
+) -> None:
+    document = json.loads((candidate / "graph.json").read_text())
+    document["graph_health"]["impact_analysis_trusted"] = True
+    write(candidate / "graph.json", json.dumps(document))
+
+    with pytest.raises(ArtifactValidationError, match="graph health"):
+        validate_candidate(candidate, staged, manifest)
+
+
+def test_candidate_rejects_claimed_collapsed_edge_evidence_for_graphify_0948(
+    candidate: Path, staged: StagedInput, manifest: ProjectManifest
+) -> None:
+    """The pinned extractor cannot prove a zero pre-build collapse count."""
+    document = json.loads((candidate / "graph.json").read_text())
+    document["graph_health"]["collapsed_edges"] = 0
+    document["graph_health"]["impact_analysis_trusted"] = True
+    write(candidate / "graph.json", json.dumps(document))
+
+    with pytest.raises(ArtifactValidationError, match="collapsed edge evidence"):
         validate_candidate(candidate, staged, manifest)
 
 
@@ -142,6 +183,7 @@ def test_valid_candidate_is_bound_to_project_version_and_staged_source(
     assert ownership["project_id"] == "demo"
     assert ownership["graphify_version"] == "0.9.48"
     assert ownership["source_digest"] == staged.source_digest
+    assert ownership["impact_analysis_trusted"] is False
     assert ownership["graph_digest"] == validated.graph_digest
     assert set(ownership["artifact_digests"]) == {
         "GRAPH_REPORT.md",
@@ -818,6 +860,22 @@ def test_candidate_accepts_native_links_and_confidence_provenance(
                 "source_file": "src/app.py",
             }
         ],
+        "graph_health": analyze_graph(
+            [
+                {"id": "app", "source_file": "src/app.py"},
+                {"id": "lib", "source_file": "src/lib.py"},
+            ],
+            [
+                {
+                    "source": "app",
+                    "target": "lib",
+                    "relation": "calls",
+                    "confidence": "INFERRED",
+                    "confidence_score": 0.75,
+                    "source_file": "src/app.py",
+                }
+            ],
+        ).to_dict(),
         "extraction_coverage": {
             "schema_version": 1,
             "total_staged_files": 2,

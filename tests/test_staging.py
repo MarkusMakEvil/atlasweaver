@@ -12,6 +12,7 @@ from project_knowledge.staging import (
     StagingCleanupError,
     StagingError,
     stage_input,
+    stage_input_with_receipt,
 )
 
 
@@ -52,6 +53,87 @@ def test_stage_copies_only_safe_regular_files(tmp_path: Path) -> None:
     assert (destination / "src/app.py").read_text(encoding="utf-8") == "print('ok')\n"
     assert not (destination / ".env").exists()
     assert not (destination / "src/leak").exists()
+
+
+def test_receipt_io_failure_removes_both_receipt_and_staged_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A disk error after exclusive receipt creation must leave no usable pair."""
+    repo, destination, manifest = project_fixture(tmp_path)
+    write(repo / "src/app.py", "safe\n")
+    receipt = tmp_path / "receipt.json"
+
+    def fail_write(descriptor: int, payload: bytes) -> int:
+        del descriptor, payload
+        raise OSError("simulated receipt disk failure")
+
+    monkeypatch.setattr(os, "write", fail_write)
+
+    with pytest.raises(StagingError, match="receipt creation failed"):
+        stage_input_with_receipt(repo, manifest, destination, receipt)
+
+    assert not destination.exists()
+    assert not receipt.exists()
+
+
+def test_receipt_must_be_outside_the_staged_tree(tmp_path: Path) -> None:
+    repo, destination, manifest = project_fixture(tmp_path)
+    write(repo / "src/app.py", "safe\n")
+
+    with pytest.raises(StagingError, match="outside staged input"):
+        stage_input_with_receipt(
+            repo,
+            manifest,
+            destination,
+            destination / "receipt.json",
+        )
+
+    assert not destination.exists()
+
+
+def test_receipt_parent_swap_cannot_redirect_receipt_into_staged_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from project_knowledge import receipt as receipt_module
+
+    repo, destination, manifest = project_fixture(tmp_path)
+    write(repo / "src/app.py", "safe\n")
+    receipt_parent = tmp_path / "receipts"
+    receipt_parent.mkdir()
+    displaced = tmp_path / "original-receipts"
+    receipt_path = receipt_parent / "receipt.json"
+    real_write_at = receipt_module._write_staging_receipt_at
+    swapped = False
+
+    def swap_parent_then_write(
+        parent_descriptor: int, name: str, staged: object, contract: object
+    ):
+        nonlocal swapped
+        receipt_parent.rename(displaced)
+        os.symlink(destination, receipt_parent, target_is_directory=True)
+        swapped = True
+        return real_write_at(
+            parent_descriptor,
+            name,
+            staged,  # type: ignore[arg-type]
+            contract,  # type: ignore[arg-type]
+        )
+
+    monkeypatch.setattr(
+        receipt_module, "_write_staging_receipt_at", swap_parent_then_write
+    )
+
+    with pytest.raises(StagingError):
+        stage_input_with_receipt(
+            repo,
+            manifest,
+            destination,
+            receipt_path,
+        )
+
+    assert swapped
+    assert not destination.exists()
+    assert not (displaced / "receipt.json").exists()
 
 
 def test_stage_does_not_follow_a_directory_replaced_with_a_symlink(
@@ -280,6 +362,53 @@ def test_stage_rejects_common_high_confidence_credentials(
     assert not destination.exists()
 
 
+@pytest.mark.parametrize(
+    "reference",
+    [
+        "process.env.SERVICE_API_KEY",
+        "import.meta.env.SERVICE_API_KEY",
+        "os.environ['SERVICE_API_KEY']",
+        '"${SERVICE_API_KEY}"',
+    ],
+)
+def test_stage_allows_non_literal_environment_secret_references(
+    tmp_path: Path, reference: str
+) -> None:
+    repo, destination, manifest = project_fixture(tmp_path)
+    write(repo / "src/settings.ts", f"api_key = {reference}\n")
+
+    staged = stage_input(repo, manifest, destination)
+
+    assert staged.files == (PurePosixPath("src/settings.ts"),)
+
+
+def test_stage_accepts_exact_reviewed_contextual_exception(tmp_path: Path) -> None:
+    from project_knowledge.secrets_scan import scan_payload
+
+    repo, destination, manifest = project_fixture(tmp_path)
+    payload = 'api_key = "correct-horse-battery-staple"\n'
+    write(repo / "src/settings.ts", payload)
+    finding = next(
+        item
+        for item in scan_payload(PurePosixPath("src/settings.ts"), payload.encode())
+        if item.detector == "generic_secret_assignment"
+    )
+    write(
+        repo / ".graphify-secret-exceptions.yaml",
+        "schema_version: 1\n"
+        "exceptions:\n"
+        "  - path: src/settings.ts\n"
+        "    detector: generic_secret_assignment\n"
+        f"    fingerprint: {finding.fingerprint}\n"
+        "    reason: reviewed public fixture\n",
+    )
+
+    staged = stage_input(repo, manifest, destination)
+
+    assert staged.files == (PurePosixPath("src/settings.ts"),)
+    assert not (destination / ".graphify-secret-exceptions.yaml").exists()
+
+
 def test_stage_surfaces_cleanup_failure_for_manual_recovery(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -287,7 +416,17 @@ def test_stage_surfaces_cleanup_failure_for_manual_recovery(
     write(repo / "src/app.py", "safe\n")
     from project_knowledge import staging
 
-    monkeypatch.setattr(staging, "iter_safe_files", lambda *args: (_ for _ in ()).throw(PermissionError("denied")))
+    original_iter = staging.iter_safe_files
+    calls = 0
+
+    def deny_staging_pass(*args: object):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise PermissionError("denied")
+        return original_iter(*args)
+
+    monkeypatch.setattr(staging, "iter_safe_files", deny_staging_pass)
     monkeypatch.setattr(staging.shutil, "rmtree", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("busy")))
 
     with pytest.raises(StagingCleanupError, match="cleanup failed"):

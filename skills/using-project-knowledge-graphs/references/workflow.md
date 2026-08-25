@@ -17,7 +17,24 @@ Run:
 project-knowledge health --repo <repo> --json
 ```
 
-Supply `--atlas <atlas>` or `--registry-state ...` only when those local states are in scope. Treat source-digest mismatch as authoritative freshness evidence.
+Supply `--atlas <atlas>` only when that local state is in scope. Treat source-digest mismatch as authoritative freshness evidence; registry matching is an internal health input, not a CLI path argument.
+Treat `impact_analysis_trusted:false` and `graph_integrity_degraded` as a hard
+boundary on impact claims: navigation remains useful, but source verification
+is mandatory.
+
+## Secret triage
+
+Run the read-only redacted scan before requesting staging approval:
+
+```sh
+project-knowledge scan-secrets --repo <repo> --json
+```
+
+The command returns detector IDs, confined paths, line numbers, and
+fingerprints, never matched values. Structured credential findings are
+non-bypassable. A reviewed `.graphify-secret-exceptions.yaml` entry can suppress
+only `generic_secret_assignment` and must bind the exact path, detector,
+fingerprint, and review reason.
 
 ## Bootstrap or refresh
 
@@ -36,18 +53,28 @@ Before mutation, show the repository, include roots, immutable global deny set, 
 2. Create a private temporary destination and stage only sanitized input:
 
    ```sh
-   project-knowledge stage --repo <repo> --destination <staged-input> --json
+   project-knowledge stage --repo <repo> --destination <staged-input> --receipt <staging-receipt> --json
    ```
 
-3. Invoke the official `$graphify` skill on `<staged-input>`, never the unsanitized repository. Direct output to a private candidate. Use only capabilities discovered from the pinned installation and official skill; do not guess shell flags.
-4. Validate, then promote the same candidate through the wrapper:
+3. Invoke the official `$graphify` skill on `<staged-input>`, never the unsanitized repository. Direct native output to a private raw candidate. Use only capabilities discovered from the pinned installation and official skill; do not guess shell flags.
+4. Verify the receipt and adapt raw Graphify output into a separate wrapper candidate:
+
+   ```sh
+   project-knowledge adapt --repo <repo> --staged-input <staged-input> --receipt <staging-receipt> --raw-candidate <raw-graph-candidate> --destination <graph-candidate> --json
+   ```
+
+   `adapt` does not modify the raw candidate. It fails if source or staged bytes
+   drift, if final edge endpoints are missing/dangling, or if wrapper metadata
+   is already present.
+
+5. Validate, then promote the same adapted candidate through the wrapper:
 
    ```sh
    project-knowledge validate --repo <repo> --candidate <graph-candidate> --json
    project-knowledge promote --repo <repo> --candidate <graph-candidate> --json
    ```
 
-5. Run health again. Registry synchronization and any Git commit remain separate, visible mutations.
+6. Run health again. Registry synchronization and any Git commit remain separate, visible mutations.
 
 Refresh only after architecture, module-boundary, schema, public-interface, or substantial documentation changes. Skip it for trivial copy, formatting, comments, and isolated one-line edits.
 
@@ -69,6 +96,8 @@ Stop without mutation when any of these occurs:
 - a project attempts to weaken the non-negotiable global deny set;
 - Graphify version/capabilities do not match the pinned contract;
 - output validation, provenance, path confinement, ownership, or health fails;
+- a structured secret finding is present or an exception attempts to bypass it;
+- final graph endpoints are missing/dangling;
 - the graph is stale and the user has not approved refresh;
 - `Generated/` contains an unknown or unmanaged entry;
 - the requested mutation or destination lacks exact approval.

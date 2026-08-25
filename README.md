@@ -53,11 +53,25 @@ project-knowledge preflight --repo /path/to/project --json
 The safe refresh sequence is deliberately explicit:
 
 ```sh
-project-knowledge stage --repo /path/to/project --destination "$PRIVATE_STAGE" --json
-# Run Graphify only against $PRIVATE_STAGE and write to $GRAPH_CANDIDATE.
+project-knowledge scan-secrets --repo /path/to/project --json
+project-knowledge stage --repo /path/to/project --destination "$PRIVATE_STAGE" --receipt "$STAGE_RECEIPT" --json
+# Run Graphify only against $PRIVATE_STAGE and write native output to $RAW_GRAPH_CANDIDATE.
+project-knowledge adapt --repo /path/to/project --staged-input "$PRIVATE_STAGE" --receipt "$STAGE_RECEIPT" --raw-candidate "$RAW_GRAPH_CANDIDATE" --destination "$GRAPH_CANDIDATE" --json
 project-knowledge validate --repo /path/to/project --candidate "$GRAPH_CANDIDATE" --json
 project-knowledge promote --repo /path/to/project --candidate "$GRAPH_CANDIDATE" --json
 ```
+
+`adapt` never mutates Graphify's raw output. It verifies the staged receipt,
+copies only the policy-approved artifacts into a separate candidate, and adds
+the project identity, source digest, extraction coverage, and graph-integrity
+metadata required by validation.
+
+`scan-secrets` returns only detector IDs, relative paths, line numbers, and
+SHA-256 fingerprints. Structured credentials and private keys are
+non-bypassable. Reviewed false positives from the contextual assignment rule
+can be bound to an exact path and fingerprint in
+`.graphify-secret-exceptions.yaml`; changing the source invalidates the
+exception.
 
 For Obsidian, export into a private candidate directory first:
 
@@ -80,6 +94,14 @@ project-knowledge health --repo /path/to/project --atlas "$OBSIDIAN_ATLAS" --jso
 - `registry_matches:false` means the global graph copy differs.
 - `partial` can be an honest accepted state when approved files are bound into
   the source digest but unsupported by the pinned extractor.
+- `impact_analysis_trusted:false` or `graph_integrity_degraded` means the graph
+  is suitable for navigation only; impact conclusions require source
+  verification.
+
+Graphify 0.9.48 does not persist enough pre-build evidence to prove that no
+same-endpoint edges collapsed. AtlasWeaver therefore records unknown collapsed
+edge evidence and keeps impact analysis untrusted while still rejecting final
+graphs with missing or dangling endpoints.
 
 Use graph results as navigation evidence. Verify decisive or inferred claims
 against current source before changing behavior.
