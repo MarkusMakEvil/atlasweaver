@@ -12,9 +12,11 @@ import stat
 from typing import Any, Literal
 
 from .artifacts import OWNERSHIP_MANIFEST
+from .integrity import IntegrityError, analyze_graph
 from .models import ProjectManifest
 from .privacy import effective_excludes, is_denied
-from .staging import _reject_secret_shapes, iter_safe_files
+from .secrets_scan import load_secret_exceptions, scan_payload
+from .staging import iter_safe_files
 
 
 HealthStatus = Literal["error", "missing", "stale", "partial", "healthy"]
@@ -45,6 +47,7 @@ class KnowledgeState:
     registry_matches: bool
     coverage_skips: int = 0
     unapproved_skips: int = 0
+    impact_analysis_trusted: bool = False
     errors: tuple[str, ...] = ()
 
     @property
@@ -66,6 +69,7 @@ class KnowledgeHealth:
     source_matches: bool
     atlas_available: bool
     registry_matches: bool
+    impact_analysis_trusted: bool
     issues: tuple[str, ...]
 
     def to_dict(self) -> dict[str, object]:
@@ -76,6 +80,7 @@ class KnowledgeHealth:
             "source_matches": self.source_matches,
             "atlas_available": self.atlas_available,
             "registry_matches": self.registry_matches,
+            "impact_analysis_trusted": self.impact_analysis_trusted,
             "issues": list(self.issues),
         }
 
@@ -103,11 +108,18 @@ def assess_health(state: KnowledgeState) -> KnowledgeHealth:
             issues.append("extraction_coverage_partial")
         if state.unapproved_skips:
             issues.append("extraction_coverage_unapproved")
+        if not state.impact_analysis_trusted:
+            issues.append("graph_integrity_degraded")
         if not state.source_matches:
             status = "stale"
         elif state.unapproved_skips:
             status = "error"
-        elif not state.atlas_available or not state.registry_matches or state.coverage_skips:
+        elif (
+            not state.atlas_available
+            or not state.registry_matches
+            or state.coverage_skips
+            or not state.impact_analysis_trusted
+        ):
             status = "partial"
         else:
             status = "healthy"
@@ -118,6 +130,7 @@ def assess_health(state: KnowledgeState) -> KnowledgeHealth:
         source_matches=state.source_matches,
         atlas_available=state.atlas_available,
         registry_matches=state.registry_matches,
+        impact_analysis_trusted=state.impact_analysis_trusted,
         issues=tuple(issues),
     )
 
@@ -129,13 +142,20 @@ def safe_input_snapshot(repo_root: Path, manifest: ProjectManifest) -> SafeInput
         files = set(iter_safe_files(repo_root, manifest))
         digest = hashlib.sha256()
         ordered = tuple(sorted(files))
+        findings = []
         for relative in ordered:
             payload = _read_stable_regular(root_fd, relative)
-            _reject_secret_shapes(payload)
+            findings.extend(scan_payload(relative, payload))
             digest.update(relative.as_posix().encode("utf-8") + b"\0" + payload + b"\0")
-        return SafeInputSnapshot(digest.hexdigest(), ordered)
     finally:
         os.close(root_fd)
+    finding_tuple = tuple(findings)
+    accepted = load_secret_exceptions(repo_root, finding_tuple)
+    if any(finding.fingerprint not in accepted for finding in finding_tuple):
+        from .staging import SecretShapeError
+
+        raise SecretShapeError("safe input contains secret-shaped material")
+    return SafeInputSnapshot(digest.hexdigest(), ordered)
 
 
 def inspect_project_state(
@@ -201,6 +221,7 @@ def inspect_project_state(
         registry_matches=registry_matches,
         coverage_skips=int(ownership["skipped_count"]),
         unapproved_skips=int(ownership["unapproved_skips"]),
+        impact_analysis_trusted=bool(ownership["impact_analysis_trusted"]),
     )
 
 
@@ -296,6 +317,7 @@ def _read_valid_graph_metadata(
         ownership_payload = _read_regular_at(output_fd, OWNERSHIP_MANIFEST)
         ownership = json.loads(
             ownership_payload,
+            object_pairs_hook=_unique_json_object,
             parse_constant=lambda value: (_ for _ in ()).throw(
                 ValueError(f"invalid JSON constant: {value}")
             ),
@@ -313,11 +335,14 @@ def _read_valid_graph_metadata(
             "files",
             "skipped_count",
             "unapproved_skips",
+            "impact_analysis_trusted",
         }
         if set(ownership) != expected_fields:
             raise ValueError("invalid ownership fields")
         if ownership["schema_version"] != 1:
             raise ValueError("invalid ownership schema")
+        if not isinstance(ownership["impact_analysis_trusted"], bool):
+            raise ValueError("invalid impact analysis trust state")
         if ownership["project_id"] != manifest.project_id:
             raise ValueError("project mismatch")
         if ownership["graphify_version"] != manifest.graphify_version:
@@ -364,6 +389,7 @@ def _read_valid_graph_metadata(
             raise ValueError("graph ownership mismatch")
         graph = json.loads(
             graph_payload,
+            object_pairs_hook=_unique_json_object,
             parse_constant=lambda value: (_ for _ in ()).throw(
                 ValueError(f"invalid JSON constant: {value}")
             ),
@@ -371,6 +397,9 @@ def _read_valid_graph_metadata(
         _reject_nonfinite(graph)
         if not isinstance(graph, dict):
             raise ValueError("invalid graph")
+        impact_analysis_trusted = _validate_graph_integrity_metadata(graph)
+        if ownership["impact_analysis_trusted"] is not impact_analysis_trusted:
+            raise ValueError("graph integrity ownership mismatch")
         coverage = graph.get("extraction_coverage")
         if not isinstance(coverage, dict) or not isinstance(coverage.get("skipped"), list):
             raise ValueError("invalid graph extraction coverage")
@@ -381,6 +410,48 @@ def _read_valid_graph_metadata(
         return ownership, graph_payload
     finally:
         os.close(output_fd)
+
+
+def _validate_graph_integrity_metadata(graph: dict[str, Any]) -> bool:
+    nodes = graph.get("nodes")
+    if "edges" in graph and "links" in graph:
+        raise ValueError("ambiguous graph edges")
+    edges = graph.get("links", graph.get("edges"))
+    if (
+        not isinstance(nodes, list)
+        or not nodes
+        or any(not isinstance(node, dict) for node in nodes)
+        or not isinstance(edges, list)
+        or any(not isinstance(edge, dict) for edge in edges)
+    ):
+        raise ValueError("invalid graph shape")
+    recorded = graph.get("graph_health")
+    expected_fields = {
+        "schema_version",
+        "dangling_edges",
+        "missing_endpoints",
+        "self_loops",
+        "duplicate_edges",
+        "collapsed_edges",
+        "impact_analysis_trusted",
+    }
+    if not isinstance(recorded, dict) or set(recorded) != expected_fields:
+        raise ValueError("invalid graph integrity metadata")
+    if recorded["collapsed_edges"] is not None:
+        raise ValueError("unsupported collapsed edge evidence")
+    try:
+        computed = analyze_graph(
+            nodes,
+            edges,
+            collapsed_edges=recorded["collapsed_edges"],
+        )
+    except (IntegrityError, TypeError) as error:
+        raise ValueError("invalid graph integrity metadata") from error
+    if recorded != computed.to_dict():
+        raise ValueError("graph integrity metadata mismatch")
+    if computed.dangling_edges or computed.missing_endpoints:
+        raise ValueError("invalid graph endpoints")
+    return computed.impact_analysis_trusted
 
 
 def _validate_query_cache(output_fd: int) -> None:
@@ -420,6 +491,15 @@ def _reject_nonfinite(value: Any) -> None:
     elif isinstance(value, list):
         for item in value:
             _reject_nonfinite(item)
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
 
 
 def _open_directory(path: Path) -> int:

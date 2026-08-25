@@ -8,7 +8,6 @@ import os
 from pathlib import Path, PurePosixPath
 import shutil
 import stat
-import re
 
 from .models import ProjectManifest
 from .privacy import effective_excludes, is_denied, repository_ignores
@@ -28,23 +27,6 @@ class SecretShapeError(StagingError):
 
 class StagingCleanupError(StagingError):
     """Raised when a failed projection remains and needs explicit recovery."""
-
-
-_SECRET_SHAPES = (
-    re.compile(rb"(?<![0-9])[0-9]{8,10}:[A-Za-z0-9_-]{30,}"),
-    re.compile(
-        rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----\s*[\r\n]+[A-Za-z0-9+/=]{32,}"
-    ),
-    re.compile(rb"\bAKIA[0-9A-Z]{16}\b"),
-    re.compile(rb"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),
-    re.compile(rb"\bxox[baprs]-[A-Za-z0-9-]{20,}\b"),
-    re.compile(
-        rb"(?i)\b(?:password|passwd|client_secret|aws_secret_access_key|"
-        rb"access_token|api_key)\b\s*[:=]\s*[\"']?[^\s\"']{16,}"
-    ),
-    re.compile(rb"(?i)\bauthorization\b\s*[:=]\s*[\"']?Bearer\s+[A-Za-z0-9._~+/=-]{20,}"),
-    re.compile(rb"(?i)\b[a-z][a-z0-9+.-]*://[^\s/:@]+:[^\s/@]{12,}@[^\s/]+"),
-)
 
 
 @dataclass(frozen=True)
@@ -69,6 +51,19 @@ def stage_input(
     _require_directory(root, "repository root")
     staged_root = _resolved_destination(destination)
     _reject_destination_in_inputs(root, manifest, staged_root)
+    from .secrets_scan import (
+        SecretExceptionError,
+        load_secret_exceptions,
+        scan_repository,
+    )
+
+    try:
+        scanned = scan_repository(root, manifest)
+        accepted = load_secret_exceptions(root, scanned)
+    except SecretExceptionError as error:
+        raise SecretShapeError("secret exception policy is invalid") from error
+    if any(item.fingerprint not in accepted for item in scanned):
+        raise SecretShapeError("safe input contains secret-shaped material")
 
     staged_root.mkdir(mode=0o700, parents=True, exist_ok=False)
     os.chmod(staged_root, 0o700)
@@ -82,7 +77,7 @@ def stage_input(
                 if not stat.S_ISREG(before.st_mode):
                     continue
                 payload = _read_regular_file(relative, root_descriptor, before)
-                _reject_secret_shapes(payload)
+                _reject_secret_shapes(payload, relative, accepted)
                 try:
                     after = _stat_relative(root_descriptor, relative)
                 except FileNotFoundError as error:
@@ -105,6 +100,92 @@ def stage_input(
                 "safe input staging cleanup failed; destination requires manual recovery"
             ) from cleanup_error
         raise
+
+
+def stage_input_with_receipt(
+    repo_root: Path,
+    manifest: ProjectManifest,
+    destination: Path,
+    receipt_path: Path,
+) -> StagedInput:
+    """Create one staged snapshot and its out-of-tree provenance receipt."""
+    from .receipt import (
+        ReceiptError,
+        _open_stable_directory as _open_receipt_directory,
+        _require_directory_binding,
+        _unlink_staging_receipt_at,
+        _write_staging_receipt_at,
+    )
+
+    staged_root = _resolved_destination(destination)
+    receipt = receipt_path.parent.absolute() / receipt_path.name
+    try:
+        receipt.relative_to(staged_root)
+    except ValueError:
+        pass
+    else:
+        raise StagingError("staging receipt must be outside staged input")
+
+    try:
+        receipt_parent, receipt_parent_fd, receipt_parent_identity = (
+            _open_receipt_directory(receipt_path.parent, "receipt parent")
+        )
+    except ReceiptError as error:
+        raise StagingError("staging receipt creation failed") from error
+
+    staged: StagedInput | None = None
+    staged_fd: int | None = None
+    staged_identity: tuple[int, int] | None = None
+    receipt_identity: tuple[int, int] | None = None
+    try:
+        staged = stage_input(repo_root, manifest, destination)
+        staged_path, staged_fd, staged_identity = _open_receipt_directory(
+            staged.root, "staged input"
+        )
+        _require_directory_binding(receipt_parent, receipt_parent_identity)
+        _require_directory_binding(staged_path, staged_identity)
+        if receipt_parent_identity == staged_identity:
+            raise ReceiptError("staging receipt parent overlaps staged input")
+        _, receipt_identity = _write_staging_receipt_at(
+            receipt_parent_fd,
+            receipt_path.name,
+            staged,
+            manifest,
+        )
+        _require_directory_binding(receipt_parent, receipt_parent_identity)
+        _require_directory_binding(staged_path, staged_identity)
+        return staged
+    except BaseException as error:
+        cleanup_error: OSError | ReceiptError | None = None
+        if receipt_identity is not None:
+            try:
+                _unlink_staging_receipt_at(
+                    receipt_parent_fd,
+                    receipt_path.name,
+                    receipt_identity,
+                )
+            except FileNotFoundError:
+                pass
+            except (OSError, ReceiptError) as failure:
+                cleanup_error = failure
+        if staged is not None:
+            try:
+                if staged_identity is not None:
+                    _require_directory_binding(staged.root, staged_identity)
+                _remove_incomplete_staging(staged.root)
+            except (OSError, ReceiptError) as failure:
+                cleanup_error = cleanup_error or failure
+        if cleanup_error is not None:
+            raise StagingCleanupError(
+                "safe input staging cleanup failed; destination requires manual recovery"
+            ) from cleanup_error
+        if isinstance(error, ReceiptError):
+            raise StagingError("staging receipt creation failed") from error
+        raise
+    finally:
+        if staged_fd is not None:
+            os.close(staged_fd)
+        os.close(receipt_parent_fd)
 
 
 def iter_safe_files(repo_root: Path, manifest: ProjectManifest):
@@ -308,6 +389,15 @@ def _remove_incomplete_staging(staged_root: Path) -> None:
     shutil.rmtree(staged_root)
 
 
-def _reject_secret_shapes(payload: bytes) -> None:
-    if any(pattern.search(payload) for pattern in _SECRET_SHAPES):
+def _reject_secret_shapes(
+    payload: bytes,
+    path: PurePosixPath = PurePosixPath("source"),
+    accepted: frozenset[str] = frozenset(),
+) -> None:
+    from .secrets_scan import scan_payload
+
+    if any(
+        finding.fingerprint not in accepted
+        for finding in scan_payload(path, payload)
+    ):
         raise SecretShapeError("safe input contains secret-shaped material")

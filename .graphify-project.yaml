@@ -1,0 +1,22 @@
+schema_version: 1
+project_id: atlasweaver
+display_name: AtlasWeaver
+include_roots:
+  - src
+  - tests
+  - skills
+  - scripts
+  - docs
+  - config
+  - examples
+  - .github
+  - README.md
+  - SECURITY.md
+  - CONTRIBUTING.md
+  - CHANGELOG.md
+  - pyproject.toml
+output_dir: graphify-out
+obsidian_namespace: Projects/atlasweaver/Generated
+excludes: []
+track_html: false
+graphify_version: 0.9.48
