@@ -30,6 +30,7 @@ GLOBAL_DENY_PATTERNS = (
     "**/snapshots/**",
     "**/*token*",
     "**/*credential*",
+    "**/*creds*",
     "**/*secret*",
     "**/cookies/**",
     "**/sessions/**",

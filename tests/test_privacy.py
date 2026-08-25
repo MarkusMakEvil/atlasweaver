@@ -54,6 +54,7 @@ def test_global_denies_cannot_be_reincluded(
         ".worktrees/x/a.py",
         "workspace/draft.md",
         "config/auth-token.yaml",
+        "config/database-creds.json",
         "Projects/demo/Notes/private.md",
         "node_modules/x.js",
         "AUTH-TOKEN.yaml",
