@@ -4,6 +4,11 @@ All notable changes to AtlasWeaver are documented here.
 
 ## Unreleased
 
+## 0.2.1 - 2026-08-25
+
+- Added `**/*creds*` to the immutable filename deny set as a defensive layer
+  alongside non-bypassable payload scanning.
+
 ## 0.2.0 - 2026-08-25
 
 - Added immutable out-of-tree staging receipts and a separate native Graphify
