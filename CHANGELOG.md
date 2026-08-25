@@ -4,6 +4,8 @@ All notable changes to AtlasWeaver are documented here.
 
 ## Unreleased
 
+## 0.2.0 - 2026-08-25
+
 - Added immutable out-of-tree staging receipts and a separate native Graphify
   candidate adapter.
 - Added redacted named secret triage with literal-aware environment references
