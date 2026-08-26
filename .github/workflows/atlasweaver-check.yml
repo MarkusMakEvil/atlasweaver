@@ -35,7 +35,7 @@ permissions:
   contents: read
 
 env:
-  ATLASWEAVER_TOOL_SHA: 8954cf736853db44e61421e5a5eb4e4b41e01f17
+  ATLASWEAVER_TOOL_SHA: 005cce7a0469f86392acb0b55f4bb535b5eccdd8
 
 jobs:
   check:
