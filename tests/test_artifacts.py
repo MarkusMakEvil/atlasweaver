@@ -18,6 +18,7 @@ from project_knowledge.artifacts import (
     promote_graph,
     validate_candidate,
 )
+from project_knowledge.compatibility import production_graphify_compatibility
 from project_knowledge.integrity import analyze_graph
 from project_knowledge.models import ProjectManifest
 from project_knowledge.staging import StagedInput
@@ -102,9 +103,17 @@ def write_graph(
     represented = sorted({str(value) for item in [*resolved_nodes, *resolved_edges] if isinstance(item, dict) for key, value in item.items() if key in {"source_file", "source_path", "path", "file"} and isinstance(value, str)})
     skipped = [{"path": path.as_posix(), "reason": "fixture not represented", "approved": True} for path in staged.files if path.as_posix() not in represented]
     try:
-        graph_health = analyze_graph(resolved_nodes, resolved_edges).to_dict()
+        graph_health = analyze_graph(
+            resolved_nodes,
+            resolved_edges,
+            semantics=production_graphify_compatibility().semantics,
+        ).to_dict()
     except (AttributeError, TypeError, ValueError):
-        graph_health = analyze_graph([{"id": "fixture"}], []).to_dict()
+        graph_health = analyze_graph(
+            [{"id": "fixture"}],
+            [],
+            semantics=production_graphify_compatibility().semantics,
+        ).to_dict()
     document: dict[str, object] = {
         "project_id": manifest.project_id,
         "graphify_version": manifest.graphify_version,
@@ -143,7 +152,7 @@ def test_candidate_rejects_forged_graph_health_counter(
     candidate: Path, staged: StagedInput, manifest: ProjectManifest
 ) -> None:
     document = json.loads((candidate / "graph.json").read_text())
-    document["graph_health"]["impact_analysis_trusted"] = True
+    document["graph_health"]["structurally_valid"] = False
     write(candidate / "graph.json", json.dumps(document))
 
     with pytest.raises(ArtifactValidationError, match="graph health"):
@@ -156,7 +165,6 @@ def test_candidate_rejects_claimed_collapsed_edge_evidence_for_graphify_0948(
     """The pinned extractor cannot prove a zero pre-build collapse count."""
     document = json.loads((candidate / "graph.json").read_text())
     document["graph_health"]["collapsed_edges"] = 0
-    document["graph_health"]["impact_analysis_trusted"] = True
     write(candidate / "graph.json", json.dumps(document))
 
     with pytest.raises(ArtifactValidationError, match="collapsed edge evidence"):
@@ -875,6 +883,7 @@ def test_candidate_accepts_native_links_and_confidence_provenance(
                     "source_file": "src/app.py",
                 }
             ],
+            semantics=production_graphify_compatibility().semantics,
         ).to_dict(),
         "extraction_coverage": {
             "schema_version": 1,

@@ -17,7 +17,11 @@ import tempfile
 import secrets
 from typing import Any
 
-from .compatibility import CompatibilityError, resolve_graphify_compatibility
+from .compatibility import (
+    CompatibilityError,
+    GraphSemantics,
+    resolve_graphify_compatibility,
+)
 from .integrity import GraphIntegrity, IntegrityError, analyze_graph
 from .models import ProjectManifest
 from .privacy import effective_excludes, is_denied
@@ -206,7 +210,13 @@ def validate_candidate(
         "source digest mismatch",
     )
     nodes, edges = _validate_graph_shape(document, staged, excludes)
-    graph_health = _validate_graph_health(document, nodes, edges)
+    graph_health = _validate_graph_health(
+        document,
+        nodes,
+        edges,
+        semantics=contract.semantics,
+        collapsed_evidence_available=contract.evidence.pre_dedup_occurrences,
+    )
     skipped_count, unapproved_skips = _validate_extraction_coverage(
         document, nodes, edges, staged
     )
@@ -234,7 +244,7 @@ def validate_candidate(
         "files": relative_files,
         "skipped_count": skipped_count,
         "unapproved_skips": unapproved_skips,
-        "impact_analysis_trusted": graph_health.impact_analysis_trusted,
+        "impact_analysis_trusted": False,
     }
     ownership_path = root / OWNERSHIP_MANIFEST
     ownership_payload = _json_payload(ownership)
@@ -270,7 +280,7 @@ def validate_candidate(
         edge_count=len(edges),
         skipped_count=skipped_count,
         unapproved_skips=unapproved_skips,
-        impact_analysis_trusted=graph_health.impact_analysis_trusted,
+        impact_analysis_trusted=False,
     )
     evidence = _ValidationEvidence(validated, expected_snapshot)
     _VALIDATED_IN_PROCESS[id(validated)] = evidence
@@ -626,20 +636,26 @@ def _validate_graph_health(
     document: Mapping[str, Any],
     nodes: list[dict[str, Any]],
     edges: list[dict[str, Any]],
+    *,
+    semantics: GraphSemantics,
+    collapsed_evidence_available: bool,
 ) -> GraphIntegrity:
     recorded = document.get("graph_health")
     expected_fields = {
         "schema_version",
-        "dangling_edges",
-        "missing_endpoints",
-        "self_loops",
-        "duplicate_edges",
+        "node_count",
+        "edge_count",
+        "missing_endpoint_edges",
+        "dangling_endpoint_edges",
+        "invalid_self_loop_edges",
+        "exact_duplicate_edges",
+        "conflicting_relation_edges",
         "collapsed_edges",
-        "impact_analysis_trusted",
+        "structurally_valid",
     }
     if not isinstance(recorded, Mapping) or set(recorded) != expected_fields:
         raise ArtifactValidationError("graph health is missing or invalid")
-    if recorded["collapsed_edges"] is not None:
+    if not collapsed_evidence_available and recorded["collapsed_edges"] is not None:
         raise ArtifactValidationError(
             "Graphify 0.9.48 collapsed edge evidence must remain unknown"
         )
@@ -647,14 +663,15 @@ def _validate_graph_health(
         computed = analyze_graph(
             nodes,
             edges,
+            semantics=semantics,
             collapsed_edges=recorded["collapsed_edges"],
         )
     except (IntegrityError, TypeError) as error:
         raise ArtifactValidationError("graph health is invalid") from error
     if dict(recorded) != computed.to_dict():
         raise ArtifactValidationError("graph health does not match graph content")
-    if computed.dangling_edges or computed.missing_endpoints:
-        raise ArtifactValidationError("graph health contains invalid edge endpoints")
+    if not computed.structurally_valid:
+        raise ArtifactValidationError("graph health contains structural defects")
     return computed
 
 

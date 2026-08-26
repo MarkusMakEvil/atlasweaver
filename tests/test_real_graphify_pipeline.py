@@ -130,7 +130,8 @@ def test_real_graphify_stage_adapt_validate_promote_health_cycle(
     adapted_graph = json.loads((candidate / "graph.json").read_text(encoding="utf-8"))
     assert adapted_graph["project_id"] == "integration-demo"
     assert adapted_graph["graphify_version"] == PINNED_GRAPHIFY_VERSION
-    assert adapted_graph["graph_health"]["impact_analysis_trusted"] is False
+    assert adapted_graph["graph_health"]["schema_version"] == 2
+    assert adapted_graph["graph_health"]["structurally_valid"] is True
 
     validated = run_project_knowledge(
         repo, "validate", "--candidate", candidate

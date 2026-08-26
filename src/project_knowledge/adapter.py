@@ -11,6 +11,7 @@ from pathlib import Path, PurePosixPath
 import stat
 from typing import Any
 
+from .compatibility import CompatibilityError, resolve_graphify_compatibility
 from .integrity import IntegrityError, analyze_graph
 from .models import ProjectManifest
 from .staging import StagedInput
@@ -52,6 +53,10 @@ def adapt_candidate(
     post_write_check: Callable[[], None] | None = None,
 ) -> AdaptedCandidate:
     """Copy only public graph artifacts and inject deterministic wrapper metadata."""
+    try:
+        contract = resolve_graphify_compatibility(manifest.graphify_version)
+    except CompatibilityError as error:
+        raise AdapterError(str(error)) from error
     raw = _real_directory(raw_candidate, "raw Graphify candidate")
     target = destination.absolute()
     if target.name in {"", ".", ".."}:
@@ -77,11 +82,20 @@ def adapt_candidate(
         nodes, edges = _native_shape(document)
         _remove_empty_path_sentinels(nodes, edges)
         try:
-            graph_health = analyze_graph(nodes, edges)
+            graph_health = analyze_graph(
+                nodes,
+                edges,
+                semantics=contract.semantics,
+            )
         except IntegrityError as error:
             raise AdapterError("raw graph integrity is invalid") from error
-        if graph_health.dangling_edges or graph_health.missing_endpoints:
+        if (
+            graph_health.dangling_endpoint_edges
+            or graph_health.missing_endpoint_edges
+        ):
             raise AdapterError("raw graph has invalid edge endpoints")
+        if not graph_health.structurally_valid:
+            raise AdapterError("raw graph is structurally invalid")
         staged_files = frozenset(staged.files)
         represented = _represented_paths(nodes, edges, staged_files)
         _canonicalize_node_source_aliases(nodes, staged_files)
@@ -97,7 +111,7 @@ def adapt_candidate(
         document.update(
             {
                 "project_id": manifest.project_id,
-                "graphify_version": manifest.graphify_version,
+                "graphify_version": contract.version,
                 "source_digest": staged.source_digest,
                 "graph_health": graph_health.to_dict(),
                 "extraction_coverage": {

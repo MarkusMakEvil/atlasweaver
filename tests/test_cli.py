@@ -11,6 +11,7 @@ import sys
 
 import pytest
 
+from project_knowledge.compatibility import production_graphify_compatibility
 from project_knowledge.integrity import analyze_graph
 
 
@@ -377,7 +378,9 @@ def write_graph_candidate(candidate: Path, source_digest: str) -> None:
         "nodes": [{"id": "app", "source_file": "src/app.py"}],
         "edges": [],
         "graph_health": analyze_graph(
-            [{"id": "app", "source_file": "src/app.py"}], []
+            [{"id": "app", "source_file": "src/app.py"}],
+            [],
+            semantics=production_graphify_compatibility().semantics,
         ).to_dict(),
         "extraction_coverage": {"schema_version": 1, "total_staged_files": 1, "represented_source_paths": ["src/app.py"], "skipped": []},
     }

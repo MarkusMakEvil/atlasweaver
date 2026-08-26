@@ -12,6 +12,7 @@ import stat
 from typing import Any, Literal
 
 from .artifacts import OWNERSHIP_MANIFEST
+from .compatibility import GraphSemantics, resolve_graphify_compatibility
 from .integrity import IntegrityError, analyze_graph
 from .models import ProjectManifest
 from .privacy import effective_excludes, is_denied
@@ -397,7 +398,9 @@ def _read_valid_graph_metadata(
         _reject_nonfinite(graph)
         if not isinstance(graph, dict):
             raise ValueError("invalid graph")
-        impact_analysis_trusted = _validate_graph_integrity_metadata(graph)
+        contract = resolve_graphify_compatibility(manifest.graphify_version)
+        _validate_graph_integrity_metadata(graph, semantics=contract.semantics)
+        impact_analysis_trusted = False
         if ownership["impact_analysis_trusted"] is not impact_analysis_trusted:
             raise ValueError("graph integrity ownership mismatch")
         coverage = graph.get("extraction_coverage")
@@ -412,7 +415,9 @@ def _read_valid_graph_metadata(
         os.close(output_fd)
 
 
-def _validate_graph_integrity_metadata(graph: dict[str, Any]) -> bool:
+def _validate_graph_integrity_metadata(
+    graph: dict[str, Any], *, semantics: GraphSemantics
+) -> None:
     nodes = graph.get("nodes")
     if "edges" in graph and "links" in graph:
         raise ValueError("ambiguous graph edges")
@@ -428,12 +433,15 @@ def _validate_graph_integrity_metadata(graph: dict[str, Any]) -> bool:
     recorded = graph.get("graph_health")
     expected_fields = {
         "schema_version",
-        "dangling_edges",
-        "missing_endpoints",
-        "self_loops",
-        "duplicate_edges",
+        "node_count",
+        "edge_count",
+        "missing_endpoint_edges",
+        "dangling_endpoint_edges",
+        "invalid_self_loop_edges",
+        "exact_duplicate_edges",
+        "conflicting_relation_edges",
         "collapsed_edges",
-        "impact_analysis_trusted",
+        "structurally_valid",
     }
     if not isinstance(recorded, dict) or set(recorded) != expected_fields:
         raise ValueError("invalid graph integrity metadata")
@@ -443,15 +451,15 @@ def _validate_graph_integrity_metadata(graph: dict[str, Any]) -> bool:
         computed = analyze_graph(
             nodes,
             edges,
+            semantics=semantics,
             collapsed_edges=recorded["collapsed_edges"],
         )
     except (IntegrityError, TypeError) as error:
         raise ValueError("invalid graph integrity metadata") from error
     if recorded != computed.to_dict():
         raise ValueError("graph integrity metadata mismatch")
-    if computed.dangling_edges or computed.missing_endpoints:
-        raise ValueError("invalid graph endpoints")
-    return computed.impact_analysis_trusted
+    if not computed.structurally_valid:
+        raise ValueError("invalid graph structure")
 
 
 def _validate_query_cache(output_fd: int) -> None:

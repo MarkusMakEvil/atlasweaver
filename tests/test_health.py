@@ -7,6 +7,7 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
+from project_knowledge.compatibility import production_graphify_compatibility
 from project_knowledge.integrity import analyze_graph
 from project_knowledge.health import (
     KnowledgeState,
@@ -259,7 +260,7 @@ def test_inspection_treats_source_digest_mismatch_as_authoritative(
     (repo / "src/app.py").write_text("current\n", encoding="utf-8")
     output = repo / "graphify-out"
     output.mkdir()
-    graph = json.dumps({"nodes": [{"id": "app", "source_file": "src/app.py"}], "edges": [], "graph_health": analyze_graph([{"id": "app", "source_file": "src/app.py"}], []).to_dict(), "extraction_coverage": {"schema_version": 1, "total_staged_files": 1, "represented_source_paths": ["src/app.py"], "skipped": []}}).encode() + b"\n"
+    graph = json.dumps({"nodes": [{"id": "app", "source_file": "src/app.py"}], "edges": [], "graph_health": analyze_graph([{"id": "app", "source_file": "src/app.py"}], [], semantics=production_graphify_compatibility().semantics).to_dict(), "extraction_coverage": {"schema_version": 1, "total_staged_files": 1, "represented_source_paths": ["src/app.py"], "skipped": []}}).encode() + b"\n"
     (output / "graph.json").write_bytes(graph)
     report = b"# report\n"
     html = b"<title>demo</title>\n"
@@ -350,7 +351,7 @@ def test_inspection_recomputes_graph_integrity_instead_of_trusting_ownership(
     graph_path = output / "graph.json"
     graph = json.loads(graph_path.read_text(encoding="utf-8"))
     graph["graph_health"]["collapsed_edges"] = 0
-    graph["graph_health"]["impact_analysis_trusted"] = True
+    graph["graph_health"]["structurally_valid"] = False
     graph_payload = json.dumps(graph).encode() + b"\n"
     graph_path.write_bytes(graph_payload)
 
@@ -466,7 +467,7 @@ def snapshot_tree(root: Path) -> tuple[tuple[str, str, bytes], ...]:
 def _write_valid_graph_output(repo: Path) -> None:
     output = repo / "graphify-out"
     output.mkdir()
-    graph = json.dumps({"nodes": [{"id": "app", "source_file": "src/app.py"}], "edges": [], "graph_health": analyze_graph([{"id": "app", "source_file": "src/app.py"}], []).to_dict(), "extraction_coverage": {"schema_version": 1, "total_staged_files": 1, "represented_source_paths": ["src/app.py"], "skipped": []}}).encode() + b"\n"
+    graph = json.dumps({"nodes": [{"id": "app", "source_file": "src/app.py"}], "edges": [], "graph_health": analyze_graph([{"id": "app", "source_file": "src/app.py"}], [], semantics=production_graphify_compatibility().semantics).to_dict(), "extraction_coverage": {"schema_version": 1, "total_staged_files": 1, "represented_source_paths": ["src/app.py"], "skipped": []}}).encode() + b"\n"
     (output / "graph.json").write_bytes(graph)
     report = b"# report\n"
     html = b"<title>demo</title>\n"

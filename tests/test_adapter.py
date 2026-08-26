@@ -105,13 +105,16 @@ def test_adapter_enriches_native_graph_without_mutating_raw_candidate(
         ],
     }
     assert document["graph_health"] == {
-        "schema_version": 1,
-        "dangling_edges": 0,
-        "missing_endpoints": 0,
-        "self_loops": 0,
-        "duplicate_edges": 0,
+        "schema_version": 2,
+        "node_count": 1,
+        "edge_count": 0,
+        "missing_endpoint_edges": 0,
+        "dangling_endpoint_edges": 0,
+        "invalid_self_loop_edges": 0,
+        "exact_duplicate_edges": 0,
+        "conflicting_relation_edges": 0,
         "collapsed_edges": None,
-        "impact_analysis_trusted": False,
+        "structurally_valid": True,
     }
     assert {path.relative_to(source): path.read_bytes() for path in source.rglob("*") if path.is_file()} == before
     validated = validate_candidate(destination, stage, manifest())
