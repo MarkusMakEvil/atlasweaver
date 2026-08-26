@@ -35,7 +35,7 @@ jobs:
       attestations: write
       contents: write
       id-token: write
-    uses: MarkusMakEvil/atlasweaver/.github/workflows/atlasweaver-publish.yml@386d3ae9d074c38c4ac1ab54acd44593b4dda223
+    uses: MarkusMakEvil/atlasweaver/.github/workflows/atlasweaver-publish.yml@b25d91678c0b6b277bbe8dcf1971d45c2b685b97
     with:
       backend: ${{ inputs.backend }}
       model: ${{ inputs.model }}
