@@ -31,6 +31,7 @@ from project_knowledge.compatibility import (
     render_graphify_global_add,
     resolve_graphify_compatibility,
     supported_graphify_versions,
+    validate_public_model_identifier,
     validate_semantic_backend,
 )
 from project_knowledge.graphify import (
@@ -505,7 +506,7 @@ def test_render_pipeline_argv_is_exact_and_canonical(tmp_path: Path) -> None:
         ({}, "choose exactly one extraction mode"),
         ({"code_only": True, "backend": "openai", "model": "gpt"}, "choose exactly one extraction mode"),
         ({"code_only": True, "deep": True}, "deep mode requires a semantic backend"),
-        ({"backend": "openai", "model": ""}, "semantic model is required"),
+        ({"backend": "openai", "model": ""}, "semantic_model_required"),
         ({"backend": "unknown", "model": "m"}, "semantic backend is unsupported"),
     ],
 )
@@ -693,3 +694,21 @@ def test_capability_surface_rejects_any_contract_drift() -> None:
     ):
         with pytest.raises(CompatibilityError, match="Graphify capability surface mismatch"):
             assert_capability_surface(contract, changed)
+
+
+@pytest.mark.parametrize("model", ["gpt-5", "vendor/model-1", "family:model_2"])
+def test_public_model_identifier_round_trips(model: str) -> None:
+    assert validate_public_model_identifier(model) == model
+
+
+@pytest.mark.parametrize(
+    "model",
+    [None, "", "-flag", "bad model", "bad\nmodel", "é", "x" * 129,
+     "ghp_" + "a" * 32, "../../model"],
+)
+def test_public_model_identifier_fails_closed_without_echo(model: object) -> None:
+    with pytest.raises(CompatibilityError) as raised:
+        validate_public_model_identifier(model)
+    assert str(raised.value) == "semantic_model_required"
+    if isinstance(model, str) and model:
+        assert model not in repr(raised.value)

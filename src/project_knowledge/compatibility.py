@@ -12,6 +12,8 @@ from types import MappingProxyType
 from typing import Literal
 from uuid import UUID
 
+from .secrets_scan import has_secret_shape
+
 
 class CompatibilityError(ValueError):
     """Raised when a Graphify version or capability is outside the registry."""
@@ -110,6 +112,11 @@ _FORBIDDEN = frozenset({
     "--no-gitignore", "--cargo", "--project", "--strict", "--platform",
 })
 _HEX_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
+_PUBLIC_MODEL_IDENTIFIER = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._-]*"
+    r"(?:/[A-Za-z0-9][A-Za-z0-9._-]*)?"
+    r"(?::[A-Za-z0-9][A-Za-z0-9._-]*)?\Z"
+)
 
 _GRAPHIFY_0_9_48_NATIVE_SCHEMA = {
     "artifact": "extract --no-cluster",
@@ -284,9 +291,24 @@ def _require_backend_and_model(
     contract: GraphifyCompatibility, backend: str | None, model: str | None
 ) -> BackendContract:
     item = _backend(contract, backend)
-    if not isinstance(model, str) or not model:
-        raise CompatibilityError("semantic model is required")
+    validate_public_model_identifier(model)
     return item
+
+
+def validate_public_model_identifier(model: object) -> str:
+    """Validate the public, non-secret model identifier used in argv/evidence."""
+    if type(model) is not str or not 1 <= len(model) <= 128:
+        raise CompatibilityError("semantic_model_required")
+    try:
+        payload = model.encode("ascii")
+    except UnicodeEncodeError:
+        raise CompatibilityError("semantic_model_required") from None
+    if (
+        _PUBLIC_MODEL_IDENTIFIER.fullmatch(model) is None
+        or has_secret_shape(payload)
+    ):
+        raise CompatibilityError("semantic_model_required")
+    return model
 
 
 def render_graphify_argv(

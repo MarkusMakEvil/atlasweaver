@@ -17,7 +17,7 @@ import subprocess
 from subprocess import CompletedProcess
 import tempfile
 from threading import Thread
-from typing import Literal, Protocol, TextIO
+from typing import Callable, Literal, Protocol, TextIO
 
 from .compatibility import (
     CapabilityProbe,
@@ -41,6 +41,14 @@ OUTPUT_TRUNCATION_MARKER = "\n[output truncated]"
 PROCESS_CLEANUP_TIMEOUT = 0.25
 MAX_EXECUTABLE_BYTES = 16 * 1024 * 1024
 MAX_PROBE_ARTIFACT_BYTES = 16 * 1024 * 1024
+
+
+def _noop() -> None:
+    """Default binding checkpoint."""
+
+
+def _process_boundary_test_checkpoint(operation: str) -> None:
+    """Private failure-injection seam; production deliberately does nothing."""
 
 
 class CommandRunner(Protocol):
@@ -285,15 +293,52 @@ def run_checked(
     *,
     env: Mapping[str, str] | None = None,
     timeout: float = COMMAND_TIMEOUT,
+    before_exec: Callable[[], None] = _noop,
 ) -> CompletedProcess[str]:
     """Revalidate and run one immutable Graphify command with safe diagnostics."""
     command = tuple(str(part) for part in argv)
-    if not command or command[0] != str(executable.path):
-        raise GraphifyContractError("graphify_executable_changed")
     operation = _operation_name(command)
-    selected_environment = dict(minimal_environment() if env is None else env)
+    return run_graphify_operation(
+        runner,
+        executable,
+        command,
+        env=minimal_environment() if env is None else env,
+        timeout=timeout,
+        operation=operation,
+        before_exec=before_exec,
+    )
+
+
+def run_graphify_operation(
+    runner: CommandRunner,
+    executable: ResolvedGraphifyExecutable,
+    argv: Sequence[str],
+    *,
+    env: Mapping[str, str],
+    timeout: float,
+    operation: str,
+    before_exec: Callable[[], None] = _noop,
+) -> CompletedProcess[str]:
+    """Run one exact Graphify argv under a capped, redacting boundary."""
+    if (
+        not argv
+        or type(operation) is not str
+        or not operation
+        or isinstance(timeout, bool)
+        or not isinstance(timeout, (int, float))
+        or timeout <= 0
+    ):
+        raise GraphifyContractError("Graphify operation contract is invalid")
+    command = tuple(str(part) for part in argv)
+    if command[0] != str(executable.path):
+        raise GraphifyContractError("graphify_executable_changed")
+    selected_environment = dict(env)
     explicit_sensitive_values = _non_base_environment_values(selected_environment)
+    _process_boundary_test_checkpoint(operation)
+    before_exec()
     revalidate_graphify_executable(executable)
+    failure_message: str | None = None
+    result: CompletedProcess[str] | None = None
     try:
         result = runner.run(
             command,
@@ -304,36 +349,45 @@ def run_checked(
             env=selected_environment,
         )
     except subprocess.TimeoutExpired:
-        raise GraphifyCommandError(operation, "command timed out") from None
+        failure_message = "command timed out"
     except OSError:
-        raise GraphifyCommandError(operation, "command could not be executed") from None
-    result = _capped_result(result, explicit_sensitive_values)
-    if result.returncode:
+        failure_message = "command could not be executed"
+    if failure_message is not None:
+        raise GraphifyCommandError(operation, failure_message) from None
+    assert result is not None
+    safe_result = _safe_result(result, explicit_sensitive_values)
+    if safe_result.returncode:
         raise GraphifyCommandError(
             operation,
             sanitize_stderr(
-                result.stderr,
-                extra_sensitive_values=explicit_sensitive_values,
+                safe_result.stderr,
+                sensitive_values=explicit_sensitive_values,
             ),
         )
-    return result
+    return safe_result
 
 
 def probe_graphify(
     executable: ResolvedGraphifyExecutable,
     contract: GraphifyCompatibility,
     runner: CommandRunner,
+    *,
+    before_exec: Callable[[], None] = _noop,
 ) -> GraphifyCapabilities:
     """Operationally verify the complete registry-declared CLI surface."""
     binary = executable.path
-    version_result = run_checked(runner, executable, (str(binary), "--version"))
+    version_result = run_checked(
+        runner, executable, (str(binary), "--version"), before_exec=before_exec
+    )
     installed_version = _parse_version(version_result.stdout)
     if installed_version != contract.version:
         raise GraphifyContractError(
             f"expected {contract.version}, got {installed_version}"
         )
 
-    help_result = run_checked(runner, executable, (str(binary), "--help"))
+    help_result = run_checked(
+        runner, executable, (str(binary), "--help"), before_exec=before_exec
+    )
     commands = _parse_cli_commands(help_result.stdout)
     missing = contract.required_cli_commands - commands
     if missing:
@@ -341,7 +395,9 @@ def probe_graphify(
             "missing required CLI commands: " + ", ".join(sorted(missing))
         )
     try:
-        capability_probe = _run_capability_smoke(executable, contract, runner, commands)
+        capability_probe = _run_capability_smoke(
+            executable, contract, runner, commands, before_exec=before_exec
+        )
         assert_capability_surface(contract, capability_probe)
     except CompatibilityError as error:
         raise GraphifyContractError(str(error)) from error
@@ -360,6 +416,8 @@ def _run_capability_smoke(
     contract: GraphifyCompatibility,
     runner: CommandRunner,
     commands: frozenset[str],
+    *,
+    before_exec: Callable[[], None] = _noop,
 ) -> CapabilityProbe:
     smoke_payload = resources.files("project_knowledge.compatibility_fixtures").joinpath(
         "runtime_probe.py"
@@ -387,8 +445,14 @@ def _run_capability_smoke(
                 {**minimal_environment(), "HOME": str(root / "extract-home")},
             )
             Path(base_environment["HOME"]).mkdir(mode=0o700)
-            run_checked(runner, executable, code_command.argv, env=base_environment)
-            run_checked(runner, executable, semantic_command.argv, env=base_environment)
+            run_checked(
+                runner, executable, code_command.argv, env=base_environment,
+                before_exec=before_exec,
+            )
+            run_checked(
+                runner, executable, semantic_command.argv, env=base_environment,
+                before_exec=before_exec,
+            )
 
             native_path = code_output / "graphify-out" / "graph.json"
             semantic_path = semantic_output / "graphify-out" / "graph.json"
@@ -403,7 +467,8 @@ def _run_capability_smoke(
                 output=code_output, graph=native_path,
             )
             diagnosis_result = run_checked(
-                runner, executable, diagnose_command.argv, env=base_environment
+                runner, executable, diagnose_command.argv, env=base_environment,
+                before_exec=before_exec,
             )
             diagnosis_full = _load_bounded_json_text(diagnosis_result.stdout)
             diagnosis = _sanitize_diagnosis(diagnosis_full)
@@ -413,7 +478,10 @@ def _run_capability_smoke(
                 contract, "cluster", binary=executable.path, source=code_output,
                 output=code_output, graph=native_path, track_html=False,
             )
-            run_checked(runner, executable, cluster_command.argv, env=base_environment)
+            run_checked(
+                runner, executable, cluster_command.argv, env=base_environment,
+                before_exec=before_exec,
+            )
             clustered_fingerprint = _validate_clustered_document(
                 _read_probe_json(native_path)
             )
@@ -429,7 +497,10 @@ def _run_capability_smoke(
                 contract, None,
                 {**minimal_environment(), "HOME": str(registry_home)},
             )
-            run_checked(runner, executable, global_command.argv, env=registry_environment)
+            run_checked(
+                runner, executable, global_command.argv, env=registry_environment,
+                before_exec=before_exec,
+            )
             registry_root = registry_home / ".graphify"
             global_graph = _read_probe_json(registry_root / "global-graph.json")
             global_manifest = _read_probe_json(registry_root / "global-manifest.json")
@@ -448,7 +519,8 @@ def _run_capability_smoke(
                     {**minimal_environment(), "HOME": str(install_home)},
                 )
                 run_checked(
-                    runner, executable, install_command.argv, env=install_environment
+                    runner, executable, install_command.argv,
+                    env=install_environment, before_exec=before_exec,
                 )
                 _validate_install_home(install_home, target.home_relative_skill)
                 installed_platforms.add(target.platform)
@@ -675,10 +747,31 @@ def sync_global_registry(
 def sanitize_stderr(
     stderr: str | None,
     *,
+    sensitive_values: Sequence[str] = (),
     extra_sensitive_values: Sequence[str] = (),
+    output_limit: int = MAX_CAPTURED_OUTPUT_CHARS,
 ) -> str:
     """Return a capped diagnostic without credentials, atlas paths, or env values."""
-    value = _cap_output(stderr or "").strip()
+    value = _sanitize_output(
+        stderr or "",
+        (
+            *sensitive_values,
+            *extra_sensitive_values,
+            *_sensitive_environment_values(),
+        ),
+        output_limit=output_limit,
+    ).strip()
+    return value or "Graphify returned no diagnostic"
+
+
+def _sanitize_output(
+    stream: str,
+    sensitive_values: Sequence[str],
+    *,
+    output_limit: int = MAX_CAPTURED_OUTPUT_CHARS,
+) -> str:
+    value = _bounded_to_limit(stream, output_limit)
+    value = _redact_values(value, sensitive_values)
     value = re.sub(
         r"(?i)\b(api[_-]?key|token|password|secret|authorization)\s*[=:]\s*"
         r"(?:bearer\s+)?[^\s,;]+",
@@ -692,11 +785,7 @@ def sanitize_stderr(
         value,
         flags=re.IGNORECASE,
     )
-    for environment_value in _distinct_sensitive_values(
-        (*_sensitive_environment_values(), *extra_sensitive_values)
-    ):
-        value = value.replace(environment_value, "[REDACTED]")
-    return _cap_output(value) or "Graphify returned no diagnostic"
+    return _bounded_to_limit(value, output_limit)
 
 
 def _drain(stream: TextIO, output: _CappedText) -> None:
@@ -704,20 +793,38 @@ def _drain(stream: TextIO, output: _CappedText) -> None:
         output.append(chunk)
 
 
-def _capped_result(
+def _safe_result(
     result: CompletedProcess[str],
     sensitive_values: Sequence[str] = (),
 ) -> CompletedProcess[str]:
     return CompletedProcess(
         result.args,
         result.returncode,
-        _cap_output(_redact_values(result.stdout or "", sensitive_values)),
-        _cap_output(_redact_values(result.stderr or "", sensitive_values)),
+        _sanitize_output(result.stdout or "", sensitive_values),
+        _sanitize_output(result.stderr or "", sensitive_values),
     )
+
+
+def _capped_result(
+    result: CompletedProcess[str],
+    sensitive_values: Sequence[str] = (),
+) -> CompletedProcess[str]:
+    """Backward-compatible private alias for older focused tests."""
+    return _safe_result(result, sensitive_values)
 
 
 def _cap_output(value: str) -> str:
     return _bounded_output(value, truncated=len(value) > MAX_CAPTURED_OUTPUT_CHARS)
+
+
+def _bounded_to_limit(value: str, limit: int) -> str:
+    if isinstance(limit, bool) or type(limit) is not int or limit <= 0:
+        raise ValueError("output limit must be a positive integer")
+    if len(value) <= limit:
+        return value
+    if limit <= len(OUTPUT_TRUNCATION_MARKER):
+        return value[:limit]
+    return value[: limit - len(OUTPUT_TRUNCATION_MARKER)] + OUTPUT_TRUNCATION_MARKER
 
 
 def _bounded_output(value: str, *, truncated: bool) -> str:
