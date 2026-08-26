@@ -42,7 +42,12 @@ graphify_version: 0.9.48
     return repo
 
 
-def run_cli(repo: Path, command: str, *arguments: object) -> subprocess.CompletedProcess[str]:
+def run_cli(
+    repo: Path,
+    command: str,
+    *arguments: object,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [
             sys.executable,
@@ -56,6 +61,7 @@ def run_cli(repo: Path, command: str, *arguments: object) -> subprocess.Complete
         text=True,
         capture_output=True,
         check=False,
+        env=env,
     )
 
 
@@ -87,15 +93,60 @@ def graphify_executable(tmp_path: Path) -> tuple[Path, Path]:
         tmp_path / "graphify",
         f"""#!{sys.executable}
 import json
+import os
 import pathlib
 import sys
 path = pathlib.Path({str(calls)!r})
 with path.open('a', encoding='utf-8') as stream:
     stream.write(json.dumps(sys.argv[1:]) + '\\n')
-if sys.argv[1:] == ['--version']:
+arguments = sys.argv[1:]
+if arguments == ['--version']:
     print('graphify 0.9.48')
-elif sys.argv[1:] == ['--help']:
-    print('Commands:\\n  query\\n  explain\\n  path\\n  global\\n  export')
+elif arguments == ['--help']:
+    print('Commands:\\n  extract\\n  diagnose\\n  cluster-only\\n  query\\n  explain\\n  path\\n  global\\n  export\\n  install')
+elif arguments and arguments[0] == 'extract':
+    output = pathlib.Path(arguments[arguments.index('--out') + 1]) / 'graphify-out'
+    output.mkdir(parents=True)
+    (output / 'graph.json').write_text(json.dumps({{
+        'nodes': [{{'id': 'probe'}}], 'edges': [], 'hyperedges': [],
+        'input_tokens': 0, 'output_tokens': 0
+    }}), encoding='utf-8')
+elif arguments[:2] == ['diagnose', 'multigraph']:
+    print(json.dumps({{
+        'schema_version': 1,
+        'summary': {{
+            'node_count': 1, 'raw_edge_count': 0, 'missing_endpoint_edges': 0,
+            'dangling_endpoint_edges': 0, 'self_loop_edges': 0,
+            'exact_duplicate_edges': 0, 'undirected_unique_endpoint_pairs': 0,
+            'undirected_same_endpoint_collapsed_edges': 0,
+            'same_endpoint_group_count': 0, 'relation_variant_groups': 0,
+            'source_file_variant_groups': 0, 'source_location_variant_groups': 0,
+            'context_variant_groups': 0, 'post_build_graph_type': 'Graph',
+            'post_build_node_count': 1, 'post_build_edge_count': 0,
+            'effective_directed': False
+        }}
+    }}))
+elif arguments and arguments[0] == 'cluster-only':
+    graph = pathlib.Path(arguments[arguments.index('--graph') + 1])
+    graph.write_text(json.dumps({{
+        'directed': False, 'multigraph': False, 'graph': {{}},
+        'nodes': [{{'id': 'probe'}}], 'links': [], 'hyperedges': []
+    }}), encoding='utf-8')
+elif arguments[:2] == ['global', 'add']:
+    home = pathlib.Path(os.environ['HOME']) / '.graphify'
+    home.mkdir(parents=True)
+    key = arguments[arguments.index('--as') + 1]
+    (home / 'global-graph.json').write_text(
+        json.dumps({{'nodes': [{{'id': 'probe'}}], 'links': []}}), encoding='utf-8'
+    )
+    (home / 'global-manifest.json').write_text(
+        json.dumps({{'repos': {{key: {{}}}}}}), encoding='utf-8'
+    )
+elif arguments and arguments[0] == 'install':
+    platform = arguments[arguments.index('--platform') + 1]
+    skill = pathlib.Path(os.environ['HOME']) / f'.{{platform}}/skills/graphify/SKILL.md'
+    skill.parent.mkdir(parents=True)
+    skill.write_text('# Graphify\\n', encoding='utf-8')
 else:
     raise SystemExit(9)
 """,
@@ -151,11 +202,16 @@ def test_detect_json_is_read_only_and_path_free(tmp_path: Path) -> None:
 def test_preflight_json_is_non_mutating_and_probes_exact_graphify_argv(
     tmp_path: Path,
 ) -> None:
-    """Preflight resolves only the literal Graphify command and stays read-only."""
+    """Preflight runs the exact confined nine-command Graphify probe sequence."""
     repo = project(tmp_path)
+    _, calls = graphify_executable(tmp_path)
     before = tree_snapshot(repo)
+    environment = {
+        **os.environ,
+        "PATH": f"{tmp_path}{os.pathsep}{os.environ.get('PATH', os.defpath)}",
+    }
 
-    result = run_cli(repo, "preflight", "--json")
+    result = run_cli(repo, "preflight", "--json", env=environment)
 
     assert result.returncode == 0
     assert payload(result) == {
@@ -169,6 +225,22 @@ def test_preflight_json_is_non_mutating_and_probes_exact_graphify_argv(
     }
     assert tree_snapshot(repo) == before
     assert not (repo / ".project-knowledge").exists()
+    recorded = [json.loads(line) for line in calls.read_text(encoding="utf-8").splitlines()]
+    assert recorded[:2] == [["--version"], ["--help"]]
+    source = Path(recorded[2][1])
+    smoke_root = source.parent
+    code_output = smoke_root / "code"
+    semantic_output = smoke_root / "semantic"
+    native_graph = code_output / "graphify-out/graph.json"
+    assert recorded[2:] == [
+        ["extract", str(source), "--out", str(code_output), "--no-cluster", "--code-only"],
+        ["extract", str(source), "--out", str(semantic_output), "--no-cluster", "--backend", "ollama", "--model", "atlasweaver-capability-probe", "--mode", "deep"],
+        ["diagnose", "multigraph", "--graph", str(native_graph), "--undirected", "--json"],
+        ["cluster-only", str(code_output), "--graph", str(native_graph), "--no-label", "--no-viz"],
+        ["global", "add", str(native_graph), "--as", "atlasweaver/00000000-0000-4000-8000-000000000000"],
+        ["install", "--platform", "codex"],
+        ["install", "--platform", "agents"],
+    ]
 
 
 @pytest.mark.parametrize("option", ["--graphify-binary", "--assistant-skill"])

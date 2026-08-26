@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 import hashlib
 from importlib import resources
@@ -291,6 +291,8 @@ def run_checked(
     if not command or command[0] != str(executable.path):
         raise GraphifyContractError("graphify_executable_changed")
     operation = _operation_name(command)
+    selected_environment = dict(minimal_environment() if env is None else env)
+    explicit_sensitive_values = _non_base_environment_values(selected_environment)
     revalidate_graphify_executable(executable)
     try:
         result = runner.run(
@@ -299,15 +301,21 @@ def run_checked(
             capture_output=True,
             check=False,
             timeout=timeout,
-            env=dict(minimal_environment() if env is None else env),
+            env=selected_environment,
         )
-    except subprocess.TimeoutExpired as error:
-        raise GraphifyCommandError(operation, "command timed out") from error
-    except OSError as error:
-        raise GraphifyCommandError(operation, "command could not be executed") from error
-    result = _capped_result(result)
+    except subprocess.TimeoutExpired:
+        raise GraphifyCommandError(operation, "command timed out") from None
+    except OSError:
+        raise GraphifyCommandError(operation, "command could not be executed") from None
+    result = _capped_result(result, explicit_sensitive_values)
     if result.returncode:
-        raise GraphifyCommandError(operation, sanitize_stderr(result.stderr))
+        raise GraphifyCommandError(
+            operation,
+            sanitize_stderr(
+                result.stderr,
+                extra_sensitive_values=explicit_sensitive_values,
+            ),
+        )
     return result
 
 
@@ -528,7 +536,8 @@ def _load_bounded_json_text(payload: str) -> object:
 
 
 def _sanitize_diagnosis(document: object) -> dict[str, object]:
-    if not isinstance(document, Mapping) or set(document) < {"schema_version", "summary"}:
+    required = {"schema_version", "summary"}
+    if not isinstance(document, Mapping) or not required <= set(document):
         raise GraphifyContractError("Graphify diagnostic schema mismatch")
     summary = document["summary"]
     if not isinstance(summary, Mapping):
@@ -663,7 +672,11 @@ def sync_global_registry(
     return RegistryResult(status="registered", project_id=registry_key)
 
 
-def sanitize_stderr(stderr: str | None) -> str:
+def sanitize_stderr(
+    stderr: str | None,
+    *,
+    extra_sensitive_values: Sequence[str] = (),
+) -> str:
     """Return a capped diagnostic without credentials, atlas paths, or env values."""
     value = _cap_output(stderr or "").strip()
     value = re.sub(
@@ -679,7 +692,9 @@ def sanitize_stderr(stderr: str | None) -> str:
         value,
         flags=re.IGNORECASE,
     )
-    for environment_value in _sensitive_environment_values():
+    for environment_value in _distinct_sensitive_values(
+        (*_sensitive_environment_values(), *extra_sensitive_values)
+    ):
         value = value.replace(environment_value, "[REDACTED]")
     return _cap_output(value) or "Graphify returned no diagnostic"
 
@@ -689,12 +704,15 @@ def _drain(stream: TextIO, output: _CappedText) -> None:
         output.append(chunk)
 
 
-def _capped_result(result: CompletedProcess[str]) -> CompletedProcess[str]:
+def _capped_result(
+    result: CompletedProcess[str],
+    sensitive_values: Sequence[str] = (),
+) -> CompletedProcess[str]:
     return CompletedProcess(
         result.args,
         result.returncode,
-        _cap_output(result.stdout or ""),
-        _cap_output(result.stderr or ""),
+        _cap_output(_redact_values(result.stdout or "", sensitive_values)),
+        _cap_output(_redact_values(result.stderr or "", sensitive_values)),
     )
 
 
@@ -773,3 +791,28 @@ def _sensitive_environment_values() -> tuple[str, ...]:
         if len(value) >= 5:
             values.append(value)
     return tuple(values)
+
+
+def _non_base_environment_values(environment: Mapping[str, str]) -> tuple[str, ...]:
+    base_names = frozenset(minimal_environment())
+    return _distinct_sensitive_values(
+        value
+        for name, value in environment.items()
+        if name not in base_names and isinstance(value, str) and value
+    )
+
+
+def _distinct_sensitive_values(values: Iterable[object]) -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            {value for value in values if isinstance(value, str) and value},
+            key=len,
+            reverse=True,
+        )
+    )
+
+
+def _redact_values(value: str, sensitive_values: Sequence[str]) -> str:
+    for sensitive in _distinct_sensitive_values(sensitive_values):
+        value = value.replace(sensitive, "[REDACTED]")
+    return value

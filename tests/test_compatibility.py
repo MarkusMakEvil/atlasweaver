@@ -9,8 +9,11 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import runpy
 import stat
 from subprocess import CompletedProcess
+import subprocess
+import sys
 
 import pytest
 
@@ -36,6 +39,15 @@ from project_knowledge.graphify import (
     revalidate_graphify_executable,
     run_checked,
 )
+
+
+_CAPTURE_TOOL = runpy.run_path(
+    str(Path("scripts/capture-graphify-compatibility-fixture").resolve()),
+    run_name="atlasweaver_capture_fixture_tests",
+)
+_capture_load_json = _CAPTURE_TOOL["_load_json"]
+_capture_reject_absolute_paths = _CAPTURE_TOOL["_reject_absolute_paths"]
+_capture_write_output = _CAPTURE_TOOL["_write_output"]
 
 
 _SOURCE_SUFFIXES = frozenset(
@@ -65,6 +77,52 @@ def _launcher(path: Path, payload: bytes = b"#!/bin/sh\nexit 0\n") -> Path:
     path.write_bytes(payload)
     path.chmod(0o755)
     return path
+
+
+def _capture_graphify_launcher(tmp_path: Path) -> tuple[Path, Path]:
+    calls = tmp_path / "capture-calls.jsonl"
+    launcher = tmp_path / "capture-graphify"
+    launcher.write_text(
+        f"""#!{sys.executable}
+import json
+import os
+from pathlib import Path
+import sys
+
+with Path({str(calls)!r}).open("a", encoding="utf-8") as stream:
+    stream.write(json.dumps({{"argv": sys.argv[1:], "env": dict(os.environ)}}) + "\\n")
+arguments = sys.argv[1:]
+if arguments == ["--version"]:
+    print("graphify 0.9.48")
+elif arguments and arguments[0] == "extract":
+    output = Path(arguments[arguments.index("--out") + 1]) / "graphify-out"
+    output.mkdir(parents=True)
+    (output / "graph.json").write_text(json.dumps({{
+        "nodes": [{{"id": "fixture"}}], "edges": [], "hyperedges": [],
+        "input_tokens": 0, "output_tokens": 0
+    }}), encoding="utf-8")
+elif arguments[:2] == ["diagnose", "multigraph"]:
+    print(json.dumps({{
+        "schema_version": 1,
+        "summary": {{
+            "node_count": 1, "raw_edge_count": 0, "missing_endpoint_edges": 0,
+            "dangling_endpoint_edges": 0, "self_loop_edges": 0,
+            "exact_duplicate_edges": 0, "undirected_unique_endpoint_pairs": 0,
+            "undirected_same_endpoint_collapsed_edges": 0,
+            "same_endpoint_group_count": 0, "relation_variant_groups": 0,
+            "source_file_variant_groups": 0, "source_location_variant_groups": 0,
+            "context_variant_groups": 0, "post_build_graph_type": "Graph",
+            "post_build_node_count": 1, "post_build_edge_count": 0,
+            "effective_directed": False
+        }}
+    }}))
+else:
+    raise SystemExit(9)
+""",
+        encoding="utf-8",
+    )
+    launcher.chmod(0o755)
+    return launcher, calls
 
 
 def test_registry_resolves_only_exact_declared_versions() -> None:
@@ -183,6 +241,121 @@ def test_compatibility_fixture_is_bound_to_reviewed_literal() -> None:
     assert hashlib.sha256(payload).hexdigest() == contract.compatibility_fixture_digest
     document = json.loads(payload)
     assert document["graphify_version"] == "0.9.48"
+
+
+def test_capture_reader_rejects_oversize_symlink_nonregular_and_malformed_inputs(
+    tmp_path: Path,
+) -> None:
+    oversized = tmp_path / "oversized.json"
+    with oversized.open("wb") as stream:
+        stream.truncate(16 * 1024 * 1024 + 1)
+    target = tmp_path / "target.json"
+    target.write_text("{}", encoding="utf-8")
+    symlink = tmp_path / "symlink.json"
+    symlink.symlink_to(target)
+    directory = tmp_path / "directory.json"
+    directory.mkdir()
+    malformed = tmp_path / "malformed.json"
+    malformed.write_text("{", encoding="utf-8")
+
+    for path in (oversized, symlink, directory, malformed):
+        with pytest.raises(
+            GraphifyContractError, match="fixture artifact is invalid"
+        ) as raised:
+            _capture_load_json(path)
+        assert raised.value.__cause__ is None
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO requires POSIX")
+def test_capture_reader_rejects_fifo_without_blocking(tmp_path: Path) -> None:
+    fifo = tmp_path / "graph.json"
+    os.mkfifo(fifo)
+    code = f"""
+import runpy
+from pathlib import Path
+scope = runpy.run_path({str(Path('scripts/capture-graphify-compatibility-fixture').resolve())!r}, run_name='fifo_test')
+try:
+    scope['_load_json'](Path({str(fifo)!r}))
+except scope['GraphifyContractError']:
+    print('rejected')
+else:
+    raise SystemExit(2)
+"""
+    process = subprocess.Popen(
+        [sys.executable, "-c", code],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=0.75)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.communicate()
+        pytest.fail("capture reader blocked while opening a FIFO")
+
+    assert process.returncode == 0, stderr
+    assert stdout.strip() == "rejected"
+
+
+@pytest.mark.parametrize("absolute", ["/private/tmp/source.py", r"C:\\temp\\source.py"])
+def test_capture_rejects_absolute_paths_recursively(absolute: str) -> None:
+    with pytest.raises(GraphifyContractError, match="absolute path"):
+        _capture_reject_absolute_paths({"outer": [{"source": absolute}]})
+
+
+def test_capture_output_is_exclusive_unless_replace_is_explicit(tmp_path: Path) -> None:
+    output = tmp_path / "fixture.json"
+    _capture_write_output(output, b"first", replace=False)
+
+    with pytest.raises(FileExistsError):
+        _capture_write_output(output, b"second", replace=False)
+    assert output.read_bytes() == b"first"
+
+    _capture_write_output(output, b"second", replace=True)
+    assert output.read_bytes() == b"second"
+
+
+def test_capture_tool_strips_ambient_secrets_and_writes_only_sanitized_output(
+    tmp_path: Path,
+) -> None:
+    launcher, calls = _capture_graphify_launcher(tmp_path)
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "fixture.py").write_text("def fixture():\n    return 1\n", encoding="utf-8")
+    output = tmp_path / "fixture.json"
+    sentinel = "ambient-capture-secret;$()"
+    environment = {
+        **os.environ,
+        "OPENAI_API_KEY": sentinel,
+        "HTTPS_PROXY": sentinel,
+        "UNRELATED_TOKEN": sentinel,
+    }
+
+    result = subprocess.run(
+        [
+            str(Path("scripts/capture-graphify-compatibility-fixture").resolve()),
+            "--binary", str(launcher),
+            "--source", str(source),
+            "--output", str(output),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+        env=environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+    captured_calls = [json.loads(line) for line in calls.read_text(encoding="utf-8").splitlines()]
+    assert [item["argv"][0] for item in captured_calls] == ["--version", "extract", "diagnose"]
+    assert all(
+        set(item["env"]) - {"__CF_USER_TEXT_ENCODING"}
+        <= {"HOME", "LANG", "LC_ALL", "PATH"}
+        for item in captured_calls
+    )
+    assert all(sentinel not in item["env"].values() for item in captured_calls)
+    assert sentinel not in output.read_text(encoding="utf-8")
+    assert sentinel not in result.stdout
 
 
 def test_render_pipeline_argv_is_exact_and_canonical(tmp_path: Path) -> None:

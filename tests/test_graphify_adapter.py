@@ -25,6 +25,7 @@ from project_knowledge.graphify import (
     probe_graphify,
     query_graph,
     resolve_graphify_executable,
+    run_checked,
     sanitize_stderr,
     sync_global_registry,
 )
@@ -123,7 +124,10 @@ class ProbeRunner(FakeRunner):
             }
             if self.mutation == "diagnosis-count":
                 summary["node_count"] = "1"
-            return CompletedProcess(call, 0, json.dumps({"schema_version": 1, "summary": summary}), "")
+            diagnosis = {"schema_version": 1, "summary": summary}
+            if self.mutation == "diagnosis-key":
+                diagnosis = {"summary": summary, "unrelated": True}
+            return CompletedProcess(call, 0, json.dumps(diagnosis), "")
         elif len(call) > 1 and call[1] == "cluster-only" and result.returncode == 0:
             graph = Path(call[call.index("--graph") + 1])
             graph.write_text(json.dumps({
@@ -256,7 +260,7 @@ def test_probe_does_not_treat_wrapped_help_descriptions_as_commands(
 @pytest.mark.parametrize(
     "mutation",
     [
-        "native-id", "diagnosis-count", "cluster-directed", "global-key",
+        "native-id", "diagnosis-count", "diagnosis-key", "cluster-directed", "global-key",
         "global-empty", "install-codex", "install-agents",
     ],
 )
@@ -333,6 +337,50 @@ def test_command_failures_are_capped_and_sanitized(
     assert "top-secret" not in message
     assert "Obsidian Vault" not in message
     assert len(message) < 10_000
+
+
+def test_explicit_per_call_environment_values_are_redacted_from_results_and_errors(
+    fake_runner: FakeRunner,
+    resolved_graphify: ResolvedGraphifyExecutable,
+) -> None:
+    first = "credential only in explicit env;$()"
+    second = "endpoint-only-explicit-env"
+    argv = (str(resolved_graphify.path), "query", "where")
+    environment = {
+        "HOME": "/private/home",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": "/bin",
+        "OPENAI_API_KEY": first,
+        "OPENAI_BASE_URL": second,
+    }
+    fake_runner.answer(argv, stdout=first, stderr=second)
+
+    result = run_checked(fake_runner, resolved_graphify, argv, env=environment)
+
+    assert first not in result.stdout
+    assert second not in result.stderr
+    fake_runner.answer(argv, returncode=1, stderr=f"failed {first} {second}")
+    with pytest.raises(GraphifyCommandError) as raised:
+        run_checked(fake_runner, resolved_graphify, argv, env=environment)
+    assert first not in raised.value.detail
+    assert second not in str(raised.value)
+
+    class EnvironmentEchoingFailure:
+        def run(self, argv: Sequence[str], **options: object) -> CompletedProcess[str]:
+            selected = options["env"]
+            assert isinstance(selected, Mapping)
+            raise OSError(str(selected["OPENAI_API_KEY"]))
+
+    with pytest.raises(GraphifyCommandError) as execution_error:
+        run_checked(
+            EnvironmentEchoingFailure(),  # type: ignore[arg-type]
+            resolved_graphify,
+            argv,
+            env=environment,
+        )
+    assert execution_error.value.__cause__ is None
+    assert first not in repr(execution_error.value)
 
 
 def test_subprocess_runner_keeps_a_truncated_stream_within_its_output_limit() -> None:
