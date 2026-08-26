@@ -2,7 +2,7 @@
 
 All notable changes to AtlasWeaver are documented here.
 
-## Unreleased
+## 0.3.0 - 2026-08-26
 
 - Added manifest schema v2 with recoverable initialization and explicit v1
   migration previews.
@@ -13,6 +13,11 @@ All notable changes to AtlasWeaver are documented here.
   model.
 - Added packaged agent resources, a bounded upstream Graphify compatibility
   probe, and artifact transport/workflow foundations.
+- Added deterministic portable graph bundles, provenance-verified GitHub
+  Release pull, managed Codex/Agents resources, and split-privilege reusable
+  publication workflows.
+- Added a bounded universal fleet coordinator and atomic UUID-keyed registry;
+  fleet configuration and behavior contain no organization-specific defaults.
 - Added the Graphify compatibility registry, evidence-bound
   `GRAPH_EVIDENCE.json`, reason-coded endpoint quarantine, deterministic final
   edge IDs, and read-only CI compatibility probes; Graphify 0.9.48 remains

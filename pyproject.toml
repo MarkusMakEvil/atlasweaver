@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "atlasweaver"
-version = "0.2.2"
+version = "0.3.0"
 description = "Privacy-safe code knowledge graphs with transactional Obsidian projections"
 readme = "README.md"
 requires-python = ">=3.10"
