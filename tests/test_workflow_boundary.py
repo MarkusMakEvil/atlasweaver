@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+import project_knowledge.workflow_boundary as workflow_module
 from project_knowledge.workflow_boundary import (
     WorkflowBoundaryError,
     _main,
@@ -121,3 +122,29 @@ def test_internal_extraction_admission_deletes_bounded_environment(
         "ATLASWEAVER_MODEL",
         "ATLASWEAVER_DEEP",
     } & os.environ.keys()
+
+
+def test_internal_check_has_one_closed_fixed_path_surface(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    consumer, _, trusted = checkouts(tmp_path)
+    output = tmp_path / "output"
+    calls: list[tuple[Path, str, Path, Path]] = []
+
+    monkeypatch.setattr(
+        workflow_module,
+        "run_workflow_check",
+        lambda checkout, root, forbidden, destination: calls.append(
+            (checkout, root, forbidden, destination)
+        ),
+        raising=False,
+    )
+
+    assert workflow_module._main([
+        "check",
+        "--consumer-checkout", str(consumer),
+        "--repo-root", "nested/repo",
+        "--trusted-tool-checkout", str(trusted),
+        "--output-directory", str(output),
+    ]) == 0
+    assert calls == [(consumer, "nested/repo", trusted, output)]

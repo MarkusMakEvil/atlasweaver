@@ -6,6 +6,7 @@ import argparse
 from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager, ExitStack
 from dataclasses import dataclass
+import json
 import os
 from pathlib import Path, PurePosixPath
 import stat
@@ -14,10 +15,17 @@ from typing import Literal
 
 from .compatibility import (
     CompatibilityError,
+    bind_semantic_backend_credential,
     production_graphify_compatibility,
+    validate_semantic_backend,
     validate_public_model_identifier,
 )
+from .doctor import doctor_project
+from .graphify import SubprocessCommandRunner, probe_graphify, resolve_graphify_executable
+from .health import assess_health, inspect_project_state
 from .locking import RepositoryAccess, RepositoryIdentity
+from .manifest import load_manifest
+from .staging import inspect_projection
 
 
 WORKFLOW_BOUNDARY_PUBLIC_ERRORS = MappingProxyType({
@@ -243,10 +251,184 @@ def _bounded_environment(name: str) -> str:
     return value
 
 
+def _prepare_output_directory(path: Path) -> Path:
+    if type(path) is not Path or not path.is_absolute():
+        raise WorkflowBoundaryError("workflow_root_invalid")
+    try:
+        if path.exists():
+            info = path.lstat()
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                raise OSError
+        else:
+            parent = path.parent
+            info = parent.lstat()
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                raise OSError
+            path.mkdir(mode=0o700)
+        os.chmod(path, 0o700)
+        return path
+    except OSError:
+        raise WorkflowBoundaryError("workflow_root_invalid") from None
+
+
+def _write_envelope(directory: Path, name: str, document: dict[str, object]) -> None:
+    payload = json.dumps(
+        document,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8") + b"\n"
+    if len(payload) > 1_048_576 or "/" in name or "\\" in name:
+        raise WorkflowBoundaryError("workflow_root_invalid")
+    destination = directory / name
+    descriptor = os.open(
+        destination,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+        0o600,
+    )
+    try:
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError
+            view = view[written:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def run_workflow_check(
+    consumer_checkout: Path,
+    repo_root: str,
+    trusted_tool_checkout: Path,
+    output_directory: Path,
+) -> None:
+    """Run the fixed read-only workflow inspection through one root authority."""
+    with open_workflow_repository(
+        consumer_checkout,
+        repo_root,
+        forbidden_checkout=trusted_tool_checkout,
+    ) as workflow:
+        repository_path = consumer_checkout.absolute().joinpath(*workflow.segments)
+        workflow.revalidate()
+        manifest = load_manifest(
+            repository_path / ".graphify-project.yaml",
+            repository_path,
+            repository_access=workflow.repository_access,
+        )
+        projection = inspect_projection(
+            repository_path,
+            manifest,
+            repository_access=workflow.repository_access,
+        )
+        workflow.revalidate()
+
+        backend = _bounded_environment("ATLASWEAVER_BACKEND")
+        model = _bounded_environment("ATLASWEAVER_MODEL")
+        raw_deep = _bounded_environment("ATLASWEAVER_DEEP") or "false"
+        if raw_deep not in {"true", "false"}:
+            raise WorkflowBoundaryError("workflow_extraction_invalid")
+        mode = admit_workflow_extraction_mode(
+            backend, model, raw_deep == "true"
+        )
+        credential_bound = False
+        if mode == "semantic":
+            token = os.environ.pop("ATLASWEAVER_BACKEND_TOKEN", None)
+            if token is not None and (
+                type(token) is not str
+                or not token
+                or len(token.encode("utf-8")) > 65_536
+                or any(ord(character) < 32 for character in token)
+            ):
+                raise WorkflowBoundaryError("workflow_extraction_invalid")
+            contract = production_graphify_compatibility()
+            try:
+                credential = bind_semantic_backend_credential(
+                    contract, backend, token
+                )
+                validate_semantic_backend(contract, backend, credential)
+            except CompatibilityError:
+                raise WorkflowBoundaryError("workflow_extraction_invalid") from None
+            credential_bound = bool(credential)
+        else:
+            os.environ.pop("ATLASWEAVER_BACKEND_TOKEN", None)
+
+        raw_required = _bounded_environment("ATLASWEAVER_REQUIRE_IMPACT_TRUST")
+        if raw_required not in {"", "true", "false"}:
+            raise WorkflowBoundaryError("workflow_extraction_invalid")
+        require_impact = raw_required == "true"
+        executable = resolve_graphify_executable()
+        capabilities = probe_graphify(
+            executable,
+            production_graphify_compatibility(),
+            SubprocessCommandRunner(),
+            before_exec=workflow.revalidate,
+        )
+        workflow.revalidate()
+        doctor = doctor_project(
+            repository_path,
+            expected_repository_identity=workflow.repository_identity,
+            expected_manifest=manifest,
+        )
+        workflow.revalidate()
+        health = assess_health(
+            inspect_project_state(
+                repository_path,
+                manifest,
+                repository_access=workflow.repository_access,
+            )
+        )
+        workflow.revalidate()
+        if health.core_status not in {"healthy", "partial"}:
+            raise WorkflowBoundaryError("workflow_root_invalid")
+        if require_impact and health.trust.impact != "trusted":
+            raise WorkflowBoundaryError("workflow_root_invalid")
+
+        output = _prepare_output_directory(output_directory.absolute())
+        documents = (
+            (
+                "preflight.json",
+                {
+                    "schema_version": 1,
+                    "status": "ready",
+                    "mode": mode,
+                    "graphify_version": capabilities.version,
+                    "safe_file_count": len(projection.files),
+                    "credential_bound": credential_bound,
+                },
+            ),
+            (
+                "doctor.json",
+                doctor.to_dict(),
+            ),
+            (
+                "scan.json",
+                {
+                    "schema_version": 1,
+                    "status": "clean",
+                    "finding_count": 0,
+                    "reason_counts": dict(projection.reason_counts),
+                },
+            ),
+            ("health.json", health.to_dict()),
+        )
+        for name, document in documents:
+            workflow.revalidate()
+            _write_envelope(output, name, document)
+        workflow.revalidate()
+
+
 def _main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m project_knowledge.workflow_boundary")
     subparsers = parser.add_subparsers(dest="verb", required=True)
     subparsers.add_parser("validate-extraction")
+    check = subparsers.add_parser("check")
+    check.add_argument("--consumer-checkout", type=Path, required=True)
+    check.add_argument("--repo-root", required=True)
+    check.add_argument("--trusted-tool-checkout", type=Path, required=True)
+    check.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args(argv)
     if arguments.verb == "validate-extraction":
         try:
@@ -258,6 +440,17 @@ def _main(argv: Sequence[str] | None = None) -> int:
             admit_workflow_extraction_mode(backend, model, raw_deep == "true")
             return 0
         except WorkflowBoundaryError:
+            return 1
+    if arguments.verb == "check":
+        try:
+            run_workflow_check(
+                arguments.consumer_checkout,
+                arguments.repo_root,
+                arguments.trusted_tool_checkout,
+                arguments.output_directory,
+            )
+            return 0
+        except (WorkflowBoundaryError, OSError, ValueError, TypeError):
             return 1
     return 1
 
