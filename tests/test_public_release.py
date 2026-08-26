@@ -156,10 +156,28 @@ def test_primary_ci_resolves_graphify_from_registry_and_keeps_adoption_gates() -
 def test_dogfood_and_example_manifests_are_v2_and_optional_by_default() -> None:
     from project_knowledge.manifest import load_manifest
 
-    for root in (ROOT, ROOT / "examples"):
-        manifest = load_manifest(root / ".graphify-project.yaml", root)
-        assert manifest.schema_version == 2
-        assert manifest.project_uid is not None
-        assert manifest.features.atlas == "disabled"
-        assert manifest.features.registry == "disabled"
-        assert manifest.artifacts.provider == "none"
+    dogfood = load_manifest(ROOT / ".graphify-project.yaml", ROOT)
+    assert dogfood.schema_version == 2
+    assert dogfood.project_uid is not None
+    assert dogfood.features.atlas == "disabled"
+    assert dogfood.features.registry == "disabled"
+    assert dogfood.artifacts.provider == "github-release"
+    assert dogfood.artifacts.repository == "MarkusMakEvil/atlasweaver"
+    assert dogfood.artifacts.repository_id == 1343065113
+    assert dogfood.artifacts.channel == "main"
+    assert dogfood.artifacts.source_ref == "refs/heads/main"
+    assert dogfood.artifacts.signer_workflow == (
+        "MarkusMakEvil/atlasweaver/.github/workflows/atlasweaver-publish.yml"
+    )
+    assert dogfood.artifacts.signer_digest == (
+        "386d3ae9d074c38c4ac1ab54acd44593b4dda223"
+    )
+
+    example = load_manifest(
+        ROOT / "examples/.graphify-project.yaml", ROOT / "examples"
+    )
+    assert example.schema_version == 2
+    assert example.project_uid is not None
+    assert example.features.atlas == "disabled"
+    assert example.features.registry == "disabled"
+    assert example.artifacts.provider == "none"

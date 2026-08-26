@@ -17,6 +17,10 @@ WORKFLOWS = ROOT / ".github/workflows"
 PINNED_ACTION = re.compile(
     r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}$"
 )
+PINNED_REUSABLE_WORKFLOW = re.compile(
+    r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/\.github/workflows/"
+    r"[A-Za-z0-9_.-]+\.ya?ml@[0-9a-f]{40}$"
+)
 
 
 class WorkflowLoader(yaml.SafeLoader):
@@ -104,7 +108,10 @@ def test_check_workflow_has_closed_typed_inputs_and_read_only_permissions() -> N
 def test_every_external_action_reference_is_a_full_commit_sha() -> None:
     for path in WORKFLOWS.glob("*.yml"):
         for uses in action_uses(load_workflow(path.name)):
-            assert PINNED_ACTION.fullmatch(uses), (path, uses)
+            assert (
+                PINNED_ACTION.fullmatch(uses)
+                or PINNED_REUSABLE_WORKFLOW.fullmatch(uses)
+            ), (path, uses)
 
 
 def test_ci_fetches_history_and_derives_graphify_version_from_registry() -> None:
@@ -305,3 +312,36 @@ def test_publish_secret_is_confined_to_semantic_unprivileged_build() -> None:
     assert semantic["env"]["ATLASWEAVER_BACKEND_TOKEN"] == (
         "${{ secrets.semantic_backend_token }}"
     )
+
+
+def test_self_publish_is_dispatch_only_and_pins_manifest_signer() -> None:
+    from project_knowledge.manifest import load_manifest
+
+    workflow = load_workflow("atlasweaver-self-publish.yml")
+    manifest = load_manifest(ROOT / ".graphify-project.yaml", ROOT)
+    signer_digest = manifest.artifacts.signer_digest
+    assert set(workflow["on"]) == {"workflow_dispatch"}
+    assert set(workflow["on"]["workflow_dispatch"]) == {"inputs"}
+    assert workflow["permissions"] == {
+        "attestations": "write",
+        "contents": "write",
+        "id-token": "write",
+    }
+    job = workflow["jobs"]["publish"]
+    assert job["permissions"] == workflow["permissions"]
+    assert job["uses"] == (
+        "MarkusMakEvil/atlasweaver/.github/workflows/atlasweaver-publish.yml@"
+        f"{signer_digest}"
+    )
+    assert job["with"]["repo-root"] == "."
+    assert job["with"]["python-version"] == "3.13"
+    assert job["secrets"] == {
+        "semantic_backend_token": (
+            "${{ secrets.ATLASWEAVER_SEMANTIC_BACKEND_TOKEN }}"
+        )
+    }
+    assert subprocess.run(
+        ["git", "merge-base", "--is-ancestor", signer_digest, "HEAD"],
+        cwd=ROOT,
+        check=False,
+    ).returncode == 0

@@ -25,4 +25,11 @@ features:
   atlas: disabled
   registry: disabled
 artifacts:
-  provider: none
+  provider: github-release
+  host: github.com
+  repository: MarkusMakEvil/atlasweaver
+  repository_id: 1343065113
+  channel: main
+  source_ref: refs/heads/main
+  signer_workflow: MarkusMakEvil/atlasweaver/.github/workflows/atlasweaver-publish.yml
+  signer_digest: 386d3ae9d074c38c4ac1ab54acd44593b4dda223

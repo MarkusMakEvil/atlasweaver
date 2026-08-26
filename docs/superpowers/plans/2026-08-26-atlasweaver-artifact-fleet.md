@@ -5074,7 +5074,7 @@ Run:
 ```bash
 rg -n 'uses:\s+[^#]+@(v[0-9]+|main|master)\b' .github/workflows
 rg -n '(GITHUB_TOKEN|GH_TOKEN|ATLASWEAVER_BACKEND_TOKEN).*?(print|echo|json|state)' src tests .github/workflows
-rg -n '(BrandMap|server repo|web repo|product-specific)' src tests skills README.md .github/workflows
+rg -n '(customer-specific|tenant-specific|product-specific)' src tests skills README.md .github/workflows
 git status --short
 git diff --stat origin/main...HEAD
 ```

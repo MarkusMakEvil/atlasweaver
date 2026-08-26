@@ -143,12 +143,11 @@ the gate is mandatory there.
 
 ## Rollout contract
 
-BrandMap onboarding is repository-scoped: `web`, `server`, `docs`, and
-`extensions` receive distinct project IDs and output ownership. Ephemeral
+Organization onboarding is repository-scoped: every canonical repository
+receives a distinct project ID and output ownership. Ephemeral
 worktrees are not globally registered by default. Obsidian export is enabled
-only after web and server complete a stable shadow period.
+only after each selected repository completes a stable shadow period.
 
 Readiness requires: no unreviewed secret findings, no dangling endpoints, no
 unapproved coverage skips for supported source, source-drift detection, rollback
-verification, and freshness checks within five seconds for web and ten seconds
-for server.
+verification, and freshness checks within the configured per-project budget.

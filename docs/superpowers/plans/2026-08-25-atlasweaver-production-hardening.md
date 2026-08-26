@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make the pinned Graphify workflow end-to-end executable, safely triage false-positive secrets, and expose an honest graph-integrity trust state suitable for BrandMap rollout.
+**Goal:** Make the pinned Graphify workflow end-to-end executable, safely triage false-positive secrets, and expose an honest graph-integrity trust state suitable for universal rollout.
 
 **Architecture:** Staging produces an out-of-tree immutable receipt. A separate failure-atomic adapter verifies that receipt and enriches an allowlisted subset of native Graphify output before the existing validator and transaction layer see it. Secret scanning and graph integrity are focused modules consumed by staging, adaptation, validation, health, and the CLI.
 
@@ -156,4 +156,4 @@
 - [ ] Run `uv build` and inspect wheel/sdist contents for manifests, docs, and private-context leakage.
 - [ ] Run `project-knowledge detect --repo . --json`, `preflight`, a temporary stage/adapt/validate/promote cycle, and `health` without touching an Obsidian vault or global registry.
 - [ ] Run `git diff --check`, inspect `git status --short`, and review the complete diff against the spec.
-- [ ] Report any BrandMap-only measurements that still require the BrandMap workspace separately; do not invent server/web evidence from this repository.
+- [ ] Report any consumer-workspace-only measurements separately; do not invent external repository evidence from this repository.

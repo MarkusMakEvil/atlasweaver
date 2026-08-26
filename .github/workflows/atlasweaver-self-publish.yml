@@ -1,0 +1,47 @@
+name: AtlasWeaver self-publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      backend:
+        description: Optional Graphify semantic backend; empty selects code-only
+        type: string
+        required: false
+        default: ""
+      model:
+        description: Model required when a semantic backend is selected
+        type: string
+        required: false
+        default: ""
+      deep-mode:
+        description: Enable Graphify deep mode for semantic extraction
+        type: boolean
+        required: false
+        default: false
+      require-impact-trust:
+        description: Fail unless impact evidence is trusted
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  attestations: write
+  contents: write
+  id-token: write
+
+jobs:
+  publish:
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
+    uses: MarkusMakEvil/atlasweaver/.github/workflows/atlasweaver-publish.yml@386d3ae9d074c38c4ac1ab54acd44593b4dda223
+    with:
+      backend: ${{ inputs.backend }}
+      model: ${{ inputs.model }}
+      deep-mode: ${{ inputs.deep-mode }}
+      python-version: "3.13"
+      repo-root: "."
+      require-impact-trust: ${{ inputs.require-impact-trust }}
+    secrets:
+      semantic_backend_token: ${{ secrets.ATLASWEAVER_SEMANTIC_BACKEND_TOKEN }}
