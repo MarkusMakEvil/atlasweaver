@@ -733,6 +733,36 @@ def _project_request(
     return BaseProjectWorkRequest()
 
 
+def _validate_refresh_environments(
+    admissions: tuple[FleetProjectAdmission, ...],
+    request: RefreshFleetRequest,
+) -> None:
+    if request.code_only:
+        return
+    from .compatibility import (
+        CompatibilityError,
+        resolve_graphify_compatibility,
+        validate_public_model_identifier,
+        validate_semantic_backend,
+    )
+
+    try:
+        validate_public_model_identifier(request.model)
+        by_uid = {item.project_uid: item for item in request.project_environments}
+        for admission in admissions:
+            environment = by_uid[admission.project.project_uid]
+            contract = resolve_graphify_compatibility(
+                admission.manifest.graphify_version
+            )
+            backend = validate_semantic_backend(
+                contract, request.backend, environment.as_mapping()
+            )
+            if environment.credential_name != backend.canonical_credential_environment:
+                raise FleetConfigError("fleet_invalid")
+    except (CompatibilityError, KeyError, TypeError, ValueError):
+        raise FleetConfigError("fleet_invalid") from None
+
+
 def _serialize_domain_result(value: object) -> dict[str, object]:
     if hasattr(value, "to_dict"):
         document = value.to_dict()  # type: ignore[union-attr]
@@ -862,7 +892,7 @@ def _run_one(
         result = None if outcome.result is None else _serialize_domain_result(outcome.result)
         code = None
         status = outcome.status
-    except BaseException as error:
+    except Exception as error:
         result = None
         code = _failure_code(error)
         status = "error"
@@ -891,6 +921,8 @@ def run_fleet_operation(
         raise FleetConfigError("fleet_invalid")
     _validate_request(operation, selected, request)
     fresh = require_fleet_projects_ready(selected)
+    if type(request) is RefreshFleetRequest:
+        _validate_refresh_environments(fresh, request)
     if expected_admissions is not None:
         if (
             type(expected_admissions) is not tuple

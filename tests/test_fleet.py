@@ -17,6 +17,7 @@ from project_knowledge.fleet import (
     FleetAliasKey,
     FleetConfigError,
     FleetProjectOutcome,
+    ProjectBackendEnvironment,
     _git_alias_key,
     load_fleet_workspace,
     run_fleet_operation,
@@ -509,3 +510,27 @@ def test_fleet_failure_isolated_to_one_repository(tmp_path: Path) -> None:
         "fleet_repository_changed",
         None,
     ]
+
+
+def test_project_backend_environment_is_closed_and_defensively_copied() -> None:
+    values = {
+        "HOME": "/tmp/isolated",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/usr/bin",
+        "OPENAI_API_KEY": "fixture-secret",
+    }
+    captured = ProjectBackendEnvironment.capture(
+        API_UID, values, canonical_credential_name="OPENAI_API_KEY"
+    )
+    values["OPENAI_API_KEY"] = "changed"
+
+    assert captured.as_mapping()["OPENAI_API_KEY"] == "fixture-secret"
+    assert "fixture-secret" not in repr(captured)
+
+    with pytest.raises(FleetConfigError):
+        ProjectBackendEnvironment.capture(
+            API_UID,
+            {**values, "EXTRA": "forbidden"},
+            canonical_credential_name="OPENAI_API_KEY",
+        )
