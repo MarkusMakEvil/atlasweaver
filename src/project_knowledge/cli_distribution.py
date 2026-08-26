@@ -42,6 +42,30 @@ class DistributionResponse:
     exit_code: int = 0
 
 
+def _bounded_integer(minimum: int, maximum: int) -> Callable[[str], int]:
+    def parse(value: str) -> int:
+        try:
+            parsed = int(value, 10)
+        except (TypeError, ValueError):
+            raise argparse.ArgumentTypeError("value is not an integer") from None
+        if not minimum <= parsed <= maximum:
+            raise argparse.ArgumentTypeError(
+                f"value must be between {minimum} and {maximum}"
+            )
+        return parsed
+
+    return parse
+
+
+class _BoundedRelationAction(argparse.Action):
+    def __call__(self, parser, namespace, value, option_string=None) -> None:
+        current = list(getattr(namespace, self.dest, ()) or ())
+        if len(current) >= 16:
+            raise argparse.ArgumentError(self, "at most 16 relations are allowed")
+        current.append(value)
+        setattr(namespace, self.dest, current)
+
+
 def add_distribution_commands(
     subparsers: argparse._SubParsersAction[argparse.ArgumentParser],
 ) -> None:
@@ -77,18 +101,20 @@ def add_distribution_commands(
     query_sub = query.add_subparsers(dest="fleet_query_operation", required=True)
     term = query_sub.add_parser("query")
     term.add_argument("term")
-    term.add_argument("--limit", type=int, default=20)
+    term.add_argument("--limit", type=_bounded_integer(1, 100), default=20)
     path = query_sub.add_parser("path")
     path.add_argument("source")
     path.add_argument("target")
-    path.add_argument("--max-depth", type=int, default=32)
+    path.add_argument("--max-depth", type=_bounded_integer(1, 32), default=32)
     explain = query_sub.add_parser("explain")
     explain.add_argument("node")
-    explain.add_argument("--depth", type=int, default=1)
+    explain.add_argument("--depth", type=_bounded_integer(1, 2), default=1)
     affected = query_sub.add_parser("affected")
     affected.add_argument("node")
-    affected.add_argument("--depth", type=int, default=2)
-    affected.add_argument("--relation", action="append", default=[])
+    affected.add_argument("--depth", type=_bounded_integer(0, 8), default=2)
+    affected.add_argument(
+        "--relation", action=_BoundedRelationAction, default=[]
+    )
 
 
 def _repo_json(parser: argparse.ArgumentParser) -> None:
@@ -215,7 +241,14 @@ def _dispatch_fleet(
     document = result.to_dict()
     document.pop("operation", None)
     document["command"] = f"fleet {operation}"
-    return DistributionResponse(document, 0 if result.status == "ok" else 1)
+    if operation == "refresh" and result.status == "ok" and any(
+        item.status == "promoted_but_stale" for item in result.projects
+    ):
+        document["status"] = "promoted_but_stale"
+        exit_code = 3
+    else:
+        exit_code = 0 if result.status == "ok" else 1
+    return DistributionResponse(document, exit_code)
 
 
 def _fleet_refresh_request(
