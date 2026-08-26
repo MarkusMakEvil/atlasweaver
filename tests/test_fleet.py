@@ -4,16 +4,22 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import subprocess
+import threading
+import time
 from uuid import UUID
 
 import pytest
 
 import project_knowledge.fleet as fleet_module
 from project_knowledge.fleet import (
+    BaseProjectWorkRequest,
+    FleetBaseRequest,
     FleetAliasKey,
     FleetConfigError,
+    FleetProjectOutcome,
     _git_alias_key,
     load_fleet_workspace,
+    run_fleet_operation,
     select_fleet_projects,
 )
 from project_knowledge.locking import open_repository_access
@@ -455,3 +461,51 @@ def test_real_linked_worktrees_resolve_dotdot_commondir_and_alias(
         load_fleet_workspace(workspace)
 
     assert raised.value.code == "fleet_worktree_alias"
+
+
+def test_fleet_operations_are_bounded_and_keep_configuration_order(
+    tmp_path: Path,
+) -> None:
+    workspace = load_fleet_workspace(_valid_workspace(tmp_path))
+    active = 0
+    maximum = 0
+    guard = threading.Lock()
+
+    def runner(admission, operation, request):
+        nonlocal active, maximum
+        assert operation == "health"
+        assert type(request) is BaseProjectWorkRequest
+        with guard:
+            active += 1
+            maximum = max(maximum, active)
+        time.sleep(0.01 if admission.project.id == "api" else 0.001)
+        with guard:
+            active -= 1
+        return FleetProjectOutcome("healthy", {"id": admission.project.id})
+
+    result = run_fleet_operation(
+        workspace, "health", workspace.projects, FleetBaseRequest(), runner
+    )
+
+    assert result.status == "ok"
+    assert maximum <= workspace.max_parallel
+    assert [item.id for item in result.projects] == ["api", "documentation"]
+
+
+def test_fleet_failure_isolated_to_one_repository(tmp_path: Path) -> None:
+    workspace = load_fleet_workspace(_valid_workspace(tmp_path))
+
+    def runner(admission, operation, request):
+        if admission.project.id == "api":
+            raise FleetConfigError("fleet_repository_changed")
+        return FleetProjectOutcome("healthy", {})
+
+    result = run_fleet_operation(
+        workspace, "health", workspace.projects, FleetBaseRequest(), runner
+    )
+
+    assert result.status == "partial_failure"
+    assert [item.error_code for item in result.projects] == [
+        "fleet_repository_changed",
+        None,
+    ]

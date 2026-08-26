@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 from contextlib import ExitStack
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict, dataclass, field, is_dataclass
+import json
+from collections.abc import Mapping
 import os
 from pathlib import Path, PurePosixPath
 import re
 import stat
-from typing import Literal
+import time
+from typing import Literal, Protocol, TypeAlias
 from uuid import UUID
 
-from .locking import RepositoryAccess, RepositoryIdentity
+from .locking import RepositoryAccess, RepositoryIdentity, open_repository_access
 from .manifest import (
     MAX_MANIFEST_BYTES,
     ManifestError,
@@ -19,6 +23,8 @@ from .manifest import (
     inspect_init_journal,
     load_manifest_payload,
 )
+from .models import ProjectManifest
+from .queries import RegistryQueryRequest
 
 
 MAX_FLEET_BYTES = 262_144
@@ -445,3 +451,513 @@ def _file_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
         value.st_mtime_ns,
         value.st_ctime_ns,
     )
+
+
+# -- Bounded universal fleet operations ----------------------------------
+
+
+FleetOperation = Literal[
+    "doctor", "health", "pull", "refresh", "registry-sync", "query"
+]
+_OPERATIONS = frozenset(
+    {"doctor", "health", "pull", "refresh", "registry-sync", "query"}
+)
+_BASE_ENVIRONMENT = ("HOME", "LANG", "LC_ALL", "PATH")
+_RESULT_LIMIT = 1_048_576
+
+
+@dataclass(frozen=True)
+class FleetProjectAdmission:
+    project: FleetProject
+    manifest: ProjectManifest
+
+
+@dataclass(frozen=True)
+class FleetProjectResult:
+    id: str
+    uid: str
+    status: str
+    result: dict[str, object] | None
+    error_code: str | None
+    duration_ms: int
+
+
+@dataclass(frozen=True)
+class FleetResult:
+    operation: FleetOperation
+    status: Literal["ok", "partial_failure", "failed"]
+    projects: tuple[FleetProjectResult, ...]
+    result: dict[str, object] | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "operation": self.operation,
+            "status": self.status,
+            "projects": [asdict(item) for item in self.projects],
+            "result": self.result,
+        }
+
+
+@dataclass(frozen=True)
+class FleetProjectOutcome:
+    status: str
+    result: dict[str, object] | None
+
+
+class FleetProjectRunner(Protocol):
+    def __call__(
+        self,
+        admission: FleetProjectAdmission,
+        operation: FleetOperation,
+        request: "FleetProjectWorkRequest",
+    ) -> FleetProjectOutcome: ...
+
+
+@dataclass(frozen=True)
+class FleetBaseRequest:
+    pass
+
+
+@dataclass(frozen=True)
+class PullFleetRequest:
+    credentials: object = field(repr=False)
+
+
+@dataclass(frozen=True)
+class ProjectBackendEnvironment:
+    project_uid: UUID
+    credential_name: str | None = field(repr=False)
+    entries: tuple[tuple[str, str], ...] = field(repr=False)
+
+    @classmethod
+    def capture(
+        cls,
+        project_uid: UUID,
+        values: Mapping[str, str],
+        *,
+        canonical_credential_name: str | None,
+    ) -> "ProjectBackendEnvironment":
+        if type(project_uid) is not UUID or project_uid.version != 4:
+            raise FleetConfigError("fleet_invalid")
+        if canonical_credential_name is not None and (
+            type(canonical_credential_name) is not str
+            or not canonical_credential_name
+            or canonical_credential_name in _BASE_ENVIRONMENT
+        ):
+            raise FleetConfigError("fleet_invalid")
+        try:
+            first = tuple(values.items())
+            second = tuple(values.items())
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            raise FleetConfigError("fleet_invalid") from None
+        if first != second or any(
+            type(key) is not str or type(value) is not str
+            for key, value in first
+        ):
+            raise FleetConfigError("fleet_invalid")
+        copied = dict(first)
+        allowed = {*_BASE_ENVIRONMENT}
+        if canonical_credential_name is not None:
+            allowed.add(canonical_credential_name)
+        if set(copied) != allowed or any(
+            not copied[name] or any(ord(char) < 32 for char in copied[name])
+            for name in allowed
+        ):
+            raise FleetConfigError("fleet_invalid")
+        ordered = tuple(
+            (name, copied[name])
+            for name in (*_BASE_ENVIRONMENT,)
+            if name in copied
+        )
+        if canonical_credential_name is not None:
+            ordered += ((canonical_credential_name, copied[canonical_credential_name]),)
+        return cls(project_uid, canonical_credential_name, ordered)
+
+    def as_mapping(self) -> dict[str, str]:
+        return dict(self.entries)
+
+
+@dataclass(frozen=True)
+class RefreshFleetRequest:
+    backend: str | None
+    model: str | None
+    deep: bool
+    code_only: bool
+    project_environments: tuple[ProjectBackendEnvironment, ...] = field(repr=False)
+
+
+@dataclass(frozen=True)
+class FleetQueryRequest:
+    query: RegistryQueryRequest
+
+
+FleetOperationRequest: TypeAlias = (
+    FleetBaseRequest | PullFleetRequest | RefreshFleetRequest | FleetQueryRequest
+)
+
+
+@dataclass(frozen=True)
+class BaseProjectWorkRequest:
+    pass
+
+
+@dataclass(frozen=True)
+class PullProjectWorkRequest:
+    credentials: object = field(repr=False)
+
+
+@dataclass(frozen=True)
+class RefreshProjectWorkRequest:
+    options: object
+    environment: ProjectBackendEnvironment | None = field(repr=False)
+
+
+FleetProjectWorkRequest: TypeAlias = (
+    BaseProjectWorkRequest | PullProjectWorkRequest | RefreshProjectWorkRequest
+)
+
+
+def _load_fleet_project_manifest(
+    project: FleetProject,
+    *,
+    expected_manifest: ProjectManifest | None = None,
+) -> FleetProjectAdmission:
+    """Reload a project's complete manifest through its retained root identity."""
+    try:
+        with open_repository_access(
+            project.root,
+            expected_repository_identity=project.repository_identity,
+        ) as repository:
+            if inspect_init_journal(
+                project.root, repository_access=repository
+            ) != "none":
+                raise FleetConfigError("init_recovery_required")
+            payload, _ = _read_regular_at(
+                repository.descriptor,
+                ".graphify-project.yaml",
+                MAX_MANIFEST_BYTES,
+                "fleet_manifest",
+            )
+            manifest = load_manifest_payload(payload, project.root)
+    except FleetConfigError as error:
+        if error.code.startswith("fleet_manifest_"):
+            raise FleetConfigError("fleet_manifest_changed") from None
+        raise
+    except (ManifestError, OSError, ValueError, TypeError):
+        raise FleetConfigError("fleet_manifest_changed") from None
+    if (
+        manifest.schema_version != 2
+        or manifest.project_uid != project.project_uid
+        or manifest.project_id != project.id
+        or (expected_manifest is not None and manifest != expected_manifest)
+    ):
+        raise FleetConfigError("fleet_manifest_changed")
+    return FleetProjectAdmission(project, manifest)
+
+
+def require_fleet_projects_ready(
+    selected: tuple[FleetProject, ...],
+) -> tuple[FleetProjectAdmission, ...]:
+    if type(selected) is not tuple or not selected or any(
+        type(project) is not FleetProject for project in selected
+    ):
+        raise FleetConfigError("fleet_invalid")
+    return tuple(_load_fleet_project_manifest(project) for project in selected)
+
+
+def _validate_request(
+    operation: FleetOperation,
+    selected: tuple[FleetProject, ...],
+    request: FleetOperationRequest,
+) -> None:
+    required = {
+        "doctor": FleetBaseRequest,
+        "health": FleetBaseRequest,
+        "registry-sync": FleetBaseRequest,
+        "pull": PullFleetRequest,
+        "refresh": RefreshFleetRequest,
+        "query": FleetQueryRequest,
+    }
+    if operation not in _OPERATIONS or type(request) is not required.get(operation):
+        raise FleetConfigError("fleet_invalid")
+    if type(selected) is not tuple or not selected or len(set(selected)) != len(selected):
+        raise FleetConfigError("fleet_invalid")
+    if type(request) is RefreshFleetRequest:
+        if type(request.deep) is not bool or type(request.code_only) is not bool:
+            raise FleetConfigError("fleet_invalid")
+        if request.code_only:
+            if (
+                request.backend is not None
+                or request.model is not None
+                or request.deep
+                or request.project_environments
+            ):
+                raise FleetConfigError("fleet_invalid")
+        else:
+            if (
+                type(request.backend) is not str
+                or not request.backend
+                or type(request.model) is not str
+                or not request.model
+                or type(request.project_environments) is not tuple
+            ):
+                raise FleetConfigError("fleet_invalid")
+            expected = {project.project_uid for project in selected}
+            actual = {item.project_uid for item in request.project_environments}
+            if len(actual) != len(request.project_environments) or actual != expected:
+                raise FleetConfigError("fleet_invalid")
+
+
+def _project_request(
+    admission: FleetProjectAdmission,
+    request: FleetOperationRequest,
+) -> FleetProjectWorkRequest:
+    if type(request) is PullFleetRequest:
+        return PullProjectWorkRequest(request.credentials)
+    if type(request) is RefreshFleetRequest:
+        from .lifecycle import RefreshOptions
+
+        environment = next(
+            (
+                item
+                for item in request.project_environments
+                if item.project_uid == admission.project.project_uid
+            ),
+            None,
+        )
+        return RefreshProjectWorkRequest(
+            RefreshOptions(request.backend, request.model, request.deep, request.code_only),
+            environment,
+        )
+    return BaseProjectWorkRequest()
+
+
+def _serialize_domain_result(value: object) -> dict[str, object]:
+    if hasattr(value, "to_dict"):
+        document = value.to_dict()  # type: ignore[union-attr]
+    elif is_dataclass(value):
+        document = asdict(value)
+    elif type(value) is dict:
+        document = dict(value)
+    else:
+        raise FleetConfigError("fleet_result_invalid")
+    try:
+        encoded = json.dumps(
+            document, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        raise FleetConfigError("fleet_result_invalid") from None
+    if len(encoded) > _RESULT_LIMIT:
+        raise FleetConfigError("fleet_result_invalid")
+    return document
+
+
+def _default_fleet_runner(
+    admission: FleetProjectAdmission,
+    operation: FleetOperation,
+    request: FleetProjectWorkRequest,
+) -> FleetProjectOutcome:
+    project = admission.project
+    if operation == "doctor":
+        from .doctor import doctor_project
+
+        result = doctor_project(
+            project.root,
+            expected_repository_identity=project.repository_identity,
+            expected_manifest=admission.manifest,
+        )
+    elif operation == "health":
+        from .health import assess_health, inspect_project_state
+
+        result = assess_health(
+            inspect_project_state(
+                project.root,
+                admission.manifest,
+                expected_repository_identity=project.repository_identity,
+            )
+        )
+    elif operation == "refresh":
+        from .lifecycle import refresh_project
+
+        assert type(request) is RefreshProjectWorkRequest
+        result = refresh_project(
+            project.root,
+            admission.manifest,
+            request.options,
+            ambient=(
+                request.environment.as_mapping()
+                if request.environment is not None
+                else {}
+            ),
+            expected_repository_identity=project.repository_identity,
+        )
+    elif operation == "pull":
+        from .github_artifacts import pull_bundle
+
+        assert type(request) is PullProjectWorkRequest
+        result = pull_bundle(
+            project.root,
+            request.credentials,
+            expected_repository_identity=project.repository_identity,
+            expected_manifest=admission.manifest,
+        )
+    elif operation == "registry-sync":
+        from .registry import registry_sync
+
+        result = registry_sync(
+            project.root,
+            admission.manifest,
+            expected_repository_identity=project.repository_identity,
+        )
+    else:
+        raise FleetConfigError("fleet_invalid")
+    document = _serialize_domain_result(result)
+    status = str(document.get("status", "ok"))
+    return FleetProjectOutcome(status, document)
+
+
+DEFAULT_FLEET_RUNNER: FleetProjectRunner = _default_fleet_runner
+
+
+def _failure_code(error: BaseException) -> str:
+    code = getattr(error, "code", None)
+    if type(code) is str and (
+        code.startswith("fleet_")
+        or code.startswith("registry_")
+        or code
+        in {
+            "init_recovery_required",
+            "manifest_migration_required",
+            "graph_missing",
+            "graph_invalid",
+        }
+    ):
+        return code
+    kind = getattr(error, "kind", None)
+    if kind in {"authority", "changed"}:
+        return "fleet_repository_changed" if kind == "authority" else "fleet_manifest_changed"
+    return "fleet_operation_failed"
+
+
+def _run_one(
+    admission: FleetProjectAdmission,
+    operation: FleetOperation,
+    request: FleetOperationRequest,
+    runner: FleetProjectRunner,
+) -> FleetProjectResult:
+    started = time.monotonic_ns()
+    try:
+        current = _load_fleet_project_manifest(
+            admission.project, expected_manifest=admission.manifest
+        )
+        outcome = runner(current, operation, _project_request(current, request))
+        if (
+            type(outcome) is not FleetProjectOutcome
+            or type(outcome.status) is not str
+            or not outcome.status
+            or (outcome.result is not None and type(outcome.result) is not dict)
+        ):
+            raise FleetConfigError("fleet_result_invalid")
+        result = None if outcome.result is None else _serialize_domain_result(outcome.result)
+        code = None
+        status = outcome.status
+    except BaseException as error:
+        result = None
+        code = _failure_code(error)
+        status = "error"
+    duration = max(0, (time.monotonic_ns() - started) // 1_000_000)
+    return FleetProjectResult(
+        admission.project.id,
+        str(admission.project.project_uid),
+        status,
+        result,
+        code,
+        duration,
+    )
+
+
+def run_fleet_operation(
+    workspace: FleetWorkspace,
+    operation: FleetOperation,
+    selected: tuple[FleetProject, ...],
+    request: FleetOperationRequest,
+    runner: FleetProjectRunner = DEFAULT_FLEET_RUNNER,
+    *,
+    expected_admissions: tuple[FleetProjectAdmission, ...] | None = None,
+) -> FleetResult:
+    """Run one project-agnostic operation with bounded, isolated workers."""
+    if type(workspace) is not FleetWorkspace:
+        raise FleetConfigError("fleet_invalid")
+    _validate_request(operation, selected, request)
+    fresh = require_fleet_projects_ready(selected)
+    if expected_admissions is not None:
+        if (
+            type(expected_admissions) is not tuple
+            or len(expected_admissions) != len(fresh)
+            or any(
+                type(old) is not FleetProjectAdmission
+                or old.project != new.project
+                or old.manifest != new.manifest
+                for old, new in zip(expected_admissions, fresh)
+            )
+        ):
+            raise FleetConfigError("fleet_manifest_changed")
+
+    if operation == "query":
+        from .registry import (
+            capture_registry_snapshot,
+            query_registry,
+            registry_status,
+        )
+
+        assert type(request) is FleetQueryRequest
+        rows: list[FleetProjectResult] = []
+        for admission in fresh:
+            started = time.monotonic_ns()
+            current = registry_status(
+                admission.project.root,
+                admission.manifest,
+                expected_repository_identity=admission.project.repository_identity,
+            )
+            duration = max(0, (time.monotonic_ns() - started) // 1_000_000)
+            code = None if current.status == "current" else f"registry_{current.status}"
+            rows.append(FleetProjectResult(
+                admission.project.id,
+                str(admission.project.project_uid),
+                "current" if code is None else "error",
+                None,
+                code,
+                duration,
+            ))
+        if any(row.error_code for row in rows):
+            return FleetResult(operation, "failed", tuple(rows), None)
+        snapshot = capture_registry_snapshot(
+            tuple(item.project.project_uid for item in fresh),
+            require_graphify_projection=True,
+        )
+        envelope = query_registry(snapshot, request.query)
+        return FleetResult(operation, "ok", tuple(rows), envelope.to_dict())
+
+    rows: list[FleetProjectResult | None] = [None] * len(fresh)
+    if operation == "registry-sync":
+        for index, admission in enumerate(fresh):
+            rows[index] = _run_one(admission, operation, request, runner)
+    else:
+        with ThreadPoolExecutor(max_workers=workspace.max_parallel) as executor:
+            futures = {
+                executor.submit(_run_one, admission, operation, request, runner): index
+                for index, admission in enumerate(fresh)
+            }
+            for future in as_completed(futures):
+                rows[futures[future]] = future.result()
+    completed = tuple(item for item in rows if item is not None)
+    failures = sum(item.error_code is not None for item in completed)
+    aggregate: Literal["ok", "partial_failure", "failed"]
+    if not failures:
+        aggregate = "ok"
+    elif failures == len(completed):
+        aggregate = "failed"
+    else:
+        aggregate = "partial_failure"
+    return FleetResult(operation, aggregate, completed)
