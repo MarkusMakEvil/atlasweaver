@@ -173,3 +173,30 @@ def test_internal_inspect_has_closed_root_and_output_surface(
         "--output", str(output),
     ]) == 0
     assert calls == [(consumer, "nested/repo", trusted, output)]
+
+
+def test_internal_build_has_closed_root_and_output_surface(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    consumer, _, trusted = checkouts(tmp_path)
+    bundle = tmp_path / "bundle.zip"
+    summary = tmp_path / "summary.json"
+    calls: list[tuple[Path, str, Path, Path, Path]] = []
+    monkeypatch.setattr(
+        workflow_module,
+        "run_workflow_build",
+        lambda checkout, root, forbidden, output, report: calls.append(
+            (checkout, root, forbidden, output, report)
+        ),
+        raising=False,
+    )
+
+    assert workflow_module._main([
+        "build",
+        "--consumer-checkout", str(consumer),
+        "--repo-root", "nested/repo",
+        "--trusted-tool-checkout", str(trusted),
+        "--output-bundle", str(bundle),
+        "--output-summary", str(summary),
+    ]) == 0
+    assert calls == [(consumer, "nested/repo", trusted, bundle, summary)]

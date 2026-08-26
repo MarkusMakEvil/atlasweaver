@@ -21,10 +21,18 @@ from .compatibility import (
     validate_public_model_identifier,
 )
 from .doctor import doctor_project
-from .graphify import SubprocessCommandRunner, probe_graphify, resolve_graphify_executable
+from .graphify import (
+    SubprocessCommandRunner,
+    minimal_environment,
+    probe_graphify,
+    resolve_graphify_executable,
+)
 from .health import assess_health, inspect_project_state
+from .lifecycle import RefreshOptions, refresh_project
 from .locking import RepositoryAccess, RepositoryIdentity
 from .manifest import load_manifest
+from .bundles import PackRequest, pack_bundle
+from .operation_state import render_ci_summary
 from .staging import inspect_projection
 
 
@@ -367,7 +375,7 @@ def run_workflow_check(
             before_exec=workflow.revalidate,
         )
         workflow.revalidate()
-        doctor = doctor_project(
+        doctor_project(
             repository_path,
             expected_repository_identity=workflow.repository_identity,
             expected_manifest=manifest,
@@ -382,6 +390,11 @@ def run_workflow_check(
         )
         workflow.revalidate()
         if health.core_status not in {"healthy", "partial"}:
+            raise WorkflowBoundaryError("workflow_root_invalid")
+        raw_required = _bounded_environment("ATLASWEAVER_REQUIRE_IMPACT_TRUST")
+        if raw_required not in {"", "true", "false"}:
+            raise WorkflowBoundaryError("workflow_extraction_invalid")
+        if raw_required == "true" and health.trust.impact != "trusted":
             raise WorkflowBoundaryError("workflow_root_invalid")
         if require_impact and health.trust.impact != "trusted":
             raise WorkflowBoundaryError("workflow_root_invalid")
@@ -502,6 +515,123 @@ def run_workflow_inspect(
         workflow.revalidate()
 
 
+def run_workflow_build(
+    consumer_checkout: Path,
+    repo_root: str,
+    trusted_tool_checkout: Path,
+    output_bundle: Path,
+    output_summary: Path,
+) -> None:
+    """Refresh and pack through one descriptor-retained workflow authority."""
+    with open_workflow_repository(
+        consumer_checkout,
+        repo_root,
+        forbidden_checkout=trusted_tool_checkout,
+    ) as workflow:
+        repository_path = consumer_checkout.absolute().joinpath(*workflow.segments)
+        workflow.revalidate()
+        manifest = load_manifest(
+            repository_path / ".graphify-project.yaml",
+            repository_path,
+            repository_access=workflow.repository_access,
+        )
+        if manifest.schema_version != 2 or manifest.project_uid is None:
+            raise WorkflowBoundaryError("workflow_root_invalid")
+        workflow.revalidate()
+
+        backend = _bounded_environment("ATLASWEAVER_BACKEND")
+        model = _bounded_environment("ATLASWEAVER_MODEL")
+        raw_deep = _bounded_environment("ATLASWEAVER_DEEP") or "false"
+        if raw_deep not in {"true", "false"}:
+            raise WorkflowBoundaryError("workflow_extraction_invalid")
+        mode = admit_workflow_extraction_mode(backend, model, raw_deep == "true")
+        ambient = minimal_environment()
+        credential_bound = False
+        if mode == "semantic":
+            token = os.environ.pop("ATLASWEAVER_BACKEND_TOKEN", None)
+            if token is not None and (
+                type(token) is not str
+                or not token
+                or len(token.encode("utf-8")) > 65_536
+                or any(ord(character) < 32 for character in token)
+            ):
+                raise WorkflowBoundaryError("workflow_extraction_invalid")
+            try:
+                credential = bind_semantic_backend_credential(
+                    production_graphify_compatibility(), backend, token
+                )
+                validate_semantic_backend(
+                    production_graphify_compatibility(), backend, credential
+                )
+            except CompatibilityError:
+                raise WorkflowBoundaryError("workflow_extraction_invalid") from None
+            ambient.update(credential)
+            credential_bound = bool(credential)
+        else:
+            os.environ.pop("ATLASWEAVER_BACKEND_TOKEN", None)
+
+        workflow.revalidate()
+        doctor = doctor_project(
+            repository_path,
+            expected_repository_identity=workflow.repository_identity,
+            expected_manifest=manifest,
+        )
+        result = refresh_project(
+            repository_path,
+            manifest,
+            RefreshOptions(
+                None if mode == "code_only" else backend,
+                None if mode == "code_only" else model,
+                raw_deep == "true",
+                mode == "code_only",
+            ),
+            ambient=ambient,
+            expected_repository_identity=workflow.repository_identity,
+        )
+        workflow.revalidate()
+        health = assess_health(
+            inspect_project_state(
+                repository_path,
+                manifest,
+                repository_access=workflow.repository_access,
+            )
+        )
+        if health.core_status not in {"healthy", "partial"}:
+            raise WorkflowBoundaryError("workflow_root_invalid")
+        output_parent = _prepare_output_directory(output_bundle.absolute().parent)
+        if output_summary.absolute().parent != output_parent:
+            _prepare_output_directory(output_summary.absolute().parent)
+        packed = pack_bundle(
+            PackRequest(repository_path, output_bundle.absolute()),
+            expected_repository_identity=workflow.repository_identity,
+            expected_manifest=manifest,
+        )
+        workflow.revalidate()
+        machine, _ = render_ci_summary([{
+            "schema_version": 1,
+            "project_id": manifest.project_id,
+            "project_uid": str(manifest.project_uid),
+            "operation": "artifact_pack",
+            "status": result.status,
+            "source_digest": packed.artifact.source_digest,
+            "projection_digest": packed.artifact.projection_digest,
+            "graph_digest": packed.artifact.graph_digest,
+            "generation_digest": packed.artifact.generation_digest,
+            "build_epoch": packed.artifact.build_epoch,
+            "artifact_channel": packed.artifact.transport.channel,
+            "backend": None if mode == "code_only" else backend,
+            "model": None if mode == "code_only" else model,
+            "deep": raw_deep == "true",
+            "credential_bound": credential_bound,
+            "core_status": health.core_status,
+        }])
+        _write_inspect_document(
+            output_summary.absolute(),
+            json.loads(machine.decode("utf-8")),
+        )
+        workflow.revalidate()
+
+
 def _main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m project_knowledge.workflow_boundary")
     subparsers = parser.add_subparsers(dest="verb", required=True)
@@ -516,6 +646,12 @@ def _main(argv: Sequence[str] | None = None) -> int:
     inspect.add_argument("--repo-root", required=True)
     inspect.add_argument("--trusted-tool-checkout", type=Path, required=True)
     inspect.add_argument("--output", type=Path, required=True)
+    build = subparsers.add_parser("build")
+    build.add_argument("--consumer-checkout", type=Path, required=True)
+    build.add_argument("--repo-root", required=True)
+    build.add_argument("--trusted-tool-checkout", type=Path, required=True)
+    build.add_argument("--output-bundle", type=Path, required=True)
+    build.add_argument("--output-summary", type=Path, required=True)
     arguments = parser.parse_args(argv)
     if arguments.verb == "validate-extraction":
         try:
@@ -546,6 +682,18 @@ def _main(argv: Sequence[str] | None = None) -> int:
                 arguments.repo_root,
                 arguments.trusted_tool_checkout,
                 arguments.output,
+            )
+            return 0
+        except (WorkflowBoundaryError, OSError, ValueError, TypeError):
+            return 1
+    if arguments.verb == "build":
+        try:
+            run_workflow_build(
+                arguments.consumer_checkout,
+                arguments.repo_root,
+                arguments.trusted_tool_checkout,
+                arguments.output_bundle,
+                arguments.output_summary,
             )
             return 0
         except (WorkflowBoundaryError, OSError, ValueError, TypeError):

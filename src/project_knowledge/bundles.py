@@ -1243,6 +1243,63 @@ def _capture_owned_generation(
     return CapturedGeneration(manifest, captured_validated, tuple(payloads))
 
 
+def _capture_validated_generation(
+    validated: ValidatedGraph,
+    manifest: ProjectManifest,
+    destination: Path,
+) -> CapturedGeneration:
+    """Descriptor-capture one in-process validated candidate for publication."""
+    if type(validated) is not ValidatedGraph or validated.project_uid != manifest.project_uid:
+        raise ArtifactValidationError("validated generation identity mismatch")
+    destination.mkdir(mode=0o700, parents=True, exist_ok=False)
+    names = [
+        OWNERSHIP_MANIFEST_NAME,
+        *(path.name for path in ALLOWED_PAYLOADS if (validated.root / path.name).exists()),
+    ]
+    for name in names:
+        payload, _ = _read_stable_regular(
+            validated.root / name, V1_LIMITS.entry_bytes
+        )
+        descriptor = os.open(
+            destination / name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+            0o600,
+        )
+        try:
+            _write_all(descriptor, payload)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    captured = validate_owned_graph(
+        destination,
+        manifest,
+        expected_source_digest=validated.source_digest,
+        expected_projection_digest=validated.projection_digest,
+    )
+    if (
+        captured.graph_digest != validated.graph_digest
+        or captured.generation_digest != validated.generation_digest
+        or captured.build_epoch != validated.build_epoch
+        or captured.git_identity != validated.git_identity
+    ):
+        raise ArtifactValidationError("captured generation identity mismatch")
+    payloads: list[CapturedPayload] = []
+    for transport_path in ALLOWED_PAYLOADS:
+        source = destination / transport_path.name
+        if not source.exists():
+            continue
+        payload, info = _read_stable_regular(source, V1_LIMITS.entry_bytes)
+        payloads.append(CapturedPayload(
+            transport_path,
+            source,
+            hashlib.sha256(payload).hexdigest(),
+            len(payload),
+            info.st_dev,
+            info.st_ino,
+        ))
+    return CapturedGeneration(manifest, captured, tuple(payloads))
+
+
 OWNERSHIP_MANIFEST_NAME = ".project-knowledge-ownership.json"
 
 
