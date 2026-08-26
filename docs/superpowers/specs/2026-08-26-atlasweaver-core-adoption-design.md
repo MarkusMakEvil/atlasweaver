@@ -43,6 +43,13 @@ the journal for deterministic recovery. Stable outcomes are `initialized`,
 `already_configured`, `init_conflict`, and `init_recovery_required`; a
 half-written configuration is never reported as success.
 
+Apply does not trust a preview object as write authority. Under the lock it
+reopens the verified repository by descriptor, rederives the complete canonical
+preview from the captured explicit intent, and requires exact repository
+identity/status/root/payload equality before allocating a UUID or writing.
+Migration and coverage approval use the same preview-rebinding rule; repository
+rename/symlink replacement cannot redirect their transaction.
+
 State bootstrap creates `.project-knowledge` as a no-follow mode-0700 directory
 and opens the lock with no-follow/exclusive-create semantics; a symlink, wrong
 type, or unsafe existing permissions fail closed. Every manifest-using command
@@ -85,6 +92,12 @@ without relying on a repository source checkout.
 9. transactional promotion into `graphify-out`;
 10. final health inspection and cleanup of temporary state.
 
+Schema-2 candidate validation always requires an external evidence-digest
+anchor from the in-process evidence builder or a descriptor-captured bundle/
+registry binding. Hashing candidate evidence at the validator call site never
+creates authority; arbitrary low-level schema-2 validate therefore refuses
+with `evidence_anchor_required`.
+
 The lifecycle lock is held from projection through cleanup, and lock order is
 always lifecycle lock before the narrower promotion lock. It serializes init,
 migration, coverage approval, refresh, install, pack snapshot capture, and
@@ -93,6 +106,23 @@ All retained low-level graph-affecting commands, including `adapt`, `promote`,
 Atlas promotion, and global-registry sync, enter the same lifecycle boundary;
 mixed legacy/high-level races are tested. A v2 command never relies on the
 promotion lock alone.
+The boundary opens the repository root once with no-follow semantics and treats
+that descriptor—not the pathname—as authority for its complete lifetime.
+Journal, manifest, ignore/policy, projection, secret-scan, staging, live graph,
+ownership, post-promotion health, query capture, pack/install capture, and
+registry input are all opened relative to that same descriptor. Renaming or
+replacing the requested root after lock acquisition cannot split validated
+input from the descriptor-bound promotion destination. An optional expected
+`(device, inode)` captured by a fleet is compared to `fstat()` of this same
+descriptor before state lookup/creation or credential-consuming work.
+
+Read-only doctor and health do not create lifecycle state. They use the same
+noncreating repository-root descriptor boundary directly, carry it through all
+repository reads, and optionally enforce the fleet-captured identity. Query and
+registry status use existing noncreating locks where atomic managed state is
+required, but all project-side bytes still come from the already bound root
+descriptor. A check followed by reopening the repository pathname is never an
+authorization boundary.
 The preflight verifies the exact command/flag/backend/model contract from the
 compatibility registry, including `extract --no-cluster`, `cluster-only`, and
 `diagnose multigraph --json`; help-text resemblance alone is insufficient.
@@ -108,7 +138,9 @@ binary override; explicit executable paths exist only as injected library-test
 seams.
 
 The command exposes Graphify backend/model/deep-mode options as validated argv
-items. It never forwards `--allow-partial`, `--global`, database introspection,
+items. Semantic mode requires both an explicit registry-supported backend and
+a bounded public model identifier; AtlasWeaver never relies on an upstream
+default model. It never forwards `--allow-partial`, `--global`, database introspection,
 Git-ignore bypass, or arbitrary native flags. A semantic corpus without an
 available backend fails before extraction with `semantic_backend_required`.
 `--code-only` must be explicit. Backend credentials enter only an
@@ -117,13 +149,26 @@ parent environment. Temporary state is retained only when cleanup itself
 fails, and the diagnostic reports a redacted recovery identifier rather than a
 source path.
 
+Backend/model pairing and lexical model admission happen before the ambient
+mapping or any fixed-name secret is read. Refresh then opens a noncreating
+repository descriptor, validates the optional expected identity, and gates the
+init journal before credential binding. The lifecycle lock must reacquire that
+same identity before any Graphify child. Thus malformed public options and
+replaced/recovery-required repositories cannot trigger credential lookup or
+subprocess execution.
+
 Atlas export, registry sync, remote publication, and hook installation remain
-separate explicit commands.
+separate explicit operations. Remote publication is workflow-internal only and
+has no public CLI subcommand or installed script; the other operations retain
+their explicitly declared public boundaries.
 
 ### Query commands
 
 `query`, `path`, `explain`, and `affected` operate only on an owned, validated
-live graph. They run `detect`/health first, refuse stale or invalid graphs, and
+manifest-v2 live graph. Schema-v1 graphs remain available to retained low-level
+navigation commands but must be explicitly migrated/refreshed before the
+immutable high-level query surface. High-level queries run `detect`/health
+first, refuse stale or invalid graphs, and
 return a trust field:
 
 - `trusted`: impact evidence passed the configured compatibility contract;
@@ -160,6 +205,11 @@ only against that immutable copy. `affected` additionally joins validated
 evidence IDs; Graphify 0.9.48's opaque text-only command is not used as
 structured evidence.
 
+Query acquisition is byte-for-byte repository read-only. It uses only an
+already existing lifecycle state directory and lock; missing state or a v1
+manifest is a stable refusal and never creates `.project-knowledge` or a lock
+file.
+
 ### Registry commands
 
 `registry-sync` and `registry-status` put an AtlasWeaver-owned atomic registry in
@@ -176,14 +226,26 @@ Ownership, digest, or alias mismatch fails closed with stable codes. Calling
 sync while disabled returns `registry_disabled` and performs no write; the
 explicit manifest migration/edit is the opt-in.
 
+When managed state exists, status uses the already existing global lock in
+shared non-creating mode so it cannot observe half of a journaled generation;
+contention is a stable read-only mismatch/busy issue. The Graphify compatibility
+manifest records exact durable journal-bound snapshot graph paths, never paths
+inside a disposable projector HOME. Those paths use a dedicated snapshot
+digest over generation identity plus exact ownership and canonical manifest
+hashes; generation identity alone cannot collide snapshots that differ only in
+build epoch, Git ownership, or configuration bytes.
+
 Because registry state is user-global, sync also takes a separate per-user lock
 after the repository lifecycle lock. The AtlasWeaver registry is the sole trust
 source. Under the same lock, a journaled compatibility projector derives
 Graphify 0.9.48's two fixed files (`global-graph.json` and
 `global-manifest.json`), records old/new hashes and backups, fsyncs each write,
-and marks the journal committed only after both reread correctly. Recovery runs
-before every managed registry read/write and deterministically rolls forward or
-back; an absent/corrupt journal never authorizes deletion.
+and marks the journal committed only after both reread correctly. The exclusive
+mutating sync path performs deterministic recovery before any new write. The
+shared `create=False` status/snapshot paths are byte-for-byte read-only: if a
+journal is present, absent where required, or corrupt, they report the stable
+recovery-required/mismatch state and never roll forward, roll back, create a
+lock, or mutate a byte. An absent/corrupt journal never authorizes deletion.
 
 AtlasWeaver status/query uses the atomic source registry and accepts the
 Graphify projection only when both files match the committed generation hashes.
@@ -258,9 +320,10 @@ explicit `manifest-migrate --apply` rewrites v1.
 Unknown fields, invalid combinations, booleans used as integers, duplicate YAML
 keys, aliases, merge keys, non-string mapping keys, path escapes, and attempts
 to weaken global policy fail closed. The parser accepts exactly one YAML
-document and applies a closed field/type schema recursively. Migration uses the
-same journaled no-clobber transaction as init, writes a canonical preview first,
-and never changes graph output.
+document and applies a closed field/type schema recursively. Migration provides
+the same journaled/no-clobber guarantees through its distinct one-file manifest
+replacement transaction, writes a canonical preview first, never mutates
+`.graphifyignore`, and never changes graph output.
 
 ## Privacy policy v2
 
@@ -311,10 +374,34 @@ because they do not change extractor input. Only aggregate action/reason counts 
 that digest leave private state; denied filenames and detector fingerprints
 never enter graph output, telemetry, or public bundles. Candidate metadata and
 ownership bind both `source_digest` and `projection_digest`, and validation
-recomputes both. This makes
-`source_matches` precise: it means the graph matches the documented safe
-projection and its policy, while `scope_coverage` separately reports how much
-of the requested tracked scope was represented, scanned, or denied.
+recomputes both. This makes the conjunction of `source_matches` and
+`projection_matches` precise: together they mean the graph matches the
+documented safe bytes, scope, and policy. `source_matches` alone compares only
+the safe-content digest; `scope_coverage` separately reports how much of the
+requested tracked scope was represented, scanned, or denied.
+
+Ownership also binds a domain-separated `generation_digest` over the exact
+approved non-ownership artifact path/SHA-256/byte-length set. Refresh no-op
+identity uses this complete generation digest, not graph bytes alone: an exact
+no-op returns the already installed build epoch, while any report, evidence,
+HTML, or graph change installs the next epoch. No response may report an
+identity component that was not descriptor-revalidated from committed live
+ownership. A committed result whose live ownership cannot be revalidated uses
+`null` for graph digest, generation digest, and epoch as one indivisible unknown
+identity; a malformed promotion summary is never serialized. Refresh result and
+CLI envelopes expose the post-commit descriptor-validated installed generation
+digest alongside graph digest and epoch, so graph-identical evidence/report
+generations remain distinguishable.
+
+Refresh records the changed-promotion commit bit immediately after
+`promote_graph` returns and places every subsequent ordinary operation,
+including the first live-ownership revalidation, inside the post-commit
+normalization boundary. An unexpected revalidation failure after a commit
+returns a navigation-only `promoted_but_stale` result with the complete
+installed identity or all three identity fields null; a coincident cleanup
+failure adds only its opaque recovery ID. After an exact-generation no-op, the
+same failure is the closed `refresh_verification_failed` error instead because
+no mutation committed. Cleanup never suppresses a pending non-ordinary signal.
 
 Both digests use canonical UTF-8 JSON with explicit domain prefixes.
 `source_digest` hashes the ordered safe entries as relative path, SHA-256, and
@@ -364,7 +451,9 @@ aggregate must pin AtlasWeaver 0.2.x until they migrate.
 
 ## Module boundaries
 
-- `policy.py`: structured path decisions and reason codes;
+- `privacy.py`: structured path decisions and reason codes;
+- `locking.py`: no-follow repository access, lifecycle leases, and descriptor-
+  rooted lock authority;
 - `manifest.py`/`models.py`: v1/v2 loading and immutable configuration;
 - `coverage.py`: strict tracked approvals and recomputed omission admission;
 - `lifecycle.py`: orchestration with injected staging, Graphify, adapter, and
@@ -384,7 +473,10 @@ promotion. Drift before promotion aborts and leaves the previous owned output
 intact. The graph directory promotion itself is atomic, but repository source
 cannot be transacted with it: drift detected after commit returns
 `promoted_but_stale`, marks health stale, and exits nonzero rather than claiming
-rollback. Subprocess output remains bounded and redacted. Signals and timeouts
+rollback. Cleanup failure follows the same commit boundary: before commit it is
+stable `cleanup_failed`; after commit it is `promoted_but_stale` with the
+revalidated installed identity (or a completely null identity), a recovery ID,
+and no rollback claim. Subprocess output remains bounded and redacted. Signals and timeouts
 terminate the owned Graphify process group; cleanup and lock release are covered
 by failure-injection tests.
 

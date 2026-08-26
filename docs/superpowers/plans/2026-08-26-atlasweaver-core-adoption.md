@@ -54,6 +54,7 @@ from project_knowledge.compatibility import (
 from project_knowledge.adapters import adapter_for
 from project_knowledge.adapters.base import CapturedArtifact, NormalizationResult
 from project_knowledge.evidence import (
+    CommandEnvironmentBinding,
     GraphEvidence,
     build_extraction_invocation,
     build_graph_evidence,
@@ -130,6 +131,8 @@ def probe_graphify(
     executable: ResolvedGraphifyExecutable,
     contract: GraphifyCompatibility,
     runner: CommandRunner,
+    *,
+    before_exec: Callable[[], None] = _noop,
 ) -> GraphifyCapabilities: ...
 def validate_candidate(
     candidate_dir: Path,
@@ -137,6 +140,7 @@ def validate_candidate(
     manifest: ProjectManifest,
     *,
     expected_projection_digest: str | None = None,
+    expected_evidence_digest: str | None = None,
     build_epoch: int | None = None,
     git_identity: GitIdentity | None = None,
 ) -> ValidatedGraph: ...
@@ -146,6 +150,7 @@ def validate_owned_graph(
     *,
     expected_source_digest: str | None = None,
     expected_projection_digest: str | None = None,
+    repository_access: RepositoryAccess | None = None,
 ) -> ValidatedGraph: ...
 ```
 
@@ -215,11 +220,13 @@ For live trust recomputation, `decide_impact_trust` accepts `source_current: boo
 
 **Interfaces:**
 - Consumes: `resolve_graphify_compatibility(version: str) -> GraphifyCompatibility`.
+- Produces: `ManifestError(message: str, *, kind: Literal["invalid", "changed"] = "invalid")`; all parser/schema failures use the default, while descriptor binding/rewrite failures use the constant `kind="changed"`. Callers never infer authority state from exception text.
 - Produces: `FeatureIntent(atlas: Literal["disabled", "enabled"], registry: Literal["disabled", "enabled"])`.
 - Produces: `ArtifactIntent(provider, host, repository, repository_id, channel, source_ref, signer_workflow, signer_digest)`.
 - Produces: backward-compatible `ProjectManifest` with `project_uid: UUID | None`, `features`, and `artifacts` defaults.
 - Produces: `load_manifest(path: Path, repo_root: Path) -> ProjectManifest` for exact schemas 1 and 2.
-- Produces: `load_manifest_payload(payload: bytes, repo_root: Path) -> ProjectManifest`; registry/fleet parses already captured bytes and never reopens a path.
+- Produces: `load_manifest_payload(payload: bytes, repo_root: Path) -> ProjectManifest`; registry/fleet parses already captured bytes and never reopens a path, and this byte-owned API independently enforces the same 262,144-byte cap.
+- Produces: `validate_project_excludes(values: object) -> tuple[str, ...]` as the shared fail-closed canonical glob-pattern boundary used by manifest load/render and privacy classification.
 - Produces: `render_manifest_v2(manifest: ProjectManifest) -> bytes`.
 
 - [ ] **Step 1: Add canonical fixture builders and failing strict-v2 tests**
@@ -323,6 +330,15 @@ def test_v1_maps_optional_intent_without_portable_identity(tmp_path: Path) -> No
     assert loaded.artifacts.provider == "none"
 ```
 
+Also parameterize direct byte-owned and path-owned inputs for 262,145 bytes;
+unhashable list/mapping YAML keys; nested non-string keys; merge tags; Windows
+drive/backslash paths; NUL/control characters; non-canonical `.`/`..`/double
+separator spellings; and booleans in every integer position. Add renderer tests
+that directly forge runtime `ProjectManifest`, `FeatureIntent`, and
+`ArtifactIntent` instances with wrong literal values, unsafe paths, boolean
+repository IDs, and incomplete GitHub transport fields. Rendering must raise
+`ManifestError`; frozen dataclasses and annotations are not runtime authority.
+
 - [ ] **Step 2: Run the tests and verify the missing contracts fail**
 
 Run: `uv run pytest -q tests/test_manifest.py tests/test_manifest_v2.py`
@@ -381,14 +397,26 @@ class _StrictLoader(yaml.SafeLoader):
         if self.check_event(yaml.AliasEvent):
             raise ManifestError("YAML aliases are forbidden")
         return super().compose_node(parent, index)
+    def flatten_mapping(self, node: yaml.MappingNode) -> None:
+        if any(key.tag == "tag:yaml.org,2002:merge" for key, _ in node.value):
+            raise ManifestError("YAML merge keys are forbidden")
+        super().flatten_mapping(node)
 
 def _construct_unique_mapping(
     loader: _StrictLoader, node: yaml.MappingNode, deep: bool = False
 ) -> dict[object, object]:
     result: dict[object, object] = {}
     for key_node, value_node in node.value:
+        if key_node.tag == "tag:yaml.org,2002:merge":
+            raise ManifestError("YAML merge keys are forbidden")
         key = loader.construct_object(key_node, deep=deep)
-        if key in result:
+        if type(key) is not str:
+            raise ManifestError("YAML mapping keys must be strings")
+        try:
+            duplicate = key in result
+        except TypeError:
+            raise ManifestError("YAML mapping keys must be strings") from None
+        if duplicate:
             raise ManifestError("duplicate YAML key")
         result[key] = loader.construct_object(value_node, deep=deep)
     return result
@@ -399,6 +427,8 @@ _StrictLoader.add_constructor(
 )
 
 def _load_one_yaml(payload: bytes) -> dict[str, object]:
+    if type(payload) is not bytes or len(payload) > 262_144:
+        raise ManifestError("manifest exceeds its byte cap")
     try:
         value = yaml.load(payload.decode("utf-8"), Loader=_StrictLoader)
     except (UnicodeDecodeError, yaml.YAMLError) as error:
@@ -431,7 +461,21 @@ def _graphify_version(value: object) -> str:
     return version
 ```
 
-For `provider: none`, require the artifact mapping to be exactly `{"provider": "none"}`. For `github-release`, require every `GITHUB_FIELDS` field, `host == "github.com"`, a positive non-boolean numeric repository ID, `repository` matching `[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+`, a channel matching `[A-Za-z0-9][A-Za-z0-9._-]{0,62}`, a source ref beginning `refs/heads/`, a confined `<owner>/<repo>/.github/workflows/<name>.yml` signer workflow, and a lowercase 40-hex signer digest. Parse `project_uid` with `UUID(value)`, require `version == 4` and `variant == RFC_4122`, and preserve it as `UUID`.
+For `provider: none`, require the artifact mapping to be exactly `{"provider": "none"}`. For `github-release`, require every `GITHUB_FIELDS` field, `host == "github.com"`, a positive exact non-boolean integer repository ID, `repository` matching `[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+`, a channel matching `[A-Za-z0-9][A-Za-z0-9._-]{0,62}`, a source ref beginning `refs/heads/`, a confined `<owner>/<repo>/.github/workflows/<name>.yml` signer workflow, and a lowercase 40-hex signer digest. Parse `project_uid` with `UUID(value)`, require `version == 4` and `variant == RFC_4122`, and preserve it as `UUID`.
+
+Every repository-relative/namespace path validator rejects backslashes, drive
+prefixes, NUL/control characters, absolute paths, empty/`.`/`..` components,
+and any spelling whose `PurePosixPath(...).as_posix()` is not byte-for-byte the
+input. Apply the same closed validation recursively to include roots, output,
+Obsidian namespace, excludes, repository identity, source ref, and signer
+workflow as appropriate; host-platform normalization must not widen the wire
+contract.
+
+`validate_project_excludes` requires a finite list/tuple of exact non-empty
+strings, rejects leading `!`, backslashes, drive/absolute prefixes, control
+characters, empty/`.`/`..` components, and any spelling changed by POSIX
+normalization, while preserving admitted glob metacharacters. Both manifest
+loading and runtime rendering call it and retain its returned tuple.
 
 Render with fixed key ordering and scalar quoting through a local `_yaml_scalar` that permits only already-validated strings; do not use a dumper that emits tags or anchors:
 
@@ -472,6 +516,11 @@ def render_manifest_v2(manifest: ProjectManifest) -> bytes:
     return ("\n".join(lines) + "\n").encode("utf-8")
 ```
 
+Before emitting a byte, `render_manifest_v2()` revalidates the complete runtime
+object through the same closed scalar/path/nested-combination helpers used by
+the loader. It must not trust dataclass annotations or call `str()` on an
+invalid optional transport value to make it renderable.
+
 - [ ] **Step 4: Run focused and legacy tests**
 
 Run: `uv run pytest -q tests/test_manifest.py tests/test_manifest_v2.py tests/test_privacy.py tests/test_staging.py tests/test_artifacts.py`
@@ -491,15 +540,25 @@ git commit -m "feat: add strict manifest v2 contract"
 - Create: `tests/test_lifecycle_locking.py`
 - Modify: `src/project_knowledge/locking.py`
 - Modify: `src/project_knowledge/artifacts.py`
+- Modify: `src/project_knowledge/manifest.py`
 - Modify: `tests/test_locking.py`
 - Modify: `tests/test_artifacts.py`
+- Modify: `tests/test_manifest_v2.py`
 
 **Interfaces:**
-- Produces: `StateRoot(path: Path, descriptor: int)` context manager.
-- Produces: `open_state_root(repo_root: Path, *, create: bool) -> StateRoot | None`.
-- Produces: `ExclusiveDescriptorLock(parent_fd: int, name: str, timeout: float = 5.0)`; lock files are opened relative to the verified state descriptor.
-- Produces: `repository_lifecycle_lock(repo_root: Path, timeout: float = 5.0) -> ExclusiveFileLock`.
+- Produces: `TransactionLockError(message, *, kind="unavailable")` with closed `kind in {"busy", "unavailable", "authority"}` for safe domain mapping; callers never parse exception text.
+- Produces: `RepositoryIdentity = tuple[int, int]` and opaque context-managed `RepositoryAccess(descriptor, identity)`, representing one no-follow opened repository root rather than a pathname assertion.
+- Produces: `open_repository_access(repo_root: Path, *, expected_repository_identity: RepositoryIdentity | None = None) -> RepositoryAccess`; it is byte-for-byte read-only, creates no state, and compares the expected identity to `fstat()` of the opened descriptor before returning.
+- Produces: `StateRoot(path, descriptor, repository_descriptor, repository_identity)` context manager; both no-follow descriptors remain open for the context lifetime.
+- Produces: `open_state_root(repo_root: Path, *, create: bool, expected_repository_identity: RepositoryIdentity | None = None) -> StateRoot | None`.
+- Produces: `ExclusiveDescriptorLock(parent_fd: int, name: str, timeout: float = 5.0, *, create: bool = True)`; lock files are opened relative to the verified state descriptor and read-only consumers can require an existing lock without creating it.
+- Produces: `repository_lifecycle_lock(repo_root: Path, timeout: float = 5.0, *, create: bool = True, expected_repository_identity: RepositoryIdentity | None = None) -> RepositoryLifecycleLock`; the expected identity is checked on the same opened descriptor from which state and the lock are derived, before any create/write. Descriptor-bound mutation authority remains private.
 - Produces: `assert_lifecycle_lock_held(repo_root: Path) -> None` for nested promotion-order enforcement.
+- Produces privately: `capture_lifecycle_descriptors(repo_root) -> LifecycleDescriptors` with duplicated verified repository/state descriptors and the live lease identity, plus `capture_lifecycle_repository(repo_root) -> RepositoryAccess` for descriptor-rooted journal/manifest/projection/staging/health reads while the live lease is held. Neither helper reopens the repository pathname.
+- Extends: `load_manifest(..., repository_access: RepositoryAccess | None = None)`; a supplied access opens `.graphify-project.yaml` relative to its descriptor, never reopens either path argument, and atomically pins/replaces that access's private `_ManifestBinding` before returning. This is the self-loading high-level path and makes a later assertion well-defined even when no caller-supplied manifest existed.
+- Produces privately: `_ManifestBinding(descriptor, identity, size, mtime_ns, ctime_ns, sha256)` retained and owned by one `RepositoryAccess`; `require_current_manifest(repo_root, supplied, *, repository_access) -> ProjectManifest` descriptor-loads/pins it, requires semantic equality with the supplied parsed contract, and returns the descriptor-owned value; `assert_current_manifest_unchanged(repo_root, manifest, *, repository_access) -> None` rechecks the retained descriptor and current directory entry without path reopen. Rebinding atomically installs the new binding then closes the old descriptor; access exit closes the active binding before the root descriptor. Every semantic/binding mismatch from these two helpers is `ManifestError("project manifest changed", kind="changed")`. Every high-level API that accepts a manifest calls the first inside its operation boundary; every self-loading high-level API calls descriptor-rooted `load_manifest`; both paths call the assertion immediately before each child/network/global-registry/promotion boundary and before returning a read snapshot.
+- Extends: `promote_graph(..., repository_access: RepositoryAccess | None = None)`; production high-level callers pass the lease access and promotion opens target/journal only relative to it.
+- Extends: `validate_owned_graph(..., repository_access: RepositoryAccess | None = None)`; when supplied, `root` must name the canonical live `graphify-out` under that access and the validator descriptor-captures the owned tree without reopening the repository path before applying the unchanged strict validator to its private copy.
 - Preserves: `ExclusiveFileLock(path: Path, timeout: float = 5.0)` and `promote_graph(...)`'s narrower `promotion.lock`.
 
 - [ ] **Step 1: Write failing mode, symlink, contention, and lock-order tests**
@@ -507,16 +566,21 @@ git commit -m "feat: add strict manifest v2 contract"
 ```python
 # tests/test_lifecycle_locking.py
 from concurrent.futures import ThreadPoolExecutor
+import contextvars
 from pathlib import Path
 import os
 import pytest
 
 from project_knowledge.locking import (
+    ExclusiveDescriptorLock,
     TransactionLockError,
     assert_lifecycle_lock_held,
+    capture_lifecycle_repository,
+    open_repository_access,
     open_state_root,
     repository_lifecycle_lock,
 )
+from tests.test_cli import tree_snapshot
 
 def test_state_root_is_private_real_and_no_follow(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
@@ -536,6 +600,120 @@ def test_state_root_rejects_symlink_and_unsafe_permissions(tmp_path: Path) -> No
     with pytest.raises(TransactionLockError, match="private state"):
         open_state_root(repo, create=True)
 
+def test_read_only_repository_access_rejects_replacement_without_creating_state(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    with open_repository_access(repo) as loaded:
+        expected = loaded.identity
+    original = tmp_path / "original"
+    repo.rename(original)
+    repo.mkdir()
+    with pytest.raises(TransactionLockError) as raised:
+        with open_repository_access(
+            repo, expected_repository_identity=expected
+        ):
+            pass
+    assert raised.value.kind == "authority"
+    assert not (repo / ".project-knowledge").exists()
+
+def test_expected_identity_is_checked_before_lifecycle_state_creation(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    with open_repository_access(repo) as loaded:
+        expected = loaded.identity
+    original = tmp_path / "original"
+    repo.rename(original)
+    repo.mkdir()
+    with pytest.raises(TransactionLockError) as raised:
+        with repository_lifecycle_lock(
+            repo, expected_repository_identity=expected
+        ):
+            pass
+    assert raised.value.kind == "authority"
+    assert not (repo / ".project-knowledge").exists()
+
+def test_pinned_manifest_detects_same_inode_rewrite_even_if_bytes_are_restored(
+    tmp_path: Path,
+) -> None:
+    repo = configured_v2_repository(tmp_path)
+    path = repo / ".graphify-project.yaml"
+    original = path.read_bytes()
+    supplied = load_manifest(path, repo)
+    with open_repository_access(repo) as repository:
+        current = require_current_manifest(
+            repo, supplied, repository_access=repository
+        )
+        rewrite_same_inode(path, manifest_with(track_html=True))
+        rewrite_same_inode(path, original)
+        with pytest.raises(ManifestError) as raised:
+            assert_current_manifest_unchanged(
+                repo, current, repository_access=repository
+            )
+        assert raised.value.kind == "changed"
+
+def test_descriptor_loaded_manifest_is_pinned_for_later_assertion(
+    tmp_path: Path,
+) -> None:
+    repo = configured_v2_repository(tmp_path)
+    path = repo / ".graphify-project.yaml"
+    original = path.read_bytes()
+    with open_repository_access(repo) as repository:
+        current = load_manifest(path, repo, repository_access=repository)
+        rewrite_same_inode(path, manifest_with(track_html=True))
+        rewrite_same_inode(path, original)
+        with pytest.raises(ManifestError) as raised:
+            assert_current_manifest_unchanged(
+                repo, current, repository_access=repository
+            )
+        assert raised.value.kind == "changed"
+
+def test_manifest_rebinding_closes_old_fd_and_access_exit_closes_active_fd(
+    tmp_path: Path,
+) -> None:
+    repo = configured_v2_repository(tmp_path)
+    with open_repository_access(repo) as repository:
+        load_manifest(
+            repo / ".graphify-project.yaml", repo,
+            repository_access=repository,
+        )
+        first_fd = repository._manifest_binding.descriptor
+        load_manifest(
+            repo / ".graphify-project.yaml", repo,
+            repository_access=repository,
+        )
+        second_fd = repository._manifest_binding.descriptor
+        with pytest.raises(OSError):
+            os.fstat(first_fd)
+        os.fstat(second_fd)
+    with pytest.raises(OSError):
+        os.fstat(second_fd)
+
+def test_failed_manifest_rebind_closes_candidate_and_preserves_old_binding(
+    tmp_path: Path, manifest_fault,
+) -> None:
+    repo = configured_v2_repository(tmp_path)
+    with open_repository_access(repo) as repository:
+        current = load_manifest(
+            repo / ".graphify-project.yaml", repo,
+            repository_access=repository,
+        )
+        old_fd = repository._manifest_binding.descriptor
+        manifest_fault.fail_after_candidate_open()
+        with pytest.raises(ManifestError):
+            load_manifest(
+                repo / ".graphify-project.yaml", repo,
+                repository_access=repository,
+            )
+        os.fstat(old_fd)
+        assert repository._manifest_binding.descriptor == old_fd
+        assert_current_manifest_unchanged(
+            repo, current, repository_access=repository
+        )
+
 def test_lifecycle_lock_serializes_and_exposes_lock_order(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -547,83 +725,419 @@ def test_lifecycle_lock_serializes_and_exposes_lock_order(tmp_path: Path) -> Non
                 blocked.result()
     with pytest.raises(TransactionLockError, match="lifecycle lock is required"):
         assert_lifecycle_lock_held(repo)
+
+def test_copied_context_cannot_retain_or_export_lifecycle_authority(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    captured = None
+    with repository_lifecycle_lock(repo):
+        captured = contextvars.copy_context()
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            with pytest.raises(TransactionLockError):
+                pool.submit(captured.run, assert_lifecycle_lock_held, repo).result()
+    assert captured is not None
+    with pytest.raises(TransactionLockError):
+        captured.run(assert_lifecycle_lock_held, repo)
+
+def test_noncreating_absence_and_state_races_are_closed_lock_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    with pytest.raises(TransactionLockError) as absent:
+        with repository_lifecycle_lock(repo, create=False):
+            pass
+    assert absent.value.kind == "unavailable"
+    assert str(repo) not in str(absent.value)
+
+    inject_state_entry_disappearance_after_open(monkeypatch, repo)
+    with pytest.raises(TransactionLockError) as raced:
+        with repository_lifecycle_lock(repo, create=True):
+            pass
+    assert raced.value.kind == "unavailable"
+    assert str(repo) not in str(raced.value)
+
+@pytest.mark.parametrize("name", ["", ".", "..", "../outside", "sub/lock", "bad\\lock", "bad\nlock"])
+def test_descriptor_lock_rejects_noncanonical_basename_before_open(
+    tmp_path: Path, name: str
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    with open_state_root(repo, create=True) as state:
+        assert state is not None
+        before = tree_snapshot(repo)
+        with pytest.raises(TransactionLockError):
+            ExclusiveDescriptorLock(state.descriptor, name)
+        assert tree_snapshot(repo) == before
+
+def test_promotion_remains_bound_when_repository_path_is_replaced(
+    tmp_path: Path,
+) -> None:
+    repo, candidate = validated_repository_and_candidate(tmp_path)
+    original = tmp_path / "original-repo"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    with repository_lifecycle_lock(repo):
+        with capture_lifecycle_repository(repo) as repository:
+            repo.rename(original)
+            os.symlink(outside, repo, target_is_directory=True)
+            result = promote_graph(
+                candidate, repo, repository_access=repository
+            )
+    assert result.digest == candidate.graph_digest
+    assert (original / "graphify-out/graph.json").is_file()
+    assert not (outside / "graphify-out").exists()
 ```
 
 - [ ] **Step 2: Run the tests and verify the new imports fail**
 
 Run: `uv run pytest -q tests/test_locking.py tests/test_lifecycle_locking.py`
 
-Expected: collection fails because `open_state_root` and `repository_lifecycle_lock` do not exist.
+Expected: collection fails because `open_repository_access`, `open_state_root`,
+`capture_lifecycle_repository`, and `repository_lifecycle_lock` do not exist.
 
 - [ ] **Step 3: Implement no-follow bootstrap and process-local order tracking**
 
 ```python
 # additions to src/project_knowledge/locking.py
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 import contextvars
+import fcntl
 import os
 import stat
+import threading
+import time
+from typing import Iterator, Literal
 
-_LIFECYCLE_ROOTS: contextvars.ContextVar[tuple[Path, ...]] = contextvars.ContextVar(
-    "atlasweaver_lifecycle_roots", default=()
+LockFailureKind = Literal["busy", "unavailable", "authority"]
+RepositoryIdentity = tuple[int, int]
+
+class TransactionLockError(RuntimeError):
+    def __init__(
+        self, message: str, *, kind: LockFailureKind = "unavailable"
+    ) -> None:
+        super().__init__(message)
+        self.kind = kind
+
+def _close_quietly(fd: int) -> bool:
+    try:
+        os.close(fd)
+        return True
+    except OSError:
+        return False
+
+@dataclass
+class _ManifestBinding:
+    descriptor: int
+    identity: RepositoryIdentity
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+    sha256: str
+
+    def close(self) -> bool:
+        descriptor, self.descriptor = self.descriptor, -1
+        return descriptor < 0 or _close_quietly(descriptor)
+
+@dataclass
+class RepositoryAccess(AbstractContextManager["RepositoryAccess"]):
+    descriptor: int
+    identity: RepositoryIdentity
+    _manifest_binding: _ManifestBinding | None = field(
+        default=None, init=False, repr=False
+    )
+
+    def _replace_manifest_binding(self, binding: _ManifestBinding) -> None:
+        previous, self._manifest_binding = self._manifest_binding, binding
+        if previous is not None:
+            previous.close()
+
+    def __exit__(self, *args: object) -> None:
+        binding, self._manifest_binding = self._manifest_binding, None
+        descriptor, self.descriptor = self.descriptor, -1
+        binding_closed = binding is None or binding.close()
+        root_closed = descriptor < 0 or _close_quietly(descriptor)
+        if (not binding_closed or not root_closed) and not args[0]:
+            raise TransactionLockError(
+                "repository access cleanup failed", kind="unavailable"
+            )
+
+def open_repository_access(
+    repo_root: Path,
+    *,
+    expected_repository_identity: RepositoryIdentity | None = None,
+) -> RepositoryAccess:
+    try:
+        descriptor = os.open(
+            repo_root.absolute(),
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+        info = os.fstat(descriptor)
+        identity = (info.st_dev, info.st_ino)
+        if (
+            expected_repository_identity is not None
+            and identity != expected_repository_identity
+        ):
+            _close_quietly(descriptor)
+            raise TransactionLockError(
+                "repository identity changed", kind="authority"
+            )
+        return RepositoryAccess(descriptor, identity)
+    except TransactionLockError:
+        raise
+    except OSError:
+        if "descriptor" in locals():
+            _close_quietly(descriptor)
+        raise TransactionLockError(
+            "repository access is unavailable", kind="unavailable"
+        ) from None
+
+@dataclass
+class _LifecycleLease:
+    repository_path: Path
+    repository_identity: RepositoryIdentity
+    owner_thread_id: int
+    repository_descriptor: int
+    state_descriptor: int
+    active: bool = True
+
+def _new_lifecycle_lease(
+    repository_path: Path,
+    repository_identity: RepositoryIdentity,
+    owner_thread_id: int,
+    repository_descriptor: int,
+    state_descriptor: int,
+) -> _LifecycleLease:
+    return _LifecycleLease(
+        repository_path, repository_identity, owner_thread_id,
+        repository_descriptor, state_descriptor,
+    )
+
+def _matching_live_lease(
+    repo_root: Path, leases: tuple[_LifecycleLease, ...]
+) -> _LifecycleLease | None:
+    try:
+        requested_path = repo_root.absolute()
+    except OSError:
+        raise TransactionLockError(
+            "repository lifecycle authority is unavailable", kind="authority"
+        ) from None
+    owner = threading.get_ident()
+    return next((
+        lease for lease in reversed(leases)
+        if lease.active
+        and lease.owner_thread_id == owner
+        and lease.repository_path == requested_path
+    ), None)
+
+def _has_live_matching_lease(
+    repo_root: Path, leases: tuple[_LifecycleLease, ...]
+) -> bool:
+    try:
+        return _matching_live_lease(repo_root, leases) is not None
+    except TransactionLockError:
+        return False
+
+@dataclass
+class LifecycleDescriptors:
+    repository_descriptor: int
+    state_descriptor: int
+    repository_identity: RepositoryIdentity
+
+@contextmanager
+def capture_lifecycle_descriptors(
+    repo_root: Path,
+) -> Iterator[LifecycleDescriptors]:
+    lease = _matching_live_lease(repo_root, _LIFECYCLE_LEASES.get())
+    if lease is None:
+        raise TransactionLockError(
+            "repository lifecycle lock is required", kind="authority"
+        )
+    repository = -1
+    state = -1
+    try:
+        repository = os.dup(lease.repository_descriptor)
+        state = os.dup(lease.state_descriptor)
+    except OSError:
+        if repository >= 0:
+            _close_quietly(repository)
+        raise TransactionLockError(
+            "repository lifecycle descriptors are unavailable", kind="unavailable"
+        ) from None
+    try:
+        yield LifecycleDescriptors(
+            repository_descriptor=repository,
+            state_descriptor=state,
+            repository_identity=lease.repository_identity,
+        )
+    finally:
+        _close_quietly(state)
+        _close_quietly(repository)
+
+@contextmanager
+def capture_lifecycle_repository(
+    repo_root: Path,
+) -> Iterator[RepositoryAccess]:
+    lease = _matching_live_lease(repo_root, _LIFECYCLE_LEASES.get())
+    if lease is None:
+        raise TransactionLockError(
+            "repository lifecycle lock is required", kind="authority"
+        )
+    try:
+        descriptor = os.dup(lease.repository_descriptor)
+    except OSError:
+        raise TransactionLockError(
+            "repository access is unavailable", kind="unavailable"
+        ) from None
+    with RepositoryAccess(descriptor, lease.repository_identity) as repository:
+        yield repository
+
+_LIFECYCLE_LEASES: contextvars.ContextVar[tuple[_LifecycleLease, ...]] = contextvars.ContextVar(
+    "atlasweaver_lifecycle_leases", default=()
 )
 
 @dataclass
 class StateRoot(AbstractContextManager["StateRoot"]):
     path: Path
     descriptor: int
+    repository_descriptor: int
+    repository_identity: tuple[int, int]
     def __exit__(self, *args: object) -> None:
-        os.close(self.descriptor)
+        state_closed = _close_quietly(self.descriptor)
+        repository_closed = _close_quietly(self.repository_descriptor)
+        self.descriptor = -1
+        self.repository_descriptor = -1
+        if not (state_closed and repository_closed) and not args[0]:
+            raise TransactionLockError(
+                "repository lifecycle cleanup failed", kind="unavailable"
+            )
 
-def open_state_root(repo_root: Path, *, create: bool) -> StateRoot | None:
-    repo = repo_root.absolute()
-    root_fd = os.open(repo, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+def open_state_root(
+    repo_root: Path,
+    *,
+    create: bool,
+    expected_repository_identity: RepositoryIdentity | None = None,
+) -> StateRoot | None:
     try:
+        repo = repo_root.absolute()
+    except OSError:
+        raise TransactionLockError(
+            "repository lifecycle state is unavailable", kind="unavailable"
+        ) from None
+    try:
+        root_fd = os.open(
+            repo, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        )
+    except OSError:
+        raise TransactionLockError(
+            "repository lifecycle state is unavailable", kind="unavailable"
+        ) from None
+    keep_root = False
+    try:
+        try:
+            repository_info = os.fstat(root_fd)
+        except OSError:
+            raise TransactionLockError(
+                "repository lifecycle state is unavailable", kind="unavailable"
+            ) from None
+        repository_identity = (repository_info.st_dev, repository_info.st_ino)
+        if (
+            expected_repository_identity is not None
+            and repository_identity != expected_repository_identity
+        ):
+            raise TransactionLockError(
+                "repository identity changed", kind="authority"
+            )
         created = False
         try:
             info = os.stat(".project-knowledge", dir_fd=root_fd, follow_symlinks=False)
         except FileNotFoundError:
             if not create:
                 return None
-            os.mkdir(".project-knowledge", 0o700, dir_fd=root_fd)
-            os.fsync(root_fd)
-            created = True
-            info = os.stat(".project-knowledge", dir_fd=root_fd, follow_symlinks=False)
+            try:
+                os.mkdir(".project-knowledge", 0o700, dir_fd=root_fd)
+                os.fsync(root_fd)
+                created = True
+                info = os.stat(".project-knowledge", dir_fd=root_fd, follow_symlinks=False)
+            except OSError:
+                raise TransactionLockError(
+                    "repository lifecycle state is unavailable", kind="unavailable"
+                ) from None
+        except OSError:
+            raise TransactionLockError(
+                "repository lifecycle state is unavailable", kind="unavailable"
+            ) from None
         if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
             raise TransactionLockError("private state must be a real directory")
-        descriptor = os.open(
-            ".project-knowledge",
-            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-            dir_fd=root_fd,
-        )
-        if created:
-            os.fchmod(descriptor, 0o700)
-        opened = os.fstat(descriptor)
+        descriptor = -1
+        try:
+            descriptor = os.open(
+                ".project-knowledge",
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=root_fd,
+            )
+            if created:
+                os.fchmod(descriptor, 0o700)
+            opened = os.fstat(descriptor)
+        except OSError:
+            if descriptor >= 0:
+                _close_quietly(descriptor)
+            raise TransactionLockError(
+                "repository lifecycle state is unavailable", kind="unavailable"
+            ) from None
         if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
-            os.close(descriptor)
+            _close_quietly(descriptor)
             raise TransactionLockError("private state changed while opening")
         if opened.st_uid != os.geteuid() or stat.S_IMODE(opened.st_mode) != 0o700:
-            os.close(descriptor)
+            _close_quietly(descriptor)
             raise TransactionLockError("private state permissions are unsafe")
-        return StateRoot(repo / ".project-knowledge", descriptor)
+        result = StateRoot(
+            repo / ".project-knowledge", descriptor, root_fd,
+            repository_identity,
+        )
+        keep_root = True
+        return result
     finally:
-        os.close(root_fd)
+        if not keep_root:
+            _close_quietly(root_fd)
 
 class ExclusiveDescriptorLock(AbstractContextManager["ExclusiveDescriptorLock"]):
-    def __init__(self, parent_fd: int, name: str, timeout: float = 5.0) -> None:
-        self.parent_fd = os.dup(parent_fd)
+    def __init__(self, parent_fd: int, name: str, timeout: float = 5.0, *, create: bool = True) -> None:
+        if (
+            type(name) is not str
+            or not name
+            or name in {".", ".."}
+            or "/" in name
+            or "\\" in name
+            or any(ord(character) < 32 or ord(character) == 127 for character in name)
+        ):
+            raise TransactionLockError(
+                "transaction lock name is invalid", kind="unavailable"
+            )
+        try:
+            self.parent_fd = os.dup(parent_fd)
+        except OSError:
+            raise TransactionLockError(
+                "transaction lock is unavailable", kind="unavailable"
+            ) from None
         self.name = name
         self.timeout = timeout
+        self.create = create
         self.fd: int | None = None
     def __enter__(self) -> "ExclusiveDescriptorLock":
         try:
-            self.fd = os.open(
-                self.name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
-                0o600, dir_fd=self.parent_fd,
-            )
-            opened = os.fstat(self.fd)
-            named = os.stat(self.name, dir_fd=self.parent_fd, follow_symlinks=False)
+            try:
+                self.fd = os.open(
+                    self.name, os.O_RDWR | (os.O_CREAT if self.create else 0) | os.O_NOFOLLOW,
+                    0o600, dir_fd=self.parent_fd,
+                )
+                opened = os.fstat(self.fd)
+                named = os.stat(self.name, dir_fd=self.parent_fd, follow_symlinks=False)
+            except OSError:
+                raise TransactionLockError(
+                    "transaction lock is unavailable", kind="unavailable"
+                ) from None
             if (
                 not stat.S_ISREG(opened.st_mode)
                 or (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)
@@ -638,77 +1152,213 @@ class ExclusiveDescriptorLock(AbstractContextManager["ExclusiveDescriptorLock"])
                     return self
                 except BlockingIOError:
                     if time.monotonic() >= deadline:
-                        raise TransactionLockError("transaction lock timed out")
+                        raise TransactionLockError(
+                            "transaction lock timed out", kind="busy"
+                        )
                     time.sleep(0.01)
-        except BaseException:
-            self.__exit__(None, None, None)
+                except OSError:
+                    raise TransactionLockError(
+                        "transaction lock is unavailable", kind="unavailable"
+                    ) from None
+        except BaseException as error:
+            self.__exit__(type(error), error, error.__traceback__)
             raise
     def __exit__(self, *args: object) -> None:
+        cleanup_ok = True
         if self.fd is not None:
-            fcntl.flock(self.fd, fcntl.LOCK_UN)
-            os.close(self.fd)
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_UN)
+            except OSError:
+                cleanup_ok = False
+            cleanup_ok = _close_quietly(self.fd) and cleanup_ok
             self.fd = None
         if self.parent_fd >= 0:
-            os.close(self.parent_fd)
+            cleanup_ok = _close_quietly(self.parent_fd) and cleanup_ok
             self.parent_fd = -1
+        if not cleanup_ok and not args[0]:
+            raise TransactionLockError(
+                "transaction lock cleanup failed", kind="unavailable"
+            )
 
 class RepositoryLifecycleLock(AbstractContextManager["RepositoryLifecycleLock"]):
-    def __init__(self, repo_root: Path, timeout: float) -> None:
-        self.repo_root = repo_root.absolute()
+    def __init__(
+        self,
+        repo_root: Path,
+        timeout: float,
+        *,
+        create: bool,
+        expected_repository_identity: RepositoryIdentity | None,
+    ) -> None:
+        try:
+            self.repo_root = repo_root.absolute()
+        except OSError:
+            raise TransactionLockError(
+                "repository lifecycle state is unavailable", kind="unavailable"
+            ) from None
         self.timeout = timeout
+        self.create = create
+        self.expected_repository_identity = expected_repository_identity
         self.state: StateRoot | None = None
         self.lock: ExclusiveDescriptorLock | None = None
-        self.token: contextvars.Token[tuple[Path, ...]] | None = None
+        self.lease: _LifecycleLease | None = None
+        self.token: contextvars.Token[tuple[_LifecycleLease, ...]] | None = None
     def __enter__(self) -> "RepositoryLifecycleLock":
         try:
-            self.state = open_state_root(self.repo_root, create=True)
-            assert self.state is not None
+            self.state = open_state_root(
+                self.repo_root,
+                create=self.create,
+                expected_repository_identity=self.expected_repository_identity,
+            )
+            if self.state is None:
+                raise TransactionLockError("repository lifecycle state is unavailable")
             self.lock = ExclusiveDescriptorLock(
-                self.state.descriptor, "refresh.lock", self.timeout
+                self.state.descriptor, "refresh.lock", self.timeout,
+                create=self.create,
             )
             self.lock.__enter__()
-            self.token = _LIFECYCLE_ROOTS.set((*_LIFECYCLE_ROOTS.get(), self.repo_root))
+            self.lease = _new_lifecycle_lease(
+                self.repo_root, self.state.repository_identity, threading.get_ident(),
+                self.state.repository_descriptor, self.state.descriptor,
+            )
+            self.token = _LIFECYCLE_LEASES.set((*_LIFECYCLE_LEASES.get(), self.lease))
             return self
-        except BaseException:
+        except BaseException as error:
             if self.lock is not None:
-                self.lock.__exit__(None, None, None)
+                self.lock.__exit__(type(error), error, error.__traceback__)
             if self.state is not None:
-                self.state.__exit__(None, None, None)
+                self.state.__exit__(type(error), error, error.__traceback__)
             self.lock = None
             self.state = None
             raise
     def __exit__(self, *args: object) -> None:
-        if self.token is not None:
-            _LIFECYCLE_ROOTS.reset(self.token)
-        if self.lock is not None:
-            self.lock.__exit__(*args)
-        if self.state is not None:
-            self.state.__exit__(*args)
+        if self.lease is not None:
+            self.lease.active = False
+        try:
+            try:
+                if self.token is not None:
+                    _LIFECYCLE_LEASES.reset(self.token)
+            finally:
+                if self.lock is not None:
+                    self.lock.__exit__(*args)
+        finally:
+            if self.state is not None:
+                self.state.__exit__(*args)
 
 def repository_lifecycle_lock(
-    repo_root: Path, timeout: float = 5.0
+    repo_root: Path,
+    timeout: float = 5.0,
+    *,
+    create: bool = True,
+    expected_repository_identity: RepositoryIdentity | None = None,
 ) -> RepositoryLifecycleLock:
-    return RepositoryLifecycleLock(repo_root, timeout)
+    return RepositoryLifecycleLock(
+        repo_root,
+        timeout,
+        create=create,
+        expected_repository_identity=expected_repository_identity,
+    )
 
 def assert_lifecycle_lock_held(repo_root: Path) -> None:
-    if repo_root.absolute() not in _LIFECYCLE_ROOTS.get():
-        raise TransactionLockError("repository lifecycle lock is required")
+    if not _has_live_matching_lease(repo_root, _LIFECYCLE_LEASES.get()):
+        raise TransactionLockError(
+            "repository lifecycle lock is required", kind="authority"
+        )
 ```
 
-`ExclusiveDescriptorLock` is the only lock used for lifecycle and global-registry state. It duplicates the caller's verified directory descriptor, opens `name` with `dir_fd`, `O_RDWR | O_CREAT | O_NOFOLLOW`, requires a regular file owned by `os.geteuid()` with mode `0600`, verifies the opened inode against a no-follow `os.stat`, then applies the existing non-blocking `fcntl.flock` timeout loop. It closes both the file and duplicated parent descriptor on every failed `__enter__` path. Add a race test that renames `.project-knowledge` and replaces it with a symlink immediately after `open_state_root`; the lock must land in the descriptor-bound original directory and nothing may be created through the symlink.
+The snippet is illustrative; the implemented authority is a private mutable
+`_LifecycleLease` containing the lexical requested root, verified repository
+`(device, inode)`, owner thread ID, and `active` flag. The lexical key is used
+only to find an already-authorized live lease in the same thread/context; it is
+never filesystem authority. `RepositoryLifecycleLock.__enter__` holds a
+no-follow repository descriptor for its entire lifetime, derives the state
+descriptor from it, and publishes the lease only after `flock` succeeds.
+`__exit__` revokes `active` before releasing the flock or resetting the
+context. `assert_lifecycle_lock_held()` checks the matching active lexical lease
+and owner thread without reopening the requested path; a copied context after
+exit or in another thread cannot authorize promotion. The entered lock exposes
+verified repository/state descriptors only through the private
+`capture_lifecycle_descriptors()`/`capture_lifecycle_repository()` context
+managers, which duplicate and close them around each transaction helper; never
+a pathname that helpers later reopen. An optional expected identity is compared
+to `fstat()` of the same root descriptor before `.project-knowledge` lookup or
+creation, so a fleet/path replacement is `kind="authority"` without side
+effects.
 
-Update `promote_graph` so it calls `assert_lifecycle_lock_held(root)` immediately before entering `promotion.lock`. Update all direct artifact tests to acquire `repository_lifecycle_lock(repo)` around the production call; add one explicit regression asserting an unlocked promotion fails. This makes the required order executable rather than documentary.
+Every expected `OSError` at repository/state/lock descriptor open, stat,
+mkdir, chmod, fsync, and post-open identity-race boundaries is normalized to a
+constant-message `TransactionLockError(kind="unavailable")` without chaining.
+No raw OS exception, filename, or caller path crosses the locking API. Busy
+flock timeouts alone use `kind="busy"`; missing live authority uses
+`kind="authority"`.
+
+With `create=False`, neither `.project-knowledge` nor `refresh.lock` is
+created: absent state/lock fails with a stable `TransactionLockError`. Existing
+state is still subject to exact owner/type/mode/inode checks. This mode is for
+read-only query capture; mutation callers always use the default `create=True`.
+
+`ExclusiveDescriptorLock` is the only lock used for lifecycle and global-registry state. Before duplicating/opening anything, it admits only one canonical nonempty basename (not `.`/`..`, no slash, backslash, NUL/control), so `dir_fd` cannot be escaped. It duplicates the caller's verified directory descriptor and opens `name` with `dir_fd`, `O_RDWR | O_NOFOLLOW`, adding `O_CREAT` only when `create=True`; `create=False` turns absence into `TransactionLockError(kind="unavailable")` and never creates or chmods anything. It requires a regular file owned by `os.geteuid()` with mode `0600`, verifies the opened inode against a no-follow `os.stat`, then applies the existing non-blocking `fcntl.flock` timeout loop; timeout is `kind="busy"`. It closes both the file and duplicated parent descriptor on every failed `__enter__` path. Add a race test that renames `.project-knowledge` and replaces it with a symlink immediately after `open_state_root`; the lock must land in the descriptor-bound original directory and nothing may be created through the symlink.
+
+`RepositoryAccess` is the common repository-read authority used by later tasks.
+Every journal, manifest, ignore/policy, projection, secret-scan, staging, live
+graph/ownership, doctor/health, query-snapshot, pack/install, and registry input
+helper has one descriptor-rooted internal form that accepts this object and
+opens all relative components with `dir_fd` plus `O_NOFOLLOW`. A public
+path-taking wrapper may open exactly one `RepositoryAccess` and then delegate.
+Once a lifecycle lease is held, callers must instead obtain
+`capture_lifecycle_repository()` and call only those descriptor-rooted forms;
+calling a path-taking wrapper from inside the transaction is a contract failure.
+For APIs that accept a caller-supplied `ProjectManifest`,
+`require_current_manifest()` must re-read through that access and require the
+same parsed semantic contract. Comments/key order may differ, but any field
+change aborts before a subprocess, network request, registry capture, or
+promotion. This closes the manifest-file race between CLI/fleet admission and
+the consuming boundary.
+Its descriptor capture stores the still-open manifest fd plus `(st_dev, st_ino,
+size, mtime_ns, ctime_ns)` and a two-pass SHA-256 on the operation's
+`RepositoryAccess`. A successful rebind closes the prior retained fd; every
+failed candidate capture closes only its candidate and preserves the prior
+binding. `RepositoryAccess.__exit__` closes the active manifest fd before the
+root fd, reports a constant cleanup failure only when no exception is already
+propagating, and never leaks descriptors.
+`assert_current_manifest_unchanged()` fstats and double-digests that same open
+file, then descriptor-opens the current `.graphify-project.yaml` entry with
+`O_NOFOLLOW` and requires the same identity/binding and semantic payload. It
+therefore detects replacement, same-inode rewrite, and rewrite-then-restore via
+metadata drift. A different manifest cannot transiently authorize an operation
+and then be hidden by restoring equal YAML. Binding failure is stable
+`manifest_changed`; an expected/fleet consumer propagates it for
+`fleet_manifest_changed` mapping.
+Repository-relative temporary/state writes use the paired state/repository
+descriptor, while Graphify staging/output lives in a separately descriptor-
+validated mode-0700 run root and therefore never needs the mutable repository
+pathname. Add an instrumentation test that makes every repository-path open
+raise immediately after lease acquisition: refresh, install, pack capture,
+query snapshot, and registry sync must still complete against the original
+opened inode or fail closed before any child/network call; no operation may
+validate replacement bytes and promote to the original descriptor.
+
+Update `promote_graph` so it obtains duplicated descriptors from the matching
+live lease and enters `promotion.lock` with `ExclusiveDescriptorLock` relative
+to the verified state descriptor. Every staging/rollback/journal/target
+create/read/rename/fsync operation is relative to those lock-held descriptors.
+Production mutation code never reopens or resolves a caller pathname after
+authority capture; pathname identity checks are diagnostic only and cannot
+authorize a write. Update all direct artifact tests to acquire
+`repository_lifecycle_lock(repo)` around the production call; add explicit
+regressions for unlocked promotion, root rename/symlink replacement, state
+rename, and copied-context authority. This makes lock order and repository
+ownership executable rather than documentary.
 
 - [ ] **Step 4: Run lock and promotion tests**
 
-Run: `uv run pytest -q tests/test_locking.py tests/test_lifecycle_locking.py tests/test_artifacts.py`
+Run: `uv run pytest -q tests/test_locking.py tests/test_lifecycle_locking.py tests/test_artifacts.py tests/test_manifest_v2.py`
 
 Expected: all selected tests pass, including existing transaction recovery tests under the outer lifecycle lock.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/project_knowledge/locking.py src/project_knowledge/artifacts.py tests/test_locking.py tests/test_lifecycle_locking.py tests/test_artifacts.py
+git add src/project_knowledge/locking.py src/project_knowledge/artifacts.py src/project_knowledge/manifest.py tests/test_locking.py tests/test_lifecycle_locking.py tests/test_artifacts.py tests/test_manifest_v2.py
 git commit -m "feat: enforce repository lifecycle lock order"
 ```
 
@@ -720,12 +1370,12 @@ git commit -m "feat: enforce repository lifecycle lock order"
 - Test: `tests/test_lifecycle_locking.py`
 
 **Interfaces:**
-- Produces: `InitPreview(status, manifest_payload, ignore_payload, candidate_roots, project_uid)`.
+- Produces: `InitPreview(status, manifest_payload, ignore_payload, candidate_roots, project_uid, project_id, requested_include_roots, repository_identity)`; intent/identity fields are library-only and are not serialized as private paths.
 - Produces: `preview_init(repo_root, project_id, *, project_uid=None, include_roots=()) -> InitPreview`.
 - Produces: `apply_init(repo_root, preview, *, uuid_factory=uuid4) -> Literal["initialized", "already_configured", "init_conflict", "init_recovery_required"]`.
 - Produces: `preview_manifest_migration(repo_root, *, project_uid=None) -> InitPreview`.
 - Produces: `apply_manifest_migration(repo_root, preview, *, uuid_factory=uuid4) -> Literal["migrated", "already_current", "init_conflict", "init_recovery_required"]`.
-- Produces: `inspect_init_journal(repo_root) -> Literal["none", "recoverable", "corrupt"]` without writing.
+- Produces: `inspect_init_journal(repo_root, *, repository_access: RepositoryAccess | None = None, expected_repository_identity: RepositoryIdentity | None = None) -> Literal["none", "recoverable", "corrupt"]` without writing. The two authority keywords are mutually exclusive; an existing access is never replaced by a pathname open.
 
 - [ ] **Step 1: Write failing deterministic-preview, no-clobber, rollback, and recovery tests**
 
@@ -800,6 +1450,17 @@ def test_v1_migration_changes_only_manifest(tmp_path: Path) -> None:
     assert graph.read_text(encoding="utf-8") == "caller bytes\n"
 ```
 
+Add forged/stale/cross-repository preview tests for both init and migration,
+including source-root changes after preview, a preview copied to a different
+repository, a directly constructed `InitPreview`, repository rename followed
+by a symlink replacement at the old path, and mutation of the v1 manifest
+between preview and lock acquisition. Apply must either rederive an exact
+in-lock match or fail without creating/replacing either configuration file.
+For both root-replacement cases, snapshot the complete replacement tree and
+assert byte-for-byte equality afterward, including absence of
+`.project-knowledge`; lifecycle acquisition must reject identity before it can
+create state or a lock.
+
 - [ ] **Step 2: Run the tests and verify the configuration APIs are absent**
 
 Run: `uv run pytest -q tests/test_manifest_v2.py`
@@ -818,6 +1479,9 @@ class InitPreview:
     ignore_payload: bytes
     candidate_roots: tuple[PurePosixPath, ...]
     project_uid: UUID | None
+    project_id: str
+    requested_include_roots: tuple[PurePosixPath, ...]
+    repository_identity: tuple[int, int]
 
 _DISCOVERABLE_ROOTS = (
     "app", "cmd", "docs", "lib", "packages", "scripts", "services", "src", "tests"
@@ -827,43 +1491,60 @@ _INIT_JOURNAL = "init-transaction.json"
 _INIT_SCHEMA = 1
 ```
 
-`preview_init` must lstat the repository, reject existing configuration as `already_configured`, sort real non-symlink discovery roots, require explicit confined roots when discovery finds more than one, and render `<generated-on-apply>` only in preview. `apply_init` must acquire `repository_lifecycle_lock`, recover a valid prior journal first, allocate UUIDv4 exactly once, replace the placeholder in-memory, and execute this fixed state machine:
+`preview_init` must descriptor-open/lstat the repository, capture its
+`(device,inode)` identity, reject existing configuration as
+`already_configured`, sort real non-symlink discovery roots, require explicit
+confined roots when discovery finds more than one, and render
+`<generated-on-apply>` only in preview. `apply_init` and
+`apply_manifest_migration` acquire
+`repository_lifecycle_lock(repo_root,
+expected_repository_identity=preview.repository_identity)`, so the identity is
+checked on the opened root before lifecycle-state creation. They use that
+verified repository descriptor, recover
+a valid prior journal first, then rederives the complete canonical preview
+under that same lock from only the preview's explicit user intent. Status,
+repository identity, candidate roots, manifest/ignore bytes, and requested UUID
+must match exactly. Only then may it allocate UUIDv4 exactly once, replace the
+placeholder in-memory, and execute this fixed state machine:
 
 ```python
 def _apply_configuration_pair(
-    repo_root: Path,
+    descriptors: LifecycleDescriptors,
     *,
     manifest_payload: bytes,
     ignore_payload: bytes,
 ) -> None:
-    state = open_state_root(repo_root, create=True)
-    assert state is not None
-    with state:
-        transaction_id = secrets.token_hex(16)
-        manifest_temp = f"init-{transaction_id}.manifest"
-        ignore_temp = f"init-{transaction_id}.ignore"
-        _write_new_at(state.descriptor, manifest_temp, manifest_payload, 0o644)
-        _write_new_at(state.descriptor, ignore_temp, ignore_payload, 0o644)
-        journal = {
-            "schema_version": 1,
-            "phase": "prepared",
-            "files": [
-                {"destination": ".graphify-project.yaml", "temporary": manifest_temp,
-                 "sha256": hashlib.sha256(manifest_payload).hexdigest()},
-                {"destination": ".graphifyignore", "temporary": ignore_temp,
-                 "sha256": hashlib.sha256(ignore_payload).hexdigest()},
-            ],
-        }
-        _write_new_at(state.descriptor, _INIT_JOURNAL, _canonical_json(journal), 0o600)
-        _install_without_replacement(repo_root, state, journal)
-        _mark_journal_committed(state, journal)
-        _remove_transaction_temporaries(state, journal)
-        _unlink_regular_at(state.descriptor, _INIT_JOURNAL)
+    state_fd = descriptors.state_descriptor
+    transaction_id = secrets.token_hex(16)
+    manifest_temp = f"init-{transaction_id}.manifest"
+    ignore_temp = f"init-{transaction_id}.ignore"
+    _write_new_at(state_fd, manifest_temp, manifest_payload, 0o644)
+    _write_new_at(state_fd, ignore_temp, ignore_payload, 0o644)
+    journal = {
+        "schema_version": 1,
+        "phase": "prepared",
+        "files": [
+            {"destination": ".graphify-project.yaml", "temporary": manifest_temp,
+             "sha256": hashlib.sha256(manifest_payload).hexdigest()},
+            {"destination": ".graphifyignore", "temporary": ignore_temp,
+             "sha256": hashlib.sha256(ignore_payload).hexdigest()},
+        ],
+    }
+    _write_new_at(state_fd, _INIT_JOURNAL, _canonical_json(journal), 0o600)
+    _install_without_replacement(descriptors.repository_descriptor, state_fd, journal)
+    _mark_journal_committed(state_fd, journal)
+    _remove_transaction_temporaries(state_fd, journal)
+    _unlink_regular_at(state_fd, _INIT_JOURNAL)
 ```
 
-Migration calls a distinct `_replace_v1_manifest(repo_root, expected_old_sha256, new_payload)` transaction whose strict journal contains exactly `destination`, `old_inode`, `old_sha256`, `backup`, `new_temporary`, `new_sha256`, and `phase`. There is no ignore-file field in that journal. The function aborts if the current manifest is not the captured v1 inode/digest, and recovery restores or completes only those exact recorded manifest names and hashes.
+`apply_init` invokes `_apply_configuration_pair` only inside
+`with capture_lifecycle_descriptors(repo_root) as descriptors:`. Migration
+invokes its distinct one-file helper inside the same private descriptor context;
+that context owns and closes both duplicates for either path.
 
-`_install_without_replacement` uses `os.link(..., follow_symlinks=False)` from each mode-0644 sibling temporary to an absent destination, verifies the destination inode and SHA-256, fsyncs the repository, then unlinks the temporary. Init alone uses the two-file transaction. Migration uses a separate one-file journal: it descriptor-captures and digest-binds only the existing v1 manifest, writes the new manifest to a unique sibling, renames the exact old inode to a journal-bound backup, renames the new sibling into place, and restores the backup on failure. It never creates, replaces, chmods, or removes `.graphifyignore`; an existing ignore file's bytes and inode remain caller-owned. Recovery may remove/restore only an inode and digest recorded by a valid strict journal; a missing/corrupt journal returns `init_recovery_required` and never authorizes deletion. Successful recovery fsyncs each affected directory.
+Migration calls a distinct `_replace_v1_manifest(descriptors, expected_old_sha256, new_payload)` transaction whose strict journal contains exactly `destination`, `old_inode`, `old_sha256`, `backup`, `new_temporary`, `new_sha256`, and `phase`. There is no ignore-file field in that journal. The function aborts if the current descriptor-relative manifest is not the captured v1 inode/digest, and recovery restores or completes only those exact recorded manifest names and hashes.
+
+`_install_without_replacement` uses `os.link(..., follow_symlinks=False)` from each mode-0644 sibling temporary to an absent destination through the lock-held repository descriptor, verifies the destination inode and SHA-256 descriptor-relatively, fsyncs that descriptor, then unlinks the temporary. It never reopens `repo_root` after lock acquisition. Init alone uses the two-file transaction. Migration uses a separate one-file journal: under the same descriptor-bound identity it rederives and compares the preview, descriptor-captures and digest-binds only the existing v1 manifest, writes the new manifest to a unique sibling, renames the exact old inode to a journal-bound backup, renames the new sibling into place, and restores the backup on failure. It never creates, replaces, chmods, or removes `.graphifyignore`; an existing ignore file's bytes and inode remain caller-owned. Recovery may remove/restore only an inode and digest recorded by a valid strict journal; a missing/corrupt journal returns `init_recovery_required` and never authorizes deletion. Successful recovery fsyncs each affected descriptor.
 
 - [ ] **Step 4: Run configuration and locking tests**
 
@@ -888,19 +1569,27 @@ git commit -m "feat: add recoverable project initialization"
 - Modify: `src/project_knowledge/receipt.py`
 - Modify: `src/project_knowledge/secrets_scan.py`
 - Modify: `src/project_knowledge/health.py`
+- Modify: `src/project_knowledge/evidence.py`
+- Modify: `src/project_knowledge/adapters/graphify_0_9_48.py`
 - Modify: `tests/test_privacy.py`
 - Modify: `tests/test_staging.py`
 - Modify: `tests/test_receipt.py`
 - Modify: `tests/test_secrets_scan.py`
+- Modify: `tests/test_evidence.py`
+- Modify: `tests/test_graphify_0_9_48_adapter.py`
 
 **Interfaces:**
 - Consumes: `resolve_graphify_compatibility(manifest.graphify_version).sensitive_source_suffixes`.
+- Consumes: Task 2 `RepositoryAccess`; every repository-consuming privacy,
+  ignore, scanner, projection, staging, and receipt helper has a descriptor-
+  rooted form, while path-only compatibility wrappers open exactly one access.
 - Produces: `PrivacyDecision(path, action: Literal["deny", "scan", "allow"], rule_id)`.
 - Produces: `ProjectionFile(path, sha256, byte_length)` and private `ProjectionSnapshot`.
 - Extends: `StagedInput(root, source_digest, files, projection_digest=None, reason_counts=(), coverage_approvals=())` without breaking positional v1 callers.
-- Produces: `inspect_projection(repo_root, manifest) -> ProjectionSnapshot`.
+- Produces: `inspect_projection(repo_root, manifest, *, repository_access: RepositoryAccess | None = None) -> ProjectionSnapshot` and the matching optional authority on `stage_input`/`stage_input_with_receipt`; when supplied, `repo_root` is never reopened and is not authority.
 - Produces: `redact_literals(value: str) -> str`.
 - Extends: receipt schema 2 with `projection_digest`, aggregate `reason_counts`, and exact v2 digest verification while continuing to load schema 1.
+- Updates: adapter/evidence staged-path admission to the same structured v2 classifier; safe sensitive-name source may pass only as `scan`, while every `deny` decision remains non-bypassable.
 
 - [ ] **Step 1: Write failing policy-precedence and projection-binding tests**
 
@@ -912,6 +1601,7 @@ import json
 import pytest
 
 from project_knowledge.privacy import classify_path
+from project_knowledge.locking import open_repository_access
 from project_knowledge.receipt import load_staging_receipt
 from project_knowledge.staging import inspect_projection, stage_input_with_receipt
 from tests.support import manifest_v2
@@ -976,6 +1666,19 @@ def test_root_workspace_rule_is_not_broadened_to_nested_component() -> None:
     )
     assert decision.action == "allow"
 
+@pytest.mark.parametrize("pattern", [
+    "!src/private.py", "/absolute/**", "../escape/**", "src\\private/**",
+    "src//private/**", "src/./private/**", "C:/private/**", "src/bad\nname/**",
+])
+def test_v2_project_excludes_reject_noncanonical_patterns_fail_closed(
+    pattern: str,
+) -> None:
+    with pytest.raises(PrivacyError, match="negated"):
+        classify_path(
+            PurePosixPath("src/app.py"), project_excludes=(pattern,),
+            sensitive_source_suffixes=resolve_graphify_compatibility("0.9.48").sensitive_source_suffixes,
+        )
+
 def test_projection_digest_binds_ignore_policy_without_hashing_denied_payload(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     (repo / "src").mkdir(parents=True)
@@ -1002,6 +1705,29 @@ def test_receipt_v2_is_projection_bound_and_publicly_path_safe(tmp_path: Path) -
     assert document["schema_version"] == 2
     assert receipt.projection_digest == staged.projection_digest
     assert "database-creds" not in receipt_path.read_text(encoding="utf-8")
+
+def test_projection_and_staging_remain_bound_to_open_repository_after_root_swap(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "src/app.py").write_text("ORIGINAL = True\n", encoding="utf-8")
+    with open_repository_access(repo) as repository:
+        expected = inspect_projection(
+            repo, manifest_v2(), repository_access=repository
+        )
+        original = tmp_path / "original"
+        repo.rename(original)
+        (repo / "src").mkdir(parents=True)
+        (repo / "src/app.py").write_text(
+            "TOKEN = 'replacement-secret'\n", encoding="utf-8"
+        )
+        staged = stage_input_with_receipt(
+            repo, manifest_v2(), tmp_path / "stage", tmp_path / "receipt.json",
+            repository_access=repository,
+        )
+    assert staged.source_digest == expected.source_digest
+    assert (staged.root / "src/app.py").read_text(encoding="utf-8") == "ORIGINAL = True\n"
 ```
 
 - [ ] **Step 2: Run the tests and verify structured policy is missing**
@@ -1060,7 +1786,9 @@ GLOBAL_DENY_RULES: tuple[tuple[str, str], ...] = (
     ("runtime_state", "**/runtime/**"),
     ("draft_content", "**/drafts/**"),
     ("snapshot_state", "**/snapshots/**"),
+    ("cookie_store", "**/cookie/**"),
     ("cookie_store", "**/cookies/**"),
+    ("session_store", "**/session/**"),
     ("session_store", "**/sessions/**"),
     ("virtual_environment", "**/.venv/**"),
     ("dependency_tree", "**/node_modules/**"),
@@ -1085,17 +1813,27 @@ def classify_path(
     project_excludes: Sequence[str],
     sensitive_source_suffixes: frozenset[str],
 ) -> PrivacyDecision:
+    try:
+        exact_excludes = validate_project_excludes(tuple(project_excludes))
+    except ManifestError:
+        raise PrivacyError("negated or invalid project exclude is forbidden") from None
     if not path.parts or path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
         return PrivacyDecision(path, "deny", "path_escape")
     folded = tuple(part.casefold() for part in path.parts)
     name = folded[-1]
     suffix = PurePosixPath(name).suffix.casefold()
+    if any(
+        fragment in component
+        for component in folded[:-1]
+        for fragment in _SENSITIVE_FRAGMENTS
+    ):
+        return PrivacyDecision(path, "deny", "sensitive_directory")
     for rule_id, pattern in GLOBAL_DENY_RULES:
         if _matches(folded, tuple(part.casefold() for part in pattern.split("/"))):
             return PrivacyDecision(path, "deny", rule_id)
     if any(
         _matches(folded, tuple(part.casefold() for part in pattern.split("/")))
-        for pattern in project_excludes
+        for pattern in exact_excludes
     ):
         return PrivacyDecision(path, "deny", "project_exclude")
     if any(fragment in name for fragment in _SENSITIVE_FRAGMENTS):
@@ -1104,6 +1842,24 @@ def classify_path(
         return PrivacyDecision(path, "deny", "sensitive_data_name")
     return PrivacyDecision(path, "allow", "ordinary_source")
 ```
+
+Keep `GLOBAL_DENY_PATTERNS` and `is_denied()` unchanged as the schema-v1
+compatibility boundary. Schema-v2 callers must not reuse that legacy lexical
+leaf list because it intentionally denies source names such as
+`credentials.py`. Instead, `Graphify0948Adapter._require_staged_files()` and
+the evidence builder's staged-file validator call `classify_path()` with the
+registry entry's immutable `sensitive_source_suffixes` and reject only
+`action == "deny"`. They accept `scan` only as an assertion that upstream
+staging already scanned the exact bytes; neither boundary performs a second
+path-only downgrade. Add regressions proving `src/credentials.py` survives the
+complete adapter/evidence path while `src/credentials/app.py`,
+`src/database-creds.json`, and every legacy private/runtime/data rule fail
+closed.
+
+Manifest v2 loading/rendering and `classify_path()` both call the same closed
+project-exclude validator. Empty, non-string, non-canonical, and `!`-prefixed
+patterns are rejected; v2 never interprets negation and never silently turns a
+negated exclude into a no-op.
 
 `RepositoryIgnores` must retain canonical SHA-256 values for every regular ignore file it reads, sorted by confined relative path, and expose `digests() -> tuple[str, ...]`. Digest entries are domain-separated hashes of `{relative ignore-file path, bytes}`; only the digest values enter a public projection.
 
@@ -1159,7 +1915,7 @@ def _projection_digest(
     return hashlib.sha256(PROJECTION_DIGEST_DOMAIN + _canonical_json(payload)).hexdigest()
 ```
 
-`inspect_projection` and `stage_input` must share one descriptor-based walker. For every manifest-scope filesystem entry, record a private reason-coded decision. A symlink becomes `deny:symlink`, a non-regular file becomes `deny:non_regular`, and a regular payload containing NUL or failing strict UTF-8 text classification becomes `deny:binary_payload`; these are counted decisions, not silent skips. Do not read payload bytes for path-classified `deny`; for `scan` and `allow`, scan the exact descriptor-read payload and require all unaccepted findings absent before building `ProjectionFile`. Scanner findings still fail the entire projection closed. The coverage and secret-exception controls are never corpus files. Bind the strict control-file SHA-256 values (or `None`) for both `.atlasweaver-coverage.yaml` and `.graphify-secret-exceptions.yaml` into `projection_digest`. For schema 1, preserve receipt schema 1 and the legacy source-digest algorithm; for schema 2, require non-`None` `projection_digest` and write receipt schema 2:
+`inspect_projection` and `stage_input` must share one descriptor-based walker. The path wrapper opens one `RepositoryAccess`; when an access is supplied by a caller holding a lifecycle lease, all manifest roots, ignore/control files, scanning, and source payloads are opened relative to that descriptor and the repository pathname is never reopened. For every manifest-scope filesystem entry, record a private reason-coded decision. A symlink becomes `deny:symlink`, a non-regular file becomes `deny:non_regular`, and a regular payload containing NUL or failing strict UTF-8 text classification becomes `deny:binary_payload`; these are counted decisions, not silent skips. Do not read payload bytes for path-classified `deny`; for `scan` and `allow`, scan the exact descriptor-read payload and require all unaccepted findings absent before building `ProjectionFile`. Scanner findings still fail the entire projection closed. The coverage and secret-exception controls are never corpus files. Bind the strict control-file SHA-256 values (or `None`) for both `.atlasweaver-coverage.yaml` and `.graphify-secret-exceptions.yaml` into `projection_digest`. For schema 1, preserve receipt schema 1 and the legacy source-digest algorithm; for schema 2, require non-`None` `projection_digest` and write receipt schema 2:
 
 ```json
 {
@@ -1178,14 +1934,14 @@ Update `scan_repository` to iterate `allow` and `scan` projection candidates, no
 
 - [ ] **Step 5: Run privacy, scanner, staging, receipt, and health regressions**
 
-Run: `uv run pytest -q tests/test_privacy.py tests/test_privacy_v2.py tests/test_secrets_scan.py tests/test_staging.py tests/test_receipt.py tests/test_health.py`
+Run: `uv run pytest -q tests/test_privacy.py tests/test_privacy_v2.py tests/test_secrets_scan.py tests/test_staging.py tests/test_receipt.py tests/test_health.py tests/test_evidence.py tests/test_graphify_0_9_48_adapter.py`
 
 Expected: all selected tests pass. Schema-v1 receipt golden JSON stays unchanged; schema-v2 projection output contains counts/digests but no denied filename or detector fingerprint.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/project_knowledge/models.py src/project_knowledge/privacy.py src/project_knowledge/staging.py src/project_knowledge/receipt.py src/project_knowledge/secrets_scan.py src/project_knowledge/health.py tests/test_privacy.py tests/test_privacy_v2.py tests/test_staging.py tests/test_receipt.py tests/test_secrets_scan.py
+git add src/project_knowledge/models.py src/project_knowledge/privacy.py src/project_knowledge/staging.py src/project_knowledge/receipt.py src/project_knowledge/secrets_scan.py src/project_knowledge/health.py src/project_knowledge/evidence.py src/project_knowledge/adapters/graphify_0_9_48.py tests/test_privacy.py tests/test_privacy_v2.py tests/test_staging.py tests/test_receipt.py tests/test_secrets_scan.py tests/test_evidence.py tests/test_graphify_0_9_48_adapter.py
 git commit -m "feat: bind staging to privacy projection v2"
 ```
 
@@ -1199,8 +1955,8 @@ git commit -m "feat: bind staging to privacy projection v2"
 
 **Interfaces:**
 - Produces: `CoverageApproval(path, content_sha256, adapter_id, reason_code, rationale)`.
-- Produces: `load_coverage_approvals(repo_root, projection, contract) -> tuple[CoverageApproval, ...]`.
-- Produces: `preview_coverage_approval(repo_root, manifest, path, reason_code, rationale) -> CoveragePreview`.
+- Produces: `load_coverage_approvals(repo_root, projection, contract, *, repository_access: RepositoryAccess | None = None) -> tuple[CoverageApproval, ...]`; supplied access is used for every control-file read.
+- Produces: `preview_coverage_approval(repo_root, manifest, path, reason_code, rationale, *, repository_access: RepositoryAccess | None = None, expected_repository_identity: RepositoryIdentity | None = None) -> CoveragePreview`; authority keywords are mutually exclusive, and the path wrapper checks the expected identity before reading any source/control byte.
 - Produces: `apply_coverage_approval(repo_root, preview) -> Literal["approved", "unchanged", "coverage_conflict", "coverage_recovery_required"]`.
 - Extends: `ProjectionSnapshot.coverage_approvals` and `StagedInput.coverage_approvals`; compatibility/impact Tasks 5–8 consume this tracked authority when they implement candidate validation.
 
@@ -1286,6 +2042,17 @@ def test_content_change_invalidates_approval(tmp_path: Path) -> None:
         inspect_projection(repo, manifest_v2())
 ```
 
+Add forged/stale/cross-repository `CoveragePreview` tests: direct construction,
+copy to another repository with identical bytes, safe-file mutation, manifest
+UID/adapter change, control-file inode replacement, and repository path
+rename/symlink swap. Apply must rederive under the lifecycle lock and either
+match exactly or leave the control and repository untouched.
+Add a CLI-admission root-swap regression: retain the admission
+`RepositoryAccess`, replace the pathname with a repository containing distinct
+safe bytes, then call preview through the retained access. It must read only the
+original descriptor or fail authority, and `--apply` must leave the complete
+replacement tree byte-identical with no `.project-knowledge`.
+
 - [ ] **Step 2: Run the tests and verify the coverage module is absent**
 
 Run: `uv run pytest -q tests/test_coverage.py tests/test_staging.py`
@@ -1316,7 +2083,13 @@ _ENTRY_FIELDS = frozenset({
 class CoveragePreview:
     payload: bytes
     previous_sha256: str | None
+    previous_identity: tuple[int, int] | None
     approval: CoverageApproval
+    repository_identity: tuple[int, int]
+    project_uid: UUID
+    requested_path: PurePosixPath
+    requested_reason_code: str
+    requested_rationale: str
 
 def _validate_approval(
     entry: Mapping[str, object],
@@ -1344,7 +2117,7 @@ def _validate_approval(
 
 Use the manifest module's strict loader rules: one document, no aliases/merges/duplicates/non-string keys. Order approvals by path, reject duplicate paths, cap the control at 262,144 bytes, scan its payload with `scan_payload`, and include its full SHA-256 (or `None`) in `projection_digest`. The control file is explicitly excluded from staged `files`.
 
-`preview_coverage_approval` requires a current safe regular file, the selected compatibility entry's adapter ID/reason code, and non-empty rationale; it outputs the complete canonical replacement and the prior control digest without writing. `apply_coverage_approval` takes `repository_lifecycle_lock`, rereads and digest-compares the prior file, and uses a mode-0600 journal plus descriptor-bound backup/new sibling rename. It must never overwrite a changed inode and must recover only its own recorded inode/digest.
+`preview_coverage_approval` requires a current safe regular file, the selected compatibility entry's adapter ID/reason code, non-empty rationale, and manifest-v2 UID; it uses the caller-supplied repository access when present (never reopening the pathname), captures that access identity, and outputs the complete canonical replacement plus the prior control digest and `(st_dev, st_ino)` identity, or two `None` values when the control is absent, without writing. `apply_coverage_approval` takes `repository_lifecycle_lock(repo_root, expected_repository_identity=preview.repository_identity)`, so a replacement is rejected before state creation, then rederives the preview under that verified repository descriptor from only the captured explicit request and requires exact repository/manifest/approval/payload/prior-file digest/prior-file identity equality. It descriptor-rereads and compares both the digest and identity of the prior file (or proves it is still absent) and uses a mode-0600 journal plus descriptor-bound backup/new sibling rename through the lock-held repository descriptor. It must never overwrite a changed inode, follow a replacement path, or recover anything except its own recorded inode/digest.
 
 - [ ] **Step 4: Bind approvals into staging for the evidence/validator phase**
 
@@ -1390,15 +2163,20 @@ git commit -m "feat: add tracked extraction coverage approvals"
 
 **Files:**
 - Modify: `src/project_knowledge/graphify.py`
+- Modify: `src/project_knowledge/compatibility.py`
+- Modify: `src/project_knowledge/evidence.py`
 - Modify: `tests/test_graphify_adapter.py`
+- Modify: `tests/test_compatibility.py`
+- Modify: `tests/test_evidence.py`
 - Create: `tests/test_lifecycle.py`
 
 **Interfaces:**
-- Extends without weakening: prerequisite `run_checked(runner, executable, argv, *, env=None, timeout=30.0) -> CompletedProcess[str]`.
-- Produces: `run_graphify_operation(runner, executable, argv, *, env, timeout, operation) -> CompletedProcess[str]`.
+- Extends without weakening: prerequisite `run_checked(runner, executable, argv, *, env=None, timeout=30.0, before_exec=_noop) -> CompletedProcess[str]`.
+- Produces: `run_graphify_operation(runner, executable, argv, *, env, timeout, operation, before_exec=_noop) -> CompletedProcess[str]`.
 - Consumes unchanged: prerequisite `ResolvedGraphifyExecutable`, `resolve_graphify_executable(test_override=None)`, and `revalidate_graphify_executable()`; the override is a library-test seam and never a high-level CLI flag.
-- Consumes unchanged: prerequisite `probe_graphify(executable, contract, runner) -> GraphifyCapabilities`, including its official private operational smoke pipeline and nested `capability_probe`.
+- Consumes unchanged except for the private binding hook: prerequisite `probe_graphify(executable, contract, runner, *, before_exec=_noop) -> GraphifyCapabilities`, including its official private operational smoke pipeline and nested `capability_probe`; it invokes the hook before every smoke child.
 - Consumes: compatibility `render_graphify_argv`, `admitted_graphify_environment`, and `assert_capability_surface`.
+- Produces: `validate_public_model_identifier(model: object) -> str` as the one pre-argv/evidence model boundary.
 - Preserves: process-group termination, bounded stdout/stderr, literal/path redaction, and argument-vector-only execution.
 
 - [ ] **Step 1: Write failing exact argv/environment/timeout tests**
@@ -1468,7 +2246,67 @@ def test_runner_receives_only_admitted_environment_names(monkeypatch, tmp_path: 
     assert "CUSTOMER_SECRET" not in runner.calls[0][1]
     assert runner.calls[0][1]["OPENAI_API_KEY"] == "admitted-for-selected-backend"
     assert runner.calls[0][2] == 123.0
+
+@pytest.mark.parametrize("returncode", [0, 1])
+def test_runner_redacts_both_streams_and_every_nonempty_short_or_long_credential(
+    tmp_path: Path, returncode: int
+) -> None:
+    runner = OutputRunner(
+        returncode=returncode,
+        stdout="short=x long=opaque-credential-value\n",
+        stderr="long=opaque-credential-value short=x\n",
+    )
+    executable = resolved_executable(tmp_path)
+    try:
+        result = run_graphify_operation(
+            runner, executable, (str(executable.path), "--version"),
+            env={"PATH": os.defpath, "SHORT_TOKEN": "x", "LONG_TOKEN": "opaque-credential-value"},
+            timeout=1.0, operation="version",
+        )
+        rendered = result.stdout + result.stderr
+    except GraphifyCommandError as error:
+        rendered = repr(error) + str(error)
+    assert "opaque-credential-value" not in rendered
+    assert "short=x" not in rendered
+    assert "[REDACTED]" in rendered
+
+def test_timeout_and_os_error_drop_raw_child_output_and_paths(tmp_path: Path) -> None:
+    executable = resolved_executable(tmp_path)
+    for runner in (
+        TimeoutRunner(output="credential=x", stderr="opaque-credential-value"),
+        OsErrorRunner(filename=str(tmp_path / "private-launcher")),
+    ):
+        with pytest.raises(GraphifyCommandError) as raised:
+            run_graphify_operation(
+                runner, executable, (str(executable.path), "--version"),
+                env={"PATH": os.defpath, "TOKEN": "x"},
+                timeout=1.0, operation="version",
+            )
+        rendered = repr(raised.value) + str(raised.value)
+        assert "credential=x" not in rendered
+        assert "opaque-credential-value" not in rendered
+        assert str(tmp_path) not in rendered
+        assert raised.value.__cause__ is None
+        assert raised.value.__context__ is None
+
+def test_short_secret_redaction_cannot_expand_past_stream_cap(tmp_path: Path) -> None:
+    executable = resolved_executable(tmp_path)
+    result = run_graphify_operation(
+        OutputRunner(returncode=0, stdout="x" * 16_384, stderr="x" * 16_384),
+        executable, (str(executable.path), "--version"),
+        env={"PATH": os.defpath, "TOKEN": "x"}, timeout=1.0, operation="version",
+    )
+    assert len(result.stdout) <= 16_384
+    assert len(result.stderr) <= 16_384
+    assert "x" not in result.stdout + result.stderr
 ```
+
+Parameterize semantic rendering/evidence with missing, empty, over-128-byte,
+leading-flag, whitespace/control, non-ASCII, path-like escaping, and every
+shared secret-shaped model value. All fail before any runner call with a stable
+public-model error and never echo the supplied value. Registry-supported public
+forms such as `gpt-5`, `vendor/model-1`, and `family:model_2` round-trip through
+argv and evidence exactly.
 
 Retain and extend `tests/test_graphify_adapter.py` with a real child-process timeout test proving the child process group is killed and neither its delayed stdout nor a secret value appears in diagnostics.
 
@@ -1491,6 +2329,7 @@ def run_checked(
     *,
     env: Mapping[str, str] | None = None,
     timeout: float = COMMAND_TIMEOUT,
+    before_exec: Callable[[], None] = _noop,
 ) -> CompletedProcess[str]:
     command = tuple(str(part) for part in argv)
     operation = _operation_name(command)
@@ -1501,6 +2340,7 @@ def run_checked(
         env=minimal_environment() if env is None else env,
         timeout=timeout,
         operation=operation,
+        before_exec=before_exec,
     )
 
 def run_graphify_operation(
@@ -1511,6 +2351,7 @@ def run_graphify_operation(
     env: Mapping[str, str],
     timeout: float,
     operation: str,
+    before_exec: Callable[[], None] = _noop,
 ) -> CompletedProcess[str]:
     if not argv or not operation or timeout <= 0:
         raise GraphifyContractError("Graphify operation contract is invalid")
@@ -1518,42 +2359,83 @@ def run_graphify_operation(
     if command[0] != str(executable.path):
         raise GraphifyContractError("graphify_executable_changed")
     child_environment = dict(env)
+    sensitive_values = tuple(
+        value
+        for name, value in child_environment.items()
+        if name not in {"HOME", "LANG", "LC_ALL", "PATH"} and value
+    )
+    _process_boundary_test_checkpoint(operation)
+    before_exec()
     # This must remain the final action before runner.run. Do not re-resolve.
     revalidate_graphify_executable(executable)
+    failure_message: str | None = None
+    result: CompletedProcess[str] | None = None
     try:
         result = runner.run(
             command, text=True, capture_output=True, check=False,
             timeout=timeout, env=child_environment,
         )
-    except subprocess.TimeoutExpired as error:
-        raise GraphifyCommandError(operation, "command timed out") from error
-    except OSError as error:
-        raise GraphifyCommandError(operation, "command could not be executed") from error
-    result = _capped_result(result)
-    if result.returncode:
+    except subprocess.TimeoutExpired:
+        failure_message = "command timed out"
+    except OSError:
+        failure_message = "command could not be executed"
+    if failure_message is not None:
+        raise GraphifyCommandError(operation, failure_message)
+    assert result is not None
+    capped = _capped_result(result)
+    safe_result = CompletedProcess(
+        capped.args,
+        capped.returncode,
+        sanitize_stderr(
+            capped.stdout, sensitive_values=sensitive_values,
+            output_limit=16_384,
+        ),
+        sanitize_stderr(
+            capped.stderr, sensitive_values=sensitive_values,
+            output_limit=16_384,
+        ),
+    )
+    if safe_result.returncode:
         raise GraphifyCommandError(
             operation,
-            sanitize_stderr(result.stderr, sensitive_values=tuple(env.values())),
+            safe_result.stderr,
         )
-    return result
+    return safe_result
 ```
 
-Extend `sanitize_stderr(stderr, *, sensitive_values: Sequence[str] = ())` to replace every distinct non-empty supplied value of at least five characters with `[REDACTED]` before applying the existing credential-literal, environment, home, and Atlas-path patterns. Keep `minimal_environment()` as the default for legacy probes. It may include only `HOME`, `LANG`, `LC_ALL`, and `PATH`. Refresh never uses the default: it always supplies `admitted_graphify_environment(...)`. Keep `shell=False`, POSIX `start_new_session=True`, concurrent pipe draining, 16,384-character capture, and hard process-group termination. Redact both captured streams before any exception or diagnostic field is created.
+`_process_boundary_test_checkpoint` is a module-private no-op with no public,
+CLI, environment, or workflow configuration. Tests monkeypatch it to mutate a
+manifest immediately before the binding callback; production callers cannot
+select it. The callback, executable revalidation, and `runner.run` remain
+adjacent after that checkpoint, and every high-level manifest-bound caller must
+pass its descriptor-owned callback rather than relying on a preceding check.
+
+Extend `sanitize_stderr(stream, *, sensitive_values: Sequence[str] = (), output_limit: int = 16_384)` to replace every distinct non-empty supplied value, including one- to four-character credentials, with `[REDACTED]` before applying the existing credential-literal, environment, home, and Atlas-path patterns, then cap the sanitized result again to `output_limit`. `run_graphify_operation` derives `sensitive_values` only from admitted non-base environment names; base `HOME`/locale/`PATH` values remain covered by the existing path/environment rules and are not blindly replaced as short literals. Keep `minimal_environment()` as the default for legacy probes. It may include only `HOME`, `LANG`, `LC_ALL`, and `PATH`. Refresh creates one mode-0700 private `HOME`, uses fixed locale plus `os.defpath`, adds only the selected backend's non-empty registry-admitted credential/endpoint names to extract, and gives diagnose/cluster the four base names only. Keep `shell=False`, POSIX `start_new_session=True`, concurrent pipe draining, 16,384-character capture, and hard process-group termination. Cap raw capture, redact, re-cap the potentially expanded sanitized streams, and construct a new `CompletedProcess` before checking return code or returning success. Timeout/output-bearing exceptions and OS errors set only a constant local failure message; raise the public error after leaving the `except` block so `__cause__` and `__context__` are both `None` and no raw stream, filename, or child exception is retained.
+
+Move the existing public-model lexical rule into
+`compatibility.validate_public_model_identifier`: require exact `str`, 1–128
+ASCII characters, the closed
+`name[/name][:variant]` alphanumeric/`._-` grammar, no leading flag or control,
+and `has_secret_shape(...) == False`. `_require_backend_and_model()` calls it
+before rendering argv. Evidence imports and calls the same function instead of
+maintaining a second regex. The CLI/lifecycle map every missing or rejected
+value to exact `CompatibilityError("semantic_model_required")` / refresh code
+`semantic_model_required` without serializing the value.
 
 Mechanically update every existing Graphify subprocess helper and caller in `graphify.py` (version/help, legacy query/path/explain/export, registry operations, and assistant installation) to accept a `ResolvedGraphifyExecutable`, render argv zero from `.path`, and call identity-revalidating `run_checked()`/`run_graphify_operation()`. No production function may accept a raw executable `Path` after resolution or call `runner.run` directly. Add an AST/`rg` regression that the sole production `runner.run(` occurrence is inside `run_graphify_operation()` and every public high-level parser lacks `--graphify-binary`/equivalent.
 
-Do not replace or weaken the prerequisite plan's `probe_graphify(executable, contract, runner) -> GraphifyCapabilities`: it already uses identity-revalidating `run_checked()` for every `--version`, `--help`, registry-rendered extract/diagnose/cluster/global-add/agent-install subprocess in private roots, then calls `assert_capability_surface(contract, capabilities.capability_probe)`. Add a regression in `tests/test_lifecycle.py` that refresh calls this probe before creating its source stage and aborts with no stage when any fingerprint differs. Add another that mutates the launcher after probe return and proves the first lifecycle extraction fails before runner invocation.
+Do not replace or weaken the prerequisite plan's `probe_graphify(executable, contract, runner, *, before_exec=_noop) -> GraphifyCapabilities`: it already uses identity-revalidating `run_checked()` for every `--version`, `--help`, registry-rendered extract/diagnose/cluster/global-add/agent-install subprocess in private roots, invokes the binding callback before each, then calls `assert_capability_surface(contract, capabilities.capability_probe)`. Task 6 tests the process boundary and probe itself only. The refresh-specific regressions—manifest callback failure at every probe-child boundary, probe before source-stage creation, mismatch with no stage, and launcher mutation between probe return and first extraction—land in Task 7 after `refresh_project()` exists; they must not be mocked away there.
 
 - [ ] **Step 4: Run focused runner and compatibility tests**
 
-Run: `uv run pytest -q tests/test_graphify_adapter.py tests/test_compatibility.py tests/test_lifecycle.py`
+Run: `uv run pytest -q tests/test_graphify_adapter.py tests/test_compatibility.py tests/test_evidence.py tests/test_lifecycle.py`
 
 Expected: all selected tests pass; recorded argv contains no shell string and recorded environments contain no unadmitted name.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/project_knowledge/graphify.py tests/test_graphify_adapter.py tests/test_lifecycle.py
+git add src/project_knowledge/graphify.py src/project_knowledge/compatibility.py src/project_knowledge/evidence.py tests/test_graphify_adapter.py tests/test_compatibility.py tests/test_evidence.py tests/test_lifecycle.py
 git commit -m "feat: add exact Graphify lifecycle process boundary"
 ```
 
@@ -1567,10 +2449,10 @@ git commit -m "feat: add exact Graphify lifecycle process boundary"
 
 **Interfaces:**
 - Produces: `RefreshOptions(backend, model, deep, code_only)`; the high-level CLI has no binary override.
-- Produces: `RefreshResult(status, source_digest, projection_digest, graph_digest, build_epoch, core_status, trust, limitations)`.
+- Produces: `RefreshResult(status, source_digest, projection_digest, graph_digest, generation_digest, build_epoch, core_status, trust, limitations, recovery_id=None)`; the opaque recovery ID is non-null only for committed cleanup failure.
 - Produces: `RefreshError(code: str, message: str, recovery_id: str | None = None)`.
-- Produces: `RefreshFileSystem.checkpoint(operation: str)`, `create_run_root(...)`, `write_private_artifact(...)`, and descriptor-safe cleanup for failure injection.
-- Produces: `refresh_project(repo_root, manifest, options, *, runner=SubprocessCommandRunner(), fs=REAL_REFRESH_FS, ambient=None, graphify_binary=None) -> RefreshResult`; `graphify_binary` is an injected library-test seam only, is immediately frozen by `resolve_graphify_executable()`, and is absent from every CLI parser.
+- Produces: `RefreshFileSystem.checkpoint(operation: str)`, `create_run_root(recovery_id: str)`, `create_private_directory(path, mode=0o700)`, `write_private_artifact(...)`, `live_run_roots`, and descriptor-safe cleanup for failure injection; run authority is independent of the repository pathname.
+- Produces: `refresh_project(repo_root, manifest, options, *, runner=SubprocessCommandRunner(), fs=REAL_REFRESH_FS, ambient=None, graphify_binary=None, expected_repository_identity=None) -> RefreshResult`; `graphify_binary` is an injected library-test seam only, is immediately frozen by `resolve_graphify_executable()`, and is absent from every CLI parser. Expected identity is checked by the lifecycle root descriptor before ambient credential materialization, state creation, staging, or subprocess spawn.
 - Consumes: `adapter_for`, `capture_native_artifact`, `build_extraction_invocation`, `build_graph_evidence`, evidence-bound `adapt_candidate`, `validate_candidate(..., build_epoch=...)`, and `promote_graph`.
 
 - [ ] **Step 1: Write failing happy-path sequence, environment, and schema-v2 ownership tests**
@@ -1578,6 +2460,7 @@ git commit -m "feat: add exact Graphify lifecycle process boundary"
 ```python
 # append to tests/test_lifecycle.py
 from dataclasses import replace
+from collections.abc import Iterator, Mapping
 import json
 import os
 
@@ -1589,6 +2472,18 @@ class FixtureRefreshFileSystem:
         self.checkpoints: list[str] = []
     def checkpoint(self, operation: str) -> None:
         self.checkpoints.append(operation)
+    def create_private_directory(self, path: Path, *, mode: int = 0o700) -> Path:
+        path.mkdir(mode=mode)
+        assert path.stat().st_mode & 0o777 == mode
+        return path
+
+class FailOnAmbientRead(Mapping[str, str]):
+    def __getitem__(self, key: str) -> str:
+        raise AssertionError("credential environment was read before option admission")
+    def __iter__(self) -> Iterator[str]:
+        raise AssertionError("credential environment was read before option admission")
+    def __len__(self) -> int:
+        raise AssertionError("credential environment was read before option admission")
 
 def test_refresh_runs_official_pipeline_and_promotes_owned_v2_graph(
     tmp_path: Path, monkeypatch
@@ -1613,12 +2508,13 @@ def test_refresh_runs_official_pipeline_and_promotes_owned_v2_graph(
     ownership = json.loads((repo / "graphify-out/.project-knowledge-ownership.json").read_text())
     assert ownership["schema_version"] == 2
     assert ownership["build_epoch"] == 1
+    assert result.generation_digest == ownership["generation_digest"]
     assert ownership["projection_digest"] == result.projection_digest
     assert "GRAPH_EVIDENCE.json" in ownership["artifacts"]
-    assert [call.operation for call in runner.rendered_calls] == [
+    assert [call.operation for call in runner.refresh_rendered_calls] == [
         "extract", "diagnose", "cluster"
     ]
-    assert "CUSTOMER_SECRET" not in runner.environments[0]
+    assert "CUSTOMER_SECRET" not in runner.refresh_environments[0]
     assert fs.checkpoints == [
         "preflight", "projection", "extract", "capture-native", "diagnose",
         "normalize", "cluster", "capture-final", "evidence", "adapt",
@@ -1627,7 +2523,7 @@ def test_refresh_runs_official_pipeline_and_promotes_owned_v2_graph(
     ]
 ```
 
-`Official0948FixtureRunner` is a test-only `CommandRunner` that recognizes the exact `RenderedCommand.argv` arrays from the compatibility registry and writes the captured 0.9.48 fixture artifacts at their requested private outputs. Any unexpected or forbidden flag raises `AssertionError`; the runner records each passed environment.
+`Official0948FixtureRunner` is a test-only `CommandRunner` that recognizes the exact `RenderedCommand.argv` arrays from the compatibility registry and writes the captured 0.9.48 fixture artifacts at their requested private outputs. Any unexpected or forbidden flag raises `AssertionError`. It records complete probe+lifecycle data as `all_calls`/`all_environments`, and separately classifies only the three post-probe refresh operations by their retained refresh run-root identity into `refresh_rendered_calls`/`refresh_environments`; tests never infer lifecycle calls from list position after the mandatory nine-child probe.
 
 - [ ] **Step 2: Add failure-boundary, cleanup, semantic-preflight, and drift tests**
 
@@ -1648,27 +2544,122 @@ def test_refresh_failure_before_commit_preserves_previous_graph(
             runner=Official0948FixtureRunner(), fs=fs, ambient={}, graphify_binary=fixture_graphify(tmp_path),
         )
     assert tree_snapshot(repo / "graphify-out") == previous
-    assert not any((repo / ".project-knowledge/runs").iterdir())
+    assert fs.live_run_roots == ()
 
 def test_semantic_backend_is_required_before_stage_creation(tmp_path: Path) -> None:
     repo = source_repository(tmp_path)
     with pytest.raises(RefreshError) as raised:
         refresh_project(
             repo, manifest_v2(), RefreshOptions(None, None, False, False),
-            runner=Official0948FixtureRunner(), ambient={}, graphify_binary=fixture_graphify(tmp_path),
+            runner=Official0948FixtureRunner(), ambient=FailOnAmbientRead(),
+            graphify_binary=fixture_graphify(tmp_path),
         )
     assert raised.value.code == "semantic_backend_required"
-    assert not (repo / ".project-knowledge/runs").exists()
+    assert not (repo / ".project-knowledge").exists()
 
 def test_selected_backend_without_credential_fails_before_stage(tmp_path: Path) -> None:
     repo = source_repository(tmp_path)
     with pytest.raises(RefreshError) as raised:
         refresh_project(
-            repo, manifest_v2(), RefreshOptions("openai", None, False, False),
+            repo, manifest_v2(), RefreshOptions("openai", "gpt-5", False, False),
             runner=Official0948FixtureRunner(), ambient={}, graphify_binary=fixture_graphify(tmp_path),
         )
     assert raised.value.code == "semantic_backend_required"
-    assert not (repo / ".project-knowledge/runs").exists()
+    assert not (repo / ".project-knowledge").exists()
+
+def test_semantic_model_is_required_and_validated_before_stage(tmp_path: Path) -> None:
+    repo = source_repository(tmp_path)
+    for model in (None, "--api-key", "bad\nmodel", "ghp_" + "a" * 32):
+        with pytest.raises(RefreshError) as raised:
+            refresh_project(
+                repo, manifest_v2(), RefreshOptions("openai", model, False, False),
+                runner=Official0948FixtureRunner(), ambient=FailOnAmbientRead(),
+                graphify_binary=fixture_graphify(tmp_path),
+            )
+        assert raised.value.code == "semantic_model_required"
+        assert not (repo / ".project-knowledge").exists()
+
+def test_refresh_expected_identity_mismatch_precedes_ambient_and_child(
+    tmp_path: Path,
+) -> None:
+    repo = source_repository(tmp_path)
+    with open_repository_access(repo) as loaded:
+        expected = loaded.identity
+    repo.rename(tmp_path / "original")
+    replacement = source_repository_at(repo, payload="replacement\n")
+    runner = Official0948FixtureRunner()
+    with pytest.raises(TransactionLockError) as raised:
+        refresh_project(
+            replacement, manifest_v2(),
+            RefreshOptions("openai", "gpt-5", False, False),
+            runner=runner, ambient=FailOnAmbientRead(),
+            graphify_binary=fixture_graphify(tmp_path),
+            expected_repository_identity=expected,
+        )
+    assert raised.value.kind == "authority"
+    assert runner.calls == []
+    assert not (replacement / ".project-knowledge").exists()
+
+def test_refresh_rejects_stale_supplied_manifest_before_ambient_or_child(
+    tmp_path: Path,
+) -> None:
+    repo = source_repository(tmp_path)
+    admitted = manifest_v2()
+    rewrite_manifest_semantically(repo, graphify_version="0.9.49")
+    runner = Official0948FixtureRunner()
+    with pytest.raises(ManifestError) as raised:
+        refresh_project(
+            repo, admitted,
+            RefreshOptions("openai", "gpt-5", False, False),
+            runner=runner, ambient=FailOnAmbientRead(),
+            graphify_binary=fixture_graphify(tmp_path),
+        )
+    assert raised.value.kind == "changed"
+    assert runner.calls == []
+    assert not (repo / ".project-knowledge").exists()
+
+def test_refresh_rechecks_manifest_after_waiting_for_lifecycle_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = source_repository(tmp_path)
+    admitted = manifest_v2()
+    runner = Official0948FixtureRunner()
+    real_lock = repository_lifecycle_lock
+    monkeypatch.setattr(
+        "project_knowledge.lifecycle.repository_lifecycle_lock",
+        lock_that_rewrites_manifest_before_yield(
+            real_lock, repo,
+            artifacts=github_artifacts(repository="attacker/redirect"),
+        ),
+    )
+    with pytest.raises(ManifestError) as raised:
+        refresh_project(
+            repo, admitted, RefreshOptions(None, None, False, True),
+            runner=runner, ambient={},
+            graphify_binary=fixture_graphify(tmp_path),
+        )
+    assert raised.value.kind == "changed"
+    assert runner.calls == []
+    assert not (repo / "graphify-out").exists()
+
+def test_refresh_root_swap_after_lock_stays_on_original_descriptor(
+    tmp_path: Path,
+) -> None:
+    repo = source_repository(tmp_path, payload="ORIGINAL = True\n")
+    original = tmp_path / "original"
+    def replace_root() -> None:
+        repo.rename(original)
+        source_repository_at(repo, payload="TOKEN = 'replacement-secret'\n")
+    fs = MutatingRefreshFileSystem("preflight", replace_root)
+    result = refresh_project(
+        repo, manifest_v2(), RefreshOptions(None, None, False, True),
+        runner=Official0948FixtureRunner(), fs=fs, ambient={},
+        graphify_binary=fixture_graphify(tmp_path),
+    )
+    assert result.status in {"refreshed", "unchanged"}
+    assert (original / "graphify-out/graph.json").is_file()
+    assert not (repo / "graphify-out").exists()
+    assert not (repo / ".project-knowledge").exists()
 
 def test_selected_credential_value_reaches_only_subprocess_but_name_is_evidence(
     tmp_path: Path,
@@ -1681,10 +2672,109 @@ def test_selected_credential_value_reaches_only_subprocess_but_name_is_evidence(
         runner=runner, ambient={"OPENAI_API_KEY": secret},
         graphify_binary=fixture_graphify(tmp_path),
     )
-    assert any(env.get("OPENAI_API_KEY") == secret for env in runner.environments)
+    assert runner.refresh_environments[0].get("OPENAI_API_KEY") == secret
+    assert all("OPENAI_API_KEY" not in env for env in runner.refresh_environments[1:])
+    assert [set(env) for env in runner.refresh_environments] == [
+        {"HOME", "LANG", "LC_ALL", "PATH", "OPENAI_API_KEY"},
+        {"HOME", "LANG", "LC_ALL", "PATH"},
+        {"HOME", "LANG", "LC_ALL", "PATH"},
+    ]
+    assert len({env["HOME"] for env in runner.refresh_environments}) == 1
+    private_home = Path(runner.refresh_environments[0]["HOME"])
+    assert runner.refresh_home_modes_during_run == [0o700, 0o700, 0o700]
+    assert not private_home.exists()
     evidence_text = (repo / "graphify-out/GRAPH_EVIDENCE.json").read_text(encoding="utf-8")
     assert secret not in evidence_text
     assert "OPENAI_API_KEY" in evidence_text
+
+def test_selected_backend_endpoint_alias_is_extract_only_and_evidence_bound(
+    tmp_path: Path,
+) -> None:
+    repo = source_repository(tmp_path)
+    runner = Official0948FixtureRunner()
+    endpoint = "https://gateway.example.invalid/v1"
+    refresh_project(
+        repo, manifest_v2(), RefreshOptions("openai", "gpt-5", False, False),
+        runner=runner,
+        ambient={"OPENAI_API_KEY": "secret", "OPENAI_BASE_URL": endpoint},
+        graphify_binary=fixture_graphify(tmp_path),
+    )
+    assert runner.refresh_environments[0]["OPENAI_BASE_URL"] == endpoint
+    assert all("OPENAI_BASE_URL" not in env for env in runner.refresh_environments[1:])
+    evidence_text = (repo / "graphify-out/GRAPH_EVIDENCE.json").read_text()
+    assert "OPENAI_BASE_URL" in evidence_text
+    assert endpoint not in evidence_text
+
+@pytest.mark.parametrize(
+    "boundary,completed_operations",
+    [
+        ("extract", []),
+        ("diagnose", ["extract"]),
+        ("cluster", ["extract", "diagnose"]),
+    ],
+)
+def test_refresh_rechecks_manifest_immediately_before_every_child(
+    tmp_path: Path, boundary: str, completed_operations: list[str],
+) -> None:
+    repo = source_repository(tmp_path)
+    manifest_path = repo / ".graphify-project.yaml"
+    original = manifest_path.read_bytes()
+
+    def rewrite_and_restore() -> None:
+        rewrite_same_inode(manifest_path, manifest_with(track_html=True))
+        rewrite_same_inode(manifest_path, original)
+
+    runner = Official0948FixtureRunner()
+    fs = MutatingRefreshFileSystem(boundary, rewrite_and_restore)
+    with pytest.raises(ManifestError) as raised:
+        refresh_project(
+            repo, manifest_v2(), RefreshOptions(None, None, False, True),
+            runner=runner, fs=fs, ambient={},
+            graphify_binary=fixture_graphify(tmp_path),
+        )
+    assert raised.value.kind == "changed"
+    assert [call.operation for call in runner.refresh_rendered_calls] == completed_operations
+    assert not (repo / "graphify-out").exists()
+
+
+@pytest.mark.parametrize("boundary", ["extract", "diagnose", "cluster"])
+def test_refresh_manifest_guard_is_inside_final_process_boundary(
+    tmp_path: Path, boundary: str,
+) -> None:
+    repo = source_repository(tmp_path)
+    runner = Official0948FixtureRunner()
+    install_process_boundary_test_fault(
+        boundary,
+        before_manifest_callback=lambda: rewrite_and_restore_manifest_same_inode(repo),
+    )
+    with pytest.raises(ManifestError) as raised:
+        refresh_project(
+            repo, manifest_v2(), RefreshOptions(None, None, False, True),
+            runner=runner, ambient={}, graphify_binary=fixture_graphify(tmp_path),
+        )
+    assert raised.value.kind == "changed"
+    assert boundary not in [call.operation for call in runner.refresh_rendered_calls]
+    assert not (repo / "graphify-out").exists()
+
+@pytest.mark.parametrize("mutate_after_probe_child", range(1, 10))
+def test_refresh_rechecks_manifest_before_every_capability_probe_child(
+    tmp_path: Path, mutate_after_probe_child: int,
+) -> None:
+    repo = source_repository(tmp_path)
+    runner = ManifestMutatingProbeRunner(
+        repo, rewrite_and_restore=True,
+        mutate_after_call=mutate_after_probe_child,
+    )
+    with pytest.raises(ManifestError) as raised:
+        refresh_project(
+            repo, manifest_v2(), RefreshOptions(None, None, False, True),
+            runner=runner, ambient={}, graphify_binary=fixture_graphify(tmp_path),
+        )
+    assert raised.value.kind == "changed"
+    assert len(runner.calls) == mutate_after_probe_child
+    assert runner.refresh_operation_calls == []
+    assert not runner.private_probe_roots
+    assert not (repo / "graphify-out").exists()
 
 def test_post_commit_drift_reports_promoted_but_stale_without_fake_rollback(
     tmp_path: Path, monkeypatch
@@ -1702,11 +2792,130 @@ def test_post_commit_drift_reports_promoted_but_stale_without_fake_rollback(
     assert result.core_status == "stale"
     assert (repo / "graphify-out/graph.json").is_file()
 
-def test_cleanup_failure_retains_private_run_and_reports_only_recovery_id(
+@pytest.mark.parametrize("field", ["digest", "generation_digest", "build_epoch"])
+def test_malformed_promotion_summary_reports_only_revalidated_live_identity(
+    tmp_path: Path, field: str,
+) -> None:
+    repo = source_repository(tmp_path)
+    fs = MalformedPromotionSummaryFileSystem(
+        field, value=("f" * 64 if field != "build_epoch" else None)
+    )
+    result = refresh_project(
+        repo, manifest_v2(), RefreshOptions(None, None, False, True),
+        runner=Official0948FixtureRunner(), fs=fs, ambient={},
+        graphify_binary=fixture_graphify(tmp_path),
+    )
+    owned = validate_owned_graph(repo / "graphify-out", manifest_v2())
+    assert result.status == "promoted_but_stale"
+    assert result.graph_digest == owned.graph_digest
+    assert result.generation_digest == owned.generation_digest
+    assert result.build_epoch == owned.build_epoch
+    assert "f" * 64 not in {result.graph_digest, result.generation_digest}
+
+def test_unverifiable_committed_generation_reports_null_complete_identity(
+    tmp_path: Path,
+) -> None:
+    repo = source_repository(tmp_path)
+    fs = CorruptAfterPromotionFileSystem()
+    result = refresh_project(
+        repo, manifest_v2(), RefreshOptions(None, None, False, True),
+        runner=Official0948FixtureRunner(), fs=fs, ambient={},
+        graphify_binary=fixture_graphify(tmp_path),
+    )
+    assert result.status == "promoted_but_stale"
+    assert (result.graph_digest, result.generation_digest, result.build_epoch) == (
+        None, None, None
+    )
+
+
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_postcommit_revalidation_exception_preserves_commit_outcome(
+    tmp_path: Path, cleanup_fails: bool,
+) -> None:
+    repo = source_repository(tmp_path)
+    fs = PostPromotionRevalidationRaisingRefreshFileSystem(
+        RuntimeError("private"), cleanup_fails=cleanup_fails
+    )
+    result = refresh_project(
+        repo, manifest_v2(), RefreshOptions(None, None, False, True),
+        runner=Official0948FixtureRunner(), fs=fs, ambient={},
+        graphify_binary=fixture_graphify(tmp_path),
+    )
+    assert result.status == "promoted_but_stale"
+    assert (result.graph_digest, result.generation_digest, result.build_epoch) == (
+        None, None, None
+    )
+    assert (result.recovery_id is not None) is cleanup_fails
+    assert "private" not in repr(result)
+
+
+def test_noop_revalidation_exception_is_closed_noncommit_error(
+    tmp_path: Path,
+) -> None:
+    repo = source_repository(tmp_path)
+    first = refresh_project(
+        repo, manifest_v2(), RefreshOptions(None, None, False, True),
+        runner=Official0948FixtureRunner(), ambient={},
+        graphify_binary=fixture_graphify(tmp_path),
+    )
+    with pytest.raises(RefreshError) as raised:
+        refresh_project(
+            repo, manifest_v2(), RefreshOptions(None, None, False, True),
+            runner=Official0948FixtureRunner(),
+            fs=PostPromotionRevalidationRaisingRefreshFileSystem(
+                RuntimeError("private"), cleanup_fails=False
+            ),
+            ambient={}, graphify_binary=fixture_graphify(tmp_path),
+        )
+    assert raised.value.code == "refresh_verification_failed"
+    assert raised.value.recovery_id is None
+    assert "private" not in repr(raised.value)
+    owned = validate_owned_graph(repo / "graphify-out", manifest_v2())
+    assert owned.generation_digest == first.generation_digest
+
+def test_post_commit_cleanup_failure_is_stale_and_reports_only_recovery_id(
     tmp_path: Path
 ) -> None:
     repo = source_repository(tmp_path)
     fs = CleanupFailingRefreshFileSystem()
+    result = refresh_project(
+        repo, manifest_v2(), RefreshOptions(None, None, False, True),
+        runner=Official0948FixtureRunner(), fs=fs, ambient={},
+        graphify_binary=fixture_graphify(tmp_path),
+    )
+    assert result.status == "promoted_but_stale"
+    assert result.core_status == "error"
+    assert "cleanup_failed" in result.limitations
+    assert result.recovery_id is not None
+    assert str(repo) not in repr(result)
+
+
+def test_exact_generation_noop_cleanup_failure_is_closed_error_not_commit(
+    tmp_path: Path,
+) -> None:
+    repo = source_repository(tmp_path)
+    first = refresh_project(
+        repo, manifest_v2(), RefreshOptions(None, None, False, True),
+        runner=Official0948FixtureRunner(), ambient={},
+        graphify_binary=fixture_graphify(tmp_path),
+    )
+    with pytest.raises(RefreshError) as raised:
+        refresh_project(
+            repo, manifest_v2(), RefreshOptions(None, None, False, True),
+            runner=Official0948FixtureRunner(),
+            fs=CleanupFailingRefreshFileSystem(), ambient={},
+            graphify_binary=fixture_graphify(tmp_path),
+        )
+    assert raised.value.code == "cleanup_failed"
+    assert raised.value.recovery_id is not None
+    owned = validate_owned_graph(repo / "graphify-out", manifest_v2())
+    assert owned.generation_digest == first.generation_digest
+
+def test_precommit_cleanup_failure_raises_only_stable_recovery_error(
+    tmp_path: Path,
+) -> None:
+    repo = source_repository(tmp_path)
+    fs = CleanupFailingBeforeCommitFileSystem("validate")
     with pytest.raises(RefreshError) as raised:
         refresh_project(
             repo, manifest_v2(), RefreshOptions(None, None, False, True),
@@ -1715,7 +2924,67 @@ def test_cleanup_failure_retains_private_run_and_reports_only_recovery_id(
     assert raised.value.code == "cleanup_failed"
     assert raised.value.recovery_id is not None
     assert str(repo) not in str(raised.value)
+
+def test_cleanup_failure_never_suppresses_pending_nonordinary_exception(
+    tmp_path: Path,
+) -> None:
+    repo = source_repository(tmp_path)
+    fs = SignalThenCleanupFailingRefreshFileSystem(
+        signal_boundary="validate", signal=KeyboardInterrupt()
+    )
+    with pytest.raises(KeyboardInterrupt):
+        refresh_project(
+            repo, manifest_v2(), RefreshOptions(None, None, False, True),
+            runner=Official0948FixtureRunner(), fs=fs, ambient={},
+            graphify_binary=fixture_graphify(tmp_path),
+        )
+    assert fs.cleanup_attempted
 ```
+
+Add exact-path regressions proving the descriptor-written normalized bytes are
+at `cluster/graphify-out/graph.json` immediately before `cluster-only`, that
+this exact path is the `--graph` argument, that the logical invocation binding
+remains `cluster-input/graph.json`, and that extract never receives
+visualization flags while cluster never receives backend/model flags.
+
+Add an unchanged refresh regression: after one successful refresh, run the
+same projection again and assert status `unchanged`, the returned `build_epoch`
+equals the installed prior epoch, and ownership bytes/inode are untouched. Add
+a same-graph/different-report-or-evidence generation test that increments epoch
+and promotes. No result may report an epoch that is absent from installed
+ownership.
+
+Add failure injections for the cleanup checkpoint itself and for every
+post-commit boundary (`post-promote-projection`, projection inspection,
+`health`). Cleanup is still attempted. Once promotion committed, verification
+failure returns exit-status semantics `promoted_but_stale` with core
+`stale`/`error` and a stable limitation; it never raises a pre-commit-style
+error or claims rollback of the installed generation.
+
+Inject malformed post-promotion summaries independently for graph digest,
+generation digest, and epoch. The state machine descriptor-revalidates live
+ownership after every committed promotion. When that succeeds, the result is
+`promoted_but_stale`, navigation-only, and reports the revalidated live
+graph/generation/epoch rather than any mismatching summary field. When live
+ownership cannot be revalidated, all three installed-identity fields are
+`null`. `refreshed` and `unchanged` always carry the exact non-null installed
+digests and positive epoch. Nullable installed identity is permitted only for a
+committed-but-unverifiable result, so no response ever invents or reports any
+identity component not proven installed.
+
+Also inject an ordinary exception directly from live ownership revalidation,
+both alone and together with cleanup failure. Since the changed promotion has
+already returned, both cases produce `promoted_but_stale`; the first has no
+recovery ID and the second has one. If revalidation never established a valid
+installed identity, all three identity fields are null. This regression keeps
+the commit marker authoritative even when the first post-commit operation
+itself fails unexpectedly.
+
+Run the same injection after an exact-generation no-op as well. Because no
+mutation committed, it raises the closed `refresh_verification_failed` error
+without recovery ID; it must never return nullable committed-stale identity.
+If cleanup also fails, the existing non-commit cleanup rule emits the closed
+`cleanup_failed` recovery error.
 
 - [ ] **Step 3: Run tests and verify lifecycle orchestration is absent**
 
@@ -1743,17 +3012,38 @@ class RefreshResult:
     status: Literal["refreshed", "unchanged", "promoted_but_stale"]
     source_digest: str
     projection_digest: str
-    graph_digest: str
-    build_epoch: int
+    graph_digest: str | None
+    generation_digest: str | None
+    build_epoch: int | None
     core_status: str
     trust: Literal["trusted", "navigation"]
     limitations: tuple[str, ...]
+    recovery_id: str | None = None
+
+@dataclass(frozen=True)
+class _InstalledGenerationIdentity:
+    graph_digest: str
+    generation_digest: str
+    build_epoch: int
 
 @dataclass(frozen=True)
 class RefreshError(Exception):
     code: str
     message: str
     recovery_id: str | None = None
+
+_SEMANTIC_REFRESH_ERRORS = {
+    "semantic_backend_required": "semantic extraction requires an admitted backend credential",
+    "semantic_model_required": "semantic extraction requires a public model identifier",
+}
+
+def _raise_refresh_compatibility(error: CompatibilityError) -> NoReturn:
+    code = error.args[0] if len(error.args) == 1 else None
+    if code not in _SEMANTIC_REFRESH_ERRORS:
+        raise RefreshError(
+            "invalid_refresh_options", "semantic refresh options are invalid"
+        ) from None
+    raise RefreshError(code, _SEMANTIC_REFRESH_ERRORS[code]) from None
 
 def refresh_project(
     repo_root: Path,
@@ -1764,31 +3054,109 @@ def refresh_project(
     fs: RefreshFileSystem = REAL_REFRESH_FS,
     ambient: Mapping[str, str] | None = None,
     graphify_binary: Path | None = None,
+    expected_repository_identity: RepositoryIdentity | None = None,
 ) -> RefreshResult:
-    if manifest.schema_version != 2 or manifest.project_uid is None:
-        raise RefreshError("manifest_migration_required", "refresh requires manifest schema 2")
-    runner = runner or SubprocessCommandRunner()
-    ambient_values = dict(os.environ if ambient is None else ambient)
-    executable = resolve_graphify_executable(test_override=graphify_binary)
-    contract = resolve_graphify_compatibility(manifest.graphify_version)
     if not options.code_only:
         if options.backend is None:
             raise RefreshError("semantic_backend_required", "semantic extraction requires a backend")
-        validate_semantic_backend(contract, options.backend, ambient_values)
+        if options.model is None:
+            raise RefreshError("semantic_model_required", "semantic extraction requires a public model identifier")
+        try:
+            validate_public_model_identifier(options.model)
+        except CompatibilityError as error:
+            _raise_refresh_compatibility(error)
     elif options.backend is not None or options.model is not None or options.deep:
         raise RefreshError("invalid_refresh_options", "code-only cannot select semantic options")
-    environment = admitted_graphify_environment(contract, options.backend, ambient_values)
-    with repository_lifecycle_lock(repo_root):
-        if inspect_init_journal(repo_root) != "none":
+    # Bind the current root (or the fleet-captured root) and run the read-only
+    # recovery gate before touching credentials. The later lifecycle open must
+    # match this exact identity, closing the gap without using a pathname check
+    # as authority.
+    with open_repository_access(
+        repo_root,
+        expected_repository_identity=expected_repository_identity,
+    ) as admission_repository:
+        if inspect_init_journal(
+            repo_root, repository_access=admission_repository
+        ) != "none":
+            raise RefreshError(
+                "init_recovery_required", "configuration recovery is required"
+            )
+        manifest = require_current_manifest(
+            repo_root, manifest, repository_access=admission_repository
+        )
+        if manifest.schema_version != 2 or manifest.project_uid is None:
+            raise RefreshError(
+                "manifest_migration_required", "refresh requires manifest schema 2"
+            )
+        contract = resolve_graphify_compatibility(manifest.graphify_version)
+        admitted_repository_identity = admission_repository.identity
+        # Do not even materialize the ambient mapping until all public
+        # option/model and repository admission has succeeded.
+        ambient_values = dict(os.environ if ambient is None else ambient)
+        if not options.code_only:
+            try:
+                assert options.backend is not None
+                validate_semantic_backend(contract, options.backend, ambient_values)
+            except CompatibilityError as error:
+                _raise_refresh_compatibility(error)
+        try:
+            admitted_environment = admitted_graphify_environment(
+                contract, options.backend, ambient_values
+            )
+        except CompatibilityError as error:
+            _raise_refresh_compatibility(error)
+        extract_additional_environment = {
+            name: value
+            for name, value in admitted_environment.items()
+            if name not in {"HOME", "LANG", "LC_ALL", "PATH"}
+        }
+        # Do not retain ambient base values. Every child receives a new bounded
+        # environment rooted in the private run directory; only extract may
+        # receive the selected backend's non-empty admitted credential/endpoint
+        # names.
+        del admitted_environment, ambient_values
+    runner = runner or SubprocessCommandRunner()
+    executable = resolve_graphify_executable(test_override=graphify_binary)
+    with repository_lifecycle_lock(
+        repo_root,
+        expected_repository_identity=admitted_repository_identity,
+    ), capture_lifecycle_repository(repo_root) as repository:
+        if inspect_init_journal(
+            repo_root, repository_access=repository
+        ) != "none":
             raise RefreshError("init_recovery_required", "configuration recovery is required")
+        manifest = require_current_manifest(
+            repo_root, manifest, repository_access=repository
+        )
         fs.checkpoint("preflight")
-        capabilities = probe_graphify(executable, contract, runner)
+        assert_current_manifest_unchanged(
+            repo_root, manifest, repository_access=repository
+        )
+        capabilities = probe_graphify(
+            executable, contract, runner,
+            before_exec=lambda: assert_current_manifest_unchanged(
+                repo_root, manifest, repository_access=repository
+            ),
+        )
         recovery_id = secrets.token_hex(16)
-        run = fs.create_run_root(repo_root, recovery_id)
+        run = fs.create_run_root(recovery_id)
+        private_home = fs.create_private_directory(run / "home", mode=0o700)
+        local_environment = {
+            "HOME": str(private_home),
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "PATH": os.defpath,
+        }
+        semantic_environment = {
+            **local_environment, **extract_additional_environment,
+        }
+        promotion_committed = False
+        installed: _InstalledGenerationIdentity | None = None
         try:
             fs.checkpoint("projection")
             staged = stage_input_with_receipt(
-                repo_root, manifest, run / "stage", run / "receipt.json"
+                repo_root, manifest, run / "stage", run / "receipt.json",
+                repository_access=repository,
             )
             assert staged.projection_digest is not None
             commands: list[RenderedCommand] = []
@@ -1797,14 +3165,19 @@ def refresh_project(
                 contract, "extract", binary=executable.path,
                 source=staged.root, output=run / "raw", backend=options.backend,
                 model=options.model, code_only=options.code_only, deep=options.deep,
-                track_html=manifest.track_html,
             )
             commands.append(extract)
             fs.checkpoint("extract")
+            assert_current_manifest_unchanged(
+                repo_root, manifest, repository_access=repository
+            )
             run_graphify_operation(
-                runner, executable, extract.argv, env=environment,
+                runner, executable, extract.argv, env=semantic_environment,
                 timeout=EXTRACT_TIMEOUT_SECONDS,
                 operation="extract",
+                before_exec=lambda: assert_current_manifest_unchanged(
+                    repo_root, manifest, repository_access=repository
+                ),
             )
             fs.checkpoint("capture-native")
             native = capture_native_artifact(
@@ -1821,10 +3194,16 @@ def refresh_project(
             )
             commands.append(diagnose)
             fs.checkpoint("diagnose")
+            assert_current_manifest_unchanged(
+                repo_root, manifest, repository_access=repository
+            )
             diagnosis_result = run_graphify_operation(
-                runner, executable, diagnose.argv, env=environment,
+                runner, executable, diagnose.argv, env=local_environment,
                 timeout=DIAGNOSE_TIMEOUT_SECONDS,
                 operation="diagnose",
+                before_exec=lambda: assert_current_manifest_unchanged(
+                    repo_root, manifest, repository_access=repository
+                ),
             )
             diagnosis = fs.write_private_artifact(
                 run, PurePosixPath("raw/diagnose.json"),
@@ -1833,23 +3212,32 @@ def refresh_project(
 
             fs.checkpoint("normalize")
             normalization = adapter.normalize_for_cluster(native_graph)
-            cluster_graph = fs.write_private_artifact(
-                run, PurePosixPath("cluster-input/graph.json"),
+            cluster_physical = fs.write_private_artifact(
+                run, PurePosixPath("cluster/graphify-out/graph.json"),
                 normalization.cluster_input.payload, max_bytes=134_217_728,
+            )
+            cluster_graph = CapturedArtifact.from_payload(
+                PurePosixPath("cluster-input/graph.json"),
+                cluster_physical.payload,
             )
             cluster = render_graphify_argv(
                 contract, "cluster", binary=executable.path,
                 source=run / "cluster", output=run / "cluster",
                 graph=run / "cluster/graphify-out/graph.json",
-                backend=options.backend, model=options.model,
                 track_html=manifest.track_html,
             )
             commands.append(cluster)
             fs.checkpoint("cluster")
+            assert_current_manifest_unchanged(
+                repo_root, manifest, repository_access=repository
+            )
             run_graphify_operation(
-                runner, executable, cluster.argv, env=environment,
+                runner, executable, cluster.argv, env=local_environment,
                 timeout=CLUSTER_TIMEOUT_SECONDS,
                 operation="cluster",
+                before_exec=lambda: assert_current_manifest_unchanged(
+                    repo_root, manifest, repository_access=repository
+                ),
             )
 
             fs.checkpoint("capture-final")
@@ -1881,7 +3269,17 @@ def refresh_project(
                 configuration_sha256=_configuration_sha256(manifest, options),
                 source_digest=staged.source_digest,
                 projection_digest=staged.projection_digest,
-                environment_names=tuple(sorted(environment)),
+                environments=(
+                    CommandEnvironmentBinding(
+                        "extract", tuple(sorted(semantic_environment))
+                    ),
+                    CommandEnvironmentBinding(
+                        "diagnose", tuple(sorted(local_environment))
+                    ),
+                    CommandEnvironmentBinding(
+                        "cluster", tuple(sorted(local_environment))
+                    ),
+                ),
                 artifacts=tuple(captured),
             )
             fs.checkpoint("evidence")
@@ -1898,53 +3296,244 @@ def refresh_project(
             adapted = adapt_candidate(
                 run / "cluster/graphify-out", run / "candidate", staged, manifest,
                 evidence=evidence,
-                post_write_check=lambda: _require_current_projection(repo_root, manifest, staged),
+                post_write_check=lambda: _require_current_projection(
+                    repo_root, manifest, staged, repository_access=repository
+                ),
             )
-            if adapted.artifact_schema_version != 2 or adapted.projection_digest != staged.projection_digest:
+            if (
+                adapted.artifact_schema_version != 2
+                or adapted.projection_digest != staged.projection_digest
+                or adapted.evidence_digest != evidence.digest
+            ):
                 raise RefreshError("adaptation_failed", "adapter did not preserve projection evidence")
-            build_epoch = _next_build_epoch(repo_root, manifest)
+            existing = _current_owned_generation(
+                repo_root, manifest, staged, repository_access=repository
+            )
+            generation_unchanged = (
+                existing is not None
+                and existing.generation_digest == adapted.generation_digest
+            )
+            build_epoch = (
+                existing.build_epoch
+                if generation_unchanged and existing is not None
+                else _next_build_epoch(existing)
+            )
+            assert build_epoch is not None
             fs.checkpoint("validate")
             validated = validate_candidate(
                 adapted.root, staged, manifest,
                 expected_projection_digest=staged.projection_digest,
+                expected_evidence_digest=adapted.evidence_digest,
                 build_epoch=build_epoch,
                 git_identity=None,
             )
             fs.checkpoint("pre-promote-projection")
-            _require_current_projection(repo_root, manifest, staged)
-            fs.checkpoint("promote")
-            promoted = promote_graph(validated, repo_root)
-            fs.checkpoint("post-promote-projection")
-            current = inspect_projection(repo_root, manifest)
-            stale = (
-                current.source_digest != staged.source_digest
-                or current.projection_digest != staged.projection_digest
+            _require_current_projection(
+                repo_root, manifest, staged, repository_access=repository
             )
-            fs.checkpoint("health")
-            health = assess_health(inspect_project_state(repo_root, manifest))
+            assert_current_manifest_unchanged(
+                repo_root, manifest, repository_access=repository
+            )
+            fs.checkpoint("promote")
+            promoted = promote_graph(
+                validated, repo_root, repository_access=repository
+            )
+            promotion_committed = promoted.changed is True
+            try:
+                installed = _revalidate_installed_generation(
+                    repo_root, manifest,
+                    repository_access=repository,
+                )
+                promotion_summary_matches = (
+                    installed is not None
+                    and promoted.digest == installed.graph_digest
+                    and promoted.generation_digest == installed.generation_digest
+                    and promoted.build_epoch == installed.build_epoch
+                    and installed.graph_digest == validated.graph_digest
+                    and installed.generation_digest == validated.generation_digest
+                    and (
+                        not promoted.changed
+                        or installed.build_epoch == validated.build_epoch
+                    )
+                )
+                if (
+                    not promotion_summary_matches
+                    or installed is None
+                    or
+                    promoted.changed == generation_unchanged
+                ):
+                    raise RuntimeError("installed promotion identity mismatch")
+                fs.checkpoint("post-promote-projection")
+                current = inspect_projection(
+                    repo_root, manifest, repository_access=repository
+                )
+                stale_limitations: list[str] = []
+                if current.source_digest != staged.source_digest:
+                    stale_limitations.append("source_changed_after_promotion")
+                if current.projection_digest != staged.projection_digest:
+                    stale_limitations.append("projection_changed_after_promotion")
+                fs.checkpoint("health")
+                health = assess_health(inspect_project_state(
+                    repo_root, manifest, repository_access=repository
+                ))
+                assert_current_manifest_unchanged(
+                    repo_root, manifest, repository_access=repository
+                )
+            except Exception:
+                if not promotion_committed:
+                    raise RefreshError(
+                        "refresh_verification_failed",
+                        "refresh verification failed",
+                    ) from None
+                return RefreshResult(
+                    status="promoted_but_stale",
+                    source_digest=staged.source_digest,
+                    projection_digest=staged.projection_digest,
+                    graph_digest=(None if installed is None else installed.graph_digest),
+                    generation_digest=(
+                        None if installed is None else installed.generation_digest
+                    ),
+                    build_epoch=(None if installed is None else installed.build_epoch),
+                    core_status="error",
+                    trust="navigation",
+                    limitations=tuple(sorted(set(validated.impact_limitations) | {
+                        "post_promotion_verification_failed",
+                    })),
+                )
+            stale = bool(stale_limitations)
+            unhealthy = health.core_status in {"error", "missing", "stale"}
+            result_limitations = set(validated.impact_limitations)
+            result_limitations.update(stale_limitations)
+            if unhealthy:
+                result_limitations.add(
+                    f"post_promotion_health_{health.core_status}"
+                )
+            promoted_but_stale = stale or unhealthy
+            result_core_status = (
+                health.core_status
+                if health.core_status in {"error", "missing"}
+                else ("stale" if stale else health.core_status)
+            )
             return RefreshResult(
-                status="promoted_but_stale" if stale else ("unchanged" if not promoted.changed else "refreshed"),
+                status=(
+                    "promoted_but_stale"
+                    if promoted_but_stale
+                    else ("unchanged" if generation_unchanged else "refreshed")
+                ),
                 source_digest=staged.source_digest,
                 projection_digest=staged.projection_digest,
-                graph_digest=validated.graph_digest,
-                build_epoch=build_epoch,
-                core_status="stale" if stale else health.core_status,
-                trust=validated.impact_trust,
-                limitations=validated.impact_limitations,
+                graph_digest=installed.graph_digest,
+                generation_digest=installed.generation_digest,
+                build_epoch=installed.build_epoch,
+                core_status=result_core_status,
+                trust="navigation" if promoted_but_stale else validated.impact_trust,
+                limitations=tuple(sorted(result_limitations)),
             )
         finally:
-            fs.checkpoint("cleanup")
+            pending_nonordinary = (
+                sys.exc_info()[1] is not None
+                and not isinstance(sys.exc_info()[1], Exception)
+            )
+            cleanup_error: Exception | None = None
+            try:
+                fs.checkpoint("cleanup")
+            except Exception as error:
+                cleanup_error = error
             try:
                 fs.remove_run_root(run)
             except OSError as error:
+                cleanup_error = error
+            if cleanup_error is not None and not pending_nonordinary:
+                if promotion_committed:
+                    return RefreshResult(
+                        status="promoted_but_stale",
+                        source_digest=staged.source_digest,
+                        projection_digest=staged.projection_digest,
+                        graph_digest=(
+                            None if installed is None else installed.graph_digest
+                        ),
+                        generation_digest=(
+                            None
+                            if installed is None
+                            else installed.generation_digest
+                        ),
+                        build_epoch=(
+                            None if installed is None else installed.build_epoch
+                        ),
+                        core_status="error",
+                        trust="navigation",
+                        limitations=tuple(sorted(set(
+                            validated.impact_limitations
+                        ) | {"cleanup_failed"})),
+                        recovery_id=recovery_id,
+                    )
                 raise RefreshError(
                     "cleanup_failed", "private refresh cleanup failed", recovery_id
-                ) from error
+                ) from cleanup_error
 ```
 
-`RefreshFileSystem` must create `.project-knowledge/runs` and each random child descriptor-relatively, no-follow, mode 0700; `write_private_artifact` exclusively creates parent directories/files, enforces the passed byte cap, fsyncs, and returns `CapturedArtifact`. `resolve_graphify_executable(None)` in `graphify.py` resolves only the literal `graphify` executable through `shutil.which` into the prerequisite immutable path/device/inode/launcher-digest object; the optional explicit path exists only as a library-test seam and is not parsed by any CLI. Every lifecycle child receives that same object, renders argv with `executable.path`, and is revalidated in `run_graphify_operation()` immediately before spawn. Invocation evidence uses `capabilities.executable.launcher_sha256`; no later ad-hoc path hash exists. `_configuration_sha256` hashes canonical JSON of manifest schema/project UID/Graphify/track-html plus backend/model/deep/code-only. `_require_current_projection` compares source digest, projection digest, ordered projection files, and coverage approvals. `_next_build_epoch` returns the previous valid ownership-v2 epoch plus one, otherwise one; booleans and values above `2**63 - 1` fail closed. Persist `tuple(sorted(environment))` unchanged as the invocation's admitted environment-name evidence, including the selected credential variable name; only names are bound, never values. No graph bytes contain the epoch.
+`_revalidate_installed_generation` calls descriptor-rooted
+`validate_owned_graph(repo_root / "graphify-out", manifest,
+repository_access=repository)` after promotion, requires schema 2, the current
+project/adapter contract, lowercase graph/generation digests, and a positive
+owned build epoch, and returns only those validator-owned fields. It catches
+only the closed artifact-validation family and returns `None`; it never copies
+a failing `PromotionResult` field into a result. The normal and stale branches
+therefore serialize installed identity exclusively from this post-commit live
+validation. Promotion summary fields are comparisons, not authority.
 
-If cleanup fails while another error is active, `cleanup_failed` is the returned stable code and chains the original internally; neither path nor original exception text is serialized. Signal/timeout behavior stays in the process runner. `RefreshFileSystem.checkpoint` exists in production as a no-op and is invoked at every boundary listed by the test.
+`RefreshFileSystem` must create each run as a descriptor-validated, random,
+mode-0700 system temporary root whose authority is independent of the mutable
+repository pathname; `create_run_root` accepts only the recovery ID, not
+`repo_root`. Cleanup-failure recovery uses that redacted ID. `write_private_artifact`
+exclusively creates parent directories/files beneath the run descriptor,
+enforces the passed byte cap, fsyncs, and returns `CapturedArtifact`. Every
+repository-side operation in the state machine—journal recheck, projection,
+staging, current generation, promotion, post-promotion projection, and health—
+receives the same captured lease `RepositoryAccess`; no in-lock call invokes a
+path-taking repository wrapper. Normalization is written to the exact physical
+file that `cluster-only --graph` mutates (`cluster/graphify-out/graph.json`);
+its pre-mutation bytes are retained under the logical evidence role
+`cluster-input/graph.json`. `resolve_graphify_executable(None)` in `graphify.py`
+resolves only the literal `graphify` executable through `shutil.which` into the
+prerequisite immutable path/device/inode/launcher-digest object; the optional
+explicit path exists only as a library-test seam and is not parsed by any CLI.
+Every lifecycle child receives that same object, renders argv with
+`executable.path`, and is revalidated in `run_graphify_operation()` immediately
+before spawn. Invocation evidence uses
+`capabilities.executable.launcher_sha256`; no later ad-hoc path hash exists.
+Validation uses `adapted.evidence_digest`, which is the in-process
+descriptor/builder binding, as its external evidence anchor; it never re-hashes
+candidate bytes to manufacture the expected value. `_configuration_sha256`
+hashes canonical JSON of manifest schema/project UID/Graphify/track-html plus
+backend/model/deep/code-only. `_require_current_projection` compares source
+digest, projection digest, ordered projection files, and coverage approvals.
+`_current_owned_generation` validates the existing live schema-2 generation
+against that same staged projection. `_next_build_epoch(existing)` returns one
+for absence or the previous epoch plus one for a changed generation; exact
+generation no-op reuses the installed epoch. Booleans and values above
+`2**63 - 1` fail closed. Persist the exact three sorted
+`CommandEnvironmentBinding` records as the invocation's admitted
+environment-name evidence: extract binds the selected backend's actual
+non-empty admitted subset, while diagnose and cluster bind only the fixed base
+names. Only names are bound, never values. No graph bytes contain the epoch.
+
+Before a changed-generation commit, cleanup failure raises stable
+`cleanup_failed` and may chain an earlier internal error; neither path nor
+original exception text is serialized. “Commit” is the private
+`promotion_committed = promoted.changed is True` bit captured immediately after
+`promote_graph` returns; it is never inferred from result status, validation,
+or generation equality. An exact-generation no-op therefore uses this closed
+error even if a later read-only check would otherwise call the snapshot stale.
+After a changed-generation commit, cleanup failure cannot turn the committed operation into a
+pre-commit error: it returns navigation-only `promoted_but_stale`, includes only
+the post-commit descriptor-revalidated installed identity (or all three null
+identity fields), adds `cleanup_failed`, and exposes the opaque recovery ID.
+State retains the last verified success plus this failure. A pending
+non-ordinary `BaseException` is never suppressed by a cleanup return/error; the
+cleanup override applies only to ordinary results/exceptions. Signal/timeout
+behavior otherwise stays in the process runner. `RefreshFileSystem.checkpoint` exists in
+production as a no-op and is invoked at every boundary listed by the test.
 
 - [ ] **Step 5: Run refresh, evidence, adapter, artifact, and transaction tests**
 
@@ -1972,9 +3561,9 @@ git commit -m "feat: orchestrate evidence-bound graph refresh"
 - Produces: `FeatureHealth(status: Literal["disabled", "available", "unavailable", "misconfigured"], issues=())`.
 - Produces: `TrustHealth(impact: Literal["trusted", "navigation"], limitations=())`.
 - Produces: `KnowledgeHealth(schema_version=2, core_status, status, source_matches, projection_matches, features, trust, issues, warnings, legacy booleans)`.
-- Produces: `inspect_project_state(repo_root, manifest, *, atlas=None, registry=None, artifacts=None) -> KnowledgeState`.
+- Produces: `inspect_project_state(repo_root, manifest, *, atlas=None, registry=None, artifacts=None, repository_access=None, expected_repository_identity=None) -> KnowledgeState`; the authority keywords are mutually exclusive and the path wrapper creates nothing.
 - Produces: `DoctorDiagnostic(code, severity)` and `DoctorResult(status, package, manifest, projection, graphify, skill, health, diagnostics)`.
-- Produces: `doctor_project(repo_root, *, graphify_binary=None, runner=None, package_version=None) -> DoctorResult`; the binary keyword is an injected library-test seam only and is absent from CLI.
+- Produces: `doctor_project(repo_root, *, graphify_binary=None, runner=None, package_version=None, expected_repository_identity=None, expected_manifest=None) -> DoctorResult`; the binary keyword and expected manifest are library-test/fleet seams only and are absent from CLI. Doctor opens one noncreating `RepositoryAccess`, descriptor-loads its manifest, optionally requires semantic equality with `expected_manifest`, and reuses the access for journal, projection, and health.
 
 - [ ] **Step 1: Replace aggregate health expectations with failing schema-v2 tests**
 
@@ -1990,6 +3579,8 @@ from tests.test_lifecycle import owned_v2_repository
 def healthy_state(**changes: object) -> KnowledgeState:
     values: dict[str, object] = {
         "project_id": "demo",
+        "manifest_schema_version": 2,
+        "artifact_schema_version": 2,
         "graph_exists": True,
         "graph_valid": True,
         "graph_version": "0.9.48",
@@ -2032,6 +3623,7 @@ def test_enabled_but_unavailable_feature_warns_without_lowering_core() -> None:
 @pytest.mark.parametrize(("changes", "status"), [
     ({"errors": ("source_inspection_failed",)}, "error"),
     ({"graph_exists": False, "graph_valid": False}, "missing"),
+    ({"graph_exists": True, "graph_valid": False}, "error"),
     ({"graph_source_digest": "c" * 64}, "stale"),
     ({"graph_projection_digest": "c" * 64}, "stale"),
     ({"coverage_skips": 1}, "partial"),
@@ -2045,23 +3637,51 @@ def test_unapproved_coverage_is_error_not_admitted_partial() -> None:
     assert health.core_status == "error"
     assert "extraction_coverage_unapproved" in health.issues
 
+def test_unapproved_coverage_error_precedes_stale() -> None:
+    health = assess_health(healthy_state(
+        graph_source_digest="c" * 64, coverage_skips=1, unapproved_skips=1,
+    ))
+    assert health.core_status == "error"
+
+def test_v1_projection_compatibility_is_explicit_not_synthetic() -> None:
+    state = healthy_state(
+        manifest_schema_version=1, artifact_schema_version=1,
+        current_projection_digest=None, graph_projection_digest=None,
+    )
+    assert state.projection_matches is True
+    assert replace(state, artifact_schema_version=2).projection_matches is False
+
 def test_live_inspection_supplies_both_current_digests_to_owned_validation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     repo, _ = owned_v2_repository(tmp_path)
     manifest = manifest_v2()
     real_validate = validate_owned_graph
-    supplied: dict[str, str | None] = {}
+    supplied: dict[str, object] = {}
     def recording_validate(root: Path, value: ProjectManifest, **kwargs: object):
         supplied.update(kwargs)
         return real_validate(root, value, **kwargs)
     monkeypatch.setattr("project_knowledge.health.validate_owned_graph", recording_validate)
     state = inspect_project_state(repo, manifest)
+    access = supplied.pop("repository_access")
+    assert isinstance(access, RepositoryAccess)
+    assert access.identity == opened_identity(repo)
     assert supplied == {
         "expected_source_digest": state.current_source_digest,
         "expected_projection_digest": state.current_projection_digest,
     }
     assert state.source_matches and state.projection_matches
+
+def test_direct_health_inspection_is_noncreating_and_tree_read_only(
+    tmp_path: Path,
+) -> None:
+    repo = configured_v2_repository_without_graph(tmp_path)
+    before = tree_snapshot(repo)
+    state = inspect_project_state(repo, manifest_v2())
+    assert state.graph_exists is False
+    assert assess_health(state).core_status == "missing"
+    assert tree_snapshot(repo) == before
+    assert not (repo / ".project-knowledge").exists()
 ```
 
 - [ ] **Step 2: Write failing doctor read-only/version/resource diagnostics**
@@ -2109,6 +3729,43 @@ def test_doctor_reports_recovery_required_without_touching_corrupt_journal(tmp_p
     result = doctor_project(repo, runner=CapabilityFixtureRunner(), package_version="test")
     assert [item.code for item in result.diagnostics] == ["init_recovery_required"]
     assert journal.read_text(encoding="utf-8") == "corrupt caller bytes\n"
+
+def test_doctor_expected_identity_mismatch_is_read_only_and_never_probes(
+    tmp_path: Path,
+) -> None:
+    repo = configured_repository(tmp_path)
+    with open_repository_access(repo) as loaded:
+        expected = loaded.identity
+    repo.rename(tmp_path / "original")
+    replacement = configured_repository_at(repo, source="replacement\n")
+    runner = CapabilityFixtureRunner()
+    before = tree_snapshot(replacement)
+    with pytest.raises(TransactionLockError) as raised:
+        doctor_project(
+            replacement, runner=runner, package_version="test",
+            expected_repository_identity=expected,
+        )
+    assert raised.value.kind == "authority"
+    assert runner.calls == []
+    assert tree_snapshot(replacement) == before
+    assert not (replacement / ".project-knowledge").exists()
+
+
+@pytest.mark.parametrize("mutate_after_probe_child", range(1, 10))
+def test_doctor_rechecks_pinned_manifest_before_every_probe_child(
+    tmp_path: Path, mutate_after_probe_child: int,
+) -> None:
+    repo = configured_repository(tmp_path)
+    runner = ManifestMutatingProbeRunner(
+        repo, rewrite_and_restore=True,
+        mutate_after_call=mutate_after_probe_child,
+    )
+    before = tree_snapshot(repo)
+    with pytest.raises(ManifestError) as raised:
+        doctor_project(repo, runner=runner, package_version="test")
+    assert raised.value.kind == "changed"
+    assert len(runner.calls) == mutate_after_probe_child
+    assert tree_snapshot(repo) == before
 ```
 
 - [ ] **Step 3: Run tests and verify health/doctor contracts fail**
@@ -2150,6 +3807,8 @@ class KnowledgeState:
     impact_trust: Literal["trusted", "navigation"] = "navigation"
     impact_limitations: tuple[str, ...] = ()
     errors: tuple[str, ...] = ()
+    manifest_schema_version: Literal[1, 2] = 1
+    artifact_schema_version: Literal[1, 2] | None = None
     @property
     def source_matches(self) -> bool:
         return (
@@ -2158,6 +3817,14 @@ class KnowledgeState:
         )
     @property
     def projection_matches(self) -> bool:
+        if (
+            self.manifest_schema_version == 1
+            and self.artifact_schema_version == 1
+            and self.graph_valid
+            and self.current_projection_digest is None
+            and self.graph_projection_digest is None
+        ):
+            return True
         return (
             self.current_projection_digest is not None
             and self.current_projection_digest == self.graph_projection_digest
@@ -2209,9 +3876,18 @@ class KnowledgeHealth:
         }
 ```
 
-`assess_health` implements exact precedence `errors -> graph missing/invalid -> source/projection stale -> unapproved coverage error -> approved coverage partial -> healthy`. Policy-denied scope and optional feature state are excluded from that decision. Append unavailable/misconfigured feature issue codes to `warnings`; append `impact_evidence_incomplete` and the validated impact limitations when trust is navigation. Deduplicate codes while preserving first occurrence.
+`assess_health` implements exact precedence: explicit inspection errors,
+structurally invalid existing graph, or unapproved coverage are `error`; only an
+absent graph is `missing`; then source/projection mismatch is `stale`; approved
+coverage omission is `partial`; otherwise `healthy`. Thus the public order is
+`error -> missing -> stale -> partial -> healthy`, and a stale graph with an
+unapproved omission remains `error`. Policy-denied scope and optional feature
+state are excluded from that decision. Append unavailable/misconfigured
+feature issue codes to `warnings`; append `impact_evidence_incomplete` and the
+validated impact limitations when trust is navigation. Deduplicate codes while
+preserving first occurrence.
 
-`inspect_project_state` calls `inspect_projection`, then calls `validate_owned_graph(output, manifest, expected_source_digest=projection.source_digest, expected_projection_digest=projection.projection_digest)` and compares the returned ownership digests to the same current projection. An unequal digest remains structurally valid but makes the separately computed source/projection match false and core status stale; its returned impact trust is already demoted by the validator. For an absent output set graph existence false. For invalid ownership/artifacts set existence true and valid false without exposing the validator exception. Map manifest intent to disabled feature states unless an explicit already-validated feature state is supplied. For schema v1, graph projection digest may be absent; treat projection matching as true only for a valid schema-v1 owned graph and schema-v1 manifest, while impact remains navigation.
+`inspect_project_state` calls `inspect_projection`, then calls `validate_owned_graph(output, manifest, expected_source_digest=projection.source_digest, expected_projection_digest=projection.projection_digest)` and compares the returned ownership digests to the same current projection. It records the loaded manifest schema and validated artifact schema explicitly. An unequal digest remains structurally valid but makes the separately computed source/projection match false and core status stale; its returned impact trust is already demoted by the validator. For an absent output set graph existence false. For invalid ownership/artifacts set existence true and valid false without exposing the validator exception. Map manifest intent to disabled feature states unless an explicit already-validated feature state is supplied. For schema v1, graph projection digest may be absent; `projection_matches` is true only when both explicit schema discriminators are 1, the owned graph validated, and both projection fields are absent. Never synthesize a digest or infer compatibility from `None == None`; impact remains navigation.
 
 - [ ] **Step 5: Implement deterministic read-only doctor diagnostics**
 
@@ -2247,7 +3923,47 @@ class DoctorResult:
         }
 ```
 
-`doctor_project` must lstat/open the repository without creating state, inspect `init-transaction.json` only when the real private state directory already exists, load the manifest, call `inspect_projection`, resolve compatibility, freeze the Graphify test/default path with `resolve_graphify_executable()`, run the prerequisite private capability probe with that object, inspect packaged/installed skill ownership if present, validate artifact provider fields locally, and call health. Every probe subprocess performs the mandatory identity revalidation. The installed version defaults to `importlib.metadata.version("atlasweaver")`; never import `pyproject.toml` or a source constant for it. Package schema constants are `manifest=2`, `ownership=2`, `evidence=1`, `query=1`.
+`inspect_project_state` opens a noncreating access when one is not supplied,
+calls `require_current_manifest` before projection/live graph reads, and passes
+that same access to both. It calls `assert_current_manifest_unchanged` after
+those reads and before returning; manifest binding errors are never collapsed
+into graph-invalid state. An expected-identity authority failure propagates
+path-free for fleet mapping.
+
+`doctor_project` must call `open_repository_access(...,
+expected_repository_identity=...)` once without creating state and carry that
+same access through journal, manifest, ignore/projection, live graph/ownership,
+and health inspection. It descriptor-loads the manifest itself and, when a
+fleet supplies `expected_manifest`, requires semantic equality before probing;
+malformed or unequal current manifest propagates a path-free `ManifestError`
+instead of becoming an ordinary doctor diagnostic so the fleet coordinator can
+map the lost admission authority to `fleet_manifest_changed`. Direct doctor,
+where `expected_manifest is None`, retains its stable `manifest_invalid`
+diagnostic behavior.
+It asserts the pinned manifest binding again after all projection/graph/probe
+reads and before constructing the result; a concurrent same-inode rewrite
+cannot yield a mixed diagnostic snapshot.
+It may inspect `init-transaction.json` only when the
+real private state directory already
+exists. If the journal state is anything other than `none`, return immediately
+with the sole `init_recovery_required` diagnostic: do not load the manifest,
+inspect source, resolve/probe Graphify, or inspect skills/providers. Otherwise
+load and pin the manifest, call `inspect_projection`, resolve compatibility,
+freeze the Graphify test/default path with `resolve_graphify_executable()`, and
+run `probe_graphify(executable, contract, runner,
+before_exec=lambda: assert_current_manifest_unchanged(repo_root, manifest,
+repository_access=repository))`. This descriptor-bound callback runs before
+every probe child; a post-admission `ManifestError(kind="changed")` propagates
+even for direct doctor rather than being collapsed into `manifest_invalid`.
+Then inspect
+packaged/installed skill ownership if present, validate artifact provider
+fields locally, and call health. Every probe subprocess performs the mandatory
+identity revalidation. A repository pathname swap after the root open either
+continues entirely against the original descriptor or fails closed; no helper
+may reopen and inspect the replacement. The installed version defaults to
+`importlib.metadata.version("atlasweaver")`; never import `pyproject.toml` or a
+source constant for it. Package schema constants are `manifest=2`,
+`ownership=2`, `evidence=1`, `query=1`.
 
 Diagnostics are stable codes only: `init_recovery_required`, `manifest_invalid`, `projection_invalid`, `graphify_unavailable`, `graphify_contract_mismatch`, `agent_skill_unavailable`, `agent_skill_mismatch`, `graph_missing`, `graph_invalid`, `source_stale`, `projection_stale`, `artifact_provider_invalid`. Sort by the explicit subsystem order above, not alphabetically. Absolute paths, secret literals, Graphify stderr, and exception text never enter `DoctorResult`.
 
@@ -2275,14 +3991,15 @@ git commit -m "feat: separate core health from optional features"
 
 **Interfaces:**
 - Produces: `QueryError(code, message, candidates=())`.
+- Produces: immutable `DOCUMENTED_QUERY_ERROR_CODES` as the only codes the CLI may pass through.
 - Produces: `QueryEnvelope(command, trust, result, limitations, schema_version=1)`.
 - Produces: `QuerySnapshot(root, validated, document, contract, evidence, health)` context manager.
-- Produces: `open_query_snapshot(repo_root, manifest) -> AbstractContextManager[QuerySnapshot]`.
+- Produces: `open_query_snapshot(repo_root, manifest, *, expected_repository_identity=None) -> AbstractContextManager[QuerySnapshot]`; the noncreating lifecycle lock derives from the identity-matched root and every live graph/ownership/projection byte is captured through its lease descriptor.
 - Produces: `query_nodes(snapshot, term, *, limit=20) -> QueryEnvelope`.
 - Produces: `shortest_path(snapshot, source, target, *, max_depth=32) -> QueryEnvelope`.
 - Produces: `explain_node(snapshot, node, *, depth=1) -> QueryEnvelope`.
 - Produces: `affected_nodes(snapshot, node, *, depth=2, relations=()) -> QueryEnvelope`.
-- Produces: frozen `RegistryQueryRequest(command, term, source, target, node, limit, max_depth, depth, relations)` and private `CapturedQueryGraph` for the Task 10 registry adapter.
+- Produces: frozen `RegistryQueryRequest(command, term, source, target, node, limit, max_depth, depth: int | None = None, relations)` and private `CapturedQueryGraph` for the Task 10 registry adapter. The adapter normalizes a null depth to 1 for explain and 2 for affected, matching local API/CLI defaults.
 - Produces: `query_captured_graphs(graphs: tuple[CapturedQueryGraph, ...], request: RegistryQueryRequest) -> QueryEnvelope`; Task 10 re-exports the request and owns the public `query_registry` wrapper.
 
 - [ ] **Step 1: Write failing immutable-snapshot and admission tests**
@@ -2316,6 +4033,65 @@ def test_query_snapshot_is_validated_immutable_and_leaves_no_cache(tmp_path: Pat
     assert not (repo / "graphify-out/memory").exists()
     assert not (repo / "graphify-out/reflections").exists()
     assert tree_snapshot(repo) != before  # only the deliberate test mutation changed live bytes
+
+def test_missing_or_v1_query_creates_no_lifecycle_state(tmp_path: Path) -> None:
+    missing = configured_v2_repository(tmp_path / "missing")
+    before = tree_snapshot(missing)
+    with pytest.raises(QueryError) as raised:
+        with open_query_snapshot(missing, manifest_v2()):
+            pass
+    assert raised.value.code == "graph_missing"
+    assert tree_snapshot(missing) == before
+    assert not (missing / ".project-knowledge").exists()
+
+    legacy = owned_v1_query_repository(tmp_path / "legacy")
+    before = tree_snapshot(legacy)
+    with pytest.raises(QueryError) as raised:
+        with open_query_snapshot(legacy, manifest_v1()):
+            pass
+    assert raised.value.code == "manifest_migration_required"
+    assert tree_snapshot(legacy) == before
+
+def test_v2_query_without_existing_lifecycle_state_refuses_without_creation(
+    tmp_path: Path,
+) -> None:
+    repo = owned_query_repository(tmp_path)
+    remove_lifecycle_state(repo)
+    before = tree_snapshot(repo)
+    with pytest.raises(QueryError) as raised:
+        with open_query_snapshot(repo, manifest_v2()):
+            pass
+    assert raised.value.code == "query_snapshot_unavailable"
+    assert tree_snapshot(repo) == before
+
+def test_query_expected_identity_mismatch_never_reads_replacement(
+    tmp_path: Path,
+) -> None:
+    repo = owned_query_repository(tmp_path)
+    with open_repository_access(repo) as loaded:
+        expected = loaded.identity
+    repo.rename(tmp_path / "original")
+    replacement = owned_query_repository_with_copied_id_uid(repo)
+    before = tree_snapshot(replacement)
+    with pytest.raises(TransactionLockError) as raised:
+        with open_query_snapshot(
+            replacement, manifest_v2(),
+            expected_repository_identity=expected,
+        ):
+            pass
+    assert raised.value.kind == "authority"
+    assert tree_snapshot(replacement) == before
+
+def test_v2_query_lock_contention_has_stable_read_only_refusal(
+    tmp_path: Path,
+) -> None:
+    repo = owned_query_repository(tmp_path)
+    ensure_existing_lifecycle_lock(repo)
+    with repository_lifecycle_lock(repo):
+        with pytest.raises(QueryError) as raised:
+            with open_query_snapshot(repo, manifest_v2()):
+                pass
+    assert raised.value.code == "query_snapshot_busy"
 
 @pytest.mark.parametrize("status", ["error", "missing", "stale"])
 def test_query_refuses_non_admitted_core_health(tmp_path: Path, status: str) -> None:
@@ -2359,6 +4135,19 @@ def test_shortest_path_and_reverse_affected_are_deterministic(tmp_path: Path) ->
         assert "source_verification_required" in affected.limitations
         assert "unaffected" not in json.dumps(affected.to_dict()).casefold()
 
+def test_registry_request_defaults_match_local_explain_and_affected_depths(
+    tmp_path: Path,
+) -> None:
+    repo = owned_query_repository(tmp_path)
+    with open_query_snapshot(repo, manifest_v2()) as snapshot:
+        captured = captured_query_graph(snapshot)
+        assert query_captured_graphs((captured,), RegistryQueryRequest(
+            command="explain", node="source"
+        )).result == explain_node(snapshot, "source").result
+        assert query_captured_graphs((captured,), RegistryQueryRequest(
+            command="affected", node="sink"
+        )).result == affected_nodes(snapshot, "sink").result
+
 @pytest.mark.parametrize(("operation", "expected"), [
     (lambda snapshot: query_nodes(snapshot, "x" * 4097), "query_input_too_large"),
     (lambda snapshot: shortest_path(snapshot, "source", "sink", max_depth=33), "query_depth_exceeded"),
@@ -2373,7 +4162,7 @@ def test_query_caps_fail_without_partial_result(tmp_path: Path, operation, expec
     assert raised.value.code == expected
 
 def test_every_rendered_string_is_literal_redacted(tmp_path: Path) -> None:
-    secret = "ghp_abcdefghijklmnopqrstuvwxyz123456"
+    secret = "ghp_" + "a" * 32
     repo = owned_query_repository(tmp_path, injected_label=secret)
     with open_query_snapshot(repo, manifest_v2()) as snapshot:
         document = explain_node(snapshot, "source").to_dict()
@@ -2400,6 +4189,16 @@ MAX_RESULTS = 100
 MAX_NEIGHBORS = 100
 MAX_RELATION_FILTERS = 16
 MAX_OUTPUT_BYTES = 1_048_576
+DOCUMENTED_QUERY_ERROR_CODES = frozenset({
+    "manifest_migration_required",
+    "graph_error", "graph_missing", "graph_stale", "graph_partial_unapproved",
+    "query_snapshot_unavailable", "query_snapshot_busy", "query_cleanup_failed",
+    "query_graph_invalid", "query_graph_too_large",
+    "query_input_invalid", "query_input_too_large",
+    "query_depth_exceeded", "query_relation_cap_exceeded",
+    "query_result_cap_invalid", "query_output_too_large",
+    "node_not_found", "ambiguous_node",
+})
 
 @dataclass(frozen=True)
 class QueryError(Exception):
@@ -2443,7 +4242,7 @@ class RegistryQueryRequest:
     node: str | None = None
     limit: int = 20
     max_depth: int = 32
-    depth: int = 1
+    depth: int | None = None
     relations: tuple[str, ...] = ()
 
 @dataclass(frozen=True)
@@ -2452,6 +4251,7 @@ class CapturedQueryGraph:
     project_id: str
     graph_payload: bytes = field(repr=False)
     evidence_payload: bytes = field(repr=False)
+    evidence_digest: str
     contract: GraphifyCompatibility
     trust: Literal["trusted", "navigation"]
     limitations: tuple[str, ...]
@@ -2475,9 +4275,41 @@ class QueryEnvelope:
         return redacted
 ```
 
-`open_query_snapshot` takes `repository_lifecycle_lock` only for capture. Inside it: inspect the current projection, descriptor-open live `graphify-out`, copy only ownership-listed regular artifacts into a fresh mode-0700 temporary root without following links, compare every source inode before/after copy, and call `validate_owned_graph(copy, manifest, expected_source_digest=projection.source_digest, expected_projection_digest=projection.projection_digest)`. Build health from that validated snapshot. Refuse `error`, `missing`, `stale`, and unapproved partial; admit approved partial with its mandatory limitation. Release the lifecycle lock only after validation; keep the private temporary alive until context exit, then remove it. Cleanup failure raises `query_cleanup_failed` with no path.
+`open_query_snapshot` is available only for manifest-v2/evidence-bound owned
+graphs; schema v1 returns `manifest_migration_required` without creating state.
+It first performs a read-only existence/admission inspection. Missing output or
+absent lifecycle state/lock returns `graph_missing` or
+`query_snapshot_unavailable`, respectively, without mutation. For an
+admissible v2 graph it takes `repository_lifecycle_lock(..., create=False,
+expected_repository_identity=...)` only for capture, so neither
+`.project-knowledge` nor a lock file can appear. The lock's opened root is the
+same descriptor on which the expected identity is checked. It immediately
+captures `RepositoryAccess` from the live lease and uses it for every project-
+side read; no path wrapper runs inside capture. It
+catches `TransactionLockError` by its closed `kind`, mapping `busy` to
+`QueryError("query_snapshot_busy", ...)` and ordinary `unavailable` acquisition
+failure to `QueryError("query_snapshot_unavailable", ...)`; `authority` is
+propagated path-free so a fleet can normalize an expected-identity mismatch to
+`fleet_repository_changed`. It never parses or serializes lock exception text.
+Inside it: inspect the current projection
+only after `require_current_manifest()` matches the supplied contract through
+the lease access, descriptor-open live `graphify-out` relative to that
+same access, copy
+only ownership-listed regular artifacts into a fresh mode-0700 system
+temporary root without following links, compare every source inode before/after
+copy, and call `validate_owned_graph(copy, manifest,
+expected_source_digest=projection.source_digest,
+expected_projection_digest=projection.projection_digest)`. Require artifact
+schema 2. Build health from that validated snapshot. Refuse `error`, `missing`,
+`stale`, and unapproved partial; admit approved partial with its mandatory
+limitation. Release the lifecycle lock only after validation; keep the private
+temporary alive until context exit, then remove it. Cleanup failure raises
+`query_cleanup_failed` with no path.
+Immediately before exposing the snapshot, call
+`assert_current_manifest_unchanged`; drift discards the private snapshot and
+raises `manifest_changed` (or the fleet mapping), never partial query data.
 
-Strict-load `graph.json` with duplicate-key/non-finite rejection and exactly one edge array (`edges` or `links`). Reject more than 100,000 nodes or 500,000 edges before building indexes. Require unique non-empty string node IDs and adapter-semantic endpoint strings. Parse `GRAPH_EVIDENCE.json` through `parse_graph_evidence` when artifact schema is 2 and build the final-edge index through `index_final_edge_evidence`; never parse native Graphify human output.
+Strict-load `graph.json` with duplicate-key/non-finite rejection and exactly one edge array (`edges` or `links`). Reject more than 100,000 nodes or 500,000 edges before building indexes. Require unique non-empty string node IDs and adapter-semantic endpoint strings. Parse `GRAPH_EVIDENCE.json` through `parse_graph_evidence(..., expected_digest=snapshot.validated.evidence_digest)` when artifact schema is 2, requiring the non-null digest returned by descriptor-captured owned-graph validation, and build the final-edge index through `index_final_edge_evidence`; never hash query payload bytes to invent the anchor and never parse native Graphify human output.
 
 Deep-copy every nested attribute document and index into immutable tuples and `MappingProxyType` instances before returning `QuerySnapshot`; a frozen dataclass wrapped around caller-owned dictionaries is not an immutable snapshot.
 
@@ -2526,7 +4358,7 @@ Implement shortest path as deterministic BFS over adjacency lists sorted by `(re
 
 `_redact_tree` recursively accepts only JSON scalar/list/string-keyed mapping output, calls `redact_literals` on every key and string, rejects non-finite numbers, and enforces `MAX_OUTPUT_BYTES` after serialization. `_bounded_input` checks non-empty strict strings and UTF-8 byte length, not Python character count.
 
-`query_captured_graphs` is the in-memory adapter used only after Task 10 has validated and captured registry entries. It validates the request as a closed command union: `query` requires only `term`; `path` requires only `source`/`target`; `explain` and `affected` require only `node`; non-applicable non-default fields are rejected. It strict-parses every captured graph/evidence payload through the same loaders, applies the node/edge caps to the aggregate before allocating indexes, and rewrites local IDs to `<registry-key>::<local-id>` before combining sorted projects. Exact namespaced IDs win; a label or local ID found in multiple projects raises `ambiguous_node` with sorted namespaced candidates. It delegates to the four existing traversals, returns one normal `QueryEnvelope`, and sets trust to navigation if any participating graph is navigation while unioning limitations in sorted order. It never reads registry/live files and never accepts ownership claims from the request.
+`query_captured_graphs` is the in-memory adapter used only after Task 10 has validated and captured registry entries. It validates the request as a closed command union: `query` requires only `term`; `path` requires only `source`/`target`; `explain` and `affected` require only `node`; non-applicable non-default fields are rejected. It normalizes `depth is None` to 1 for explain and 2 for affected before delegating; explicit explain depth is 1..2 and explicit affected depth is 0..8, while query/path reject non-null depth. It strict-parses every captured graph/evidence payload through the same loaders, passing each `CapturedQueryGraph.evidence_digest` as the external parser anchor, applies the node/edge caps to the aggregate before allocating indexes, and rewrites local IDs to `<registry-key>::<local-id>` before combining sorted projects. Exact namespaced IDs win; a label or local ID found in multiple projects raises `ambiguous_node` with sorted namespaced candidates. It delegates to the four existing traversals, returns one normal `QueryEnvelope`, and sets trust to navigation if any participating graph is navigation while unioning limitations in sorted order. It never reads registry/live files, hashes payload bytes to manufacture an anchor, or accepts ownership claims from the request.
 
 - [ ] **Step 6: Run queries with health/evidence regressions**
 
@@ -2553,11 +4385,12 @@ git commit -m "feat: add immutable bounded graph queries"
 
 **Interfaces:**
 - Produces: `RegistryError(code: str, message: str)` with stable path-free codes.
+- Produces immutable `DOCUMENTED_REGISTRY_ERROR_CODES` with exactly `registry_disabled`, `registry_busy`, `registry_unmanaged_state`, `registry_recovery_required`, `registry_source_changed`, `manifest_migration_required`, `registry_snapshot_missing`, `registry_snapshot_stale`, `registry_snapshot_mismatch`, `registry_snapshot_too_large`, and `registry_snapshot_busy`; CLI/fleet map only these codes to their matching constant public messages and collapse every forged/unknown code to `registry_failed`.
 - Produces: `RegistryStatus(status: Literal["disabled", "missing", "stale", "mismatch", "current"], issues=())`.
-- Produces: `RegistrySyncResult(status: Literal["synced", "unchanged"], key, generation, graph_digest)`.
+- Produces: `RegistrySyncResult(status: Literal["synced", "unchanged"], key, generation, graph_digest, generation_digest, snapshot_digest)`.
 - Produces: immutable `RegistrySnapshotEntry`, `RegistrySnapshot`, and re-exported `RegistryQueryRequest` contracts for fleet readers.
-- Produces: `registry_status(repo_root, manifest, *, user_root=None) -> RegistryStatus` with no writes or lock-file creation.
-- Produces: `registry_sync(repo_root, manifest, *, user_root=None, runner=None, graphify_binary=None, fs=REAL_REGISTRY_FS) -> RegistrySyncResult`; runner/binary/filesystem are injected library-test seams, the binary is immediately frozen as `ResolvedGraphifyExecutable`, and no public CLI override is added.
+- Produces: `registry_status(repo_root, manifest, *, user_root=None, expected_repository_identity=None) -> RegistryStatus` with no writes or lock-file creation; it opens one identity-matched noncreating repository access for all project-side reads.
+- Produces: `registry_sync(repo_root, manifest, *, user_root=None, runner=None, graphify_binary=None, fs=REAL_REGISTRY_FS, expected_repository_identity=None) -> RegistrySyncResult`; runner/binary/filesystem are injected library-test seams, the binary is immediately frozen as `ResolvedGraphifyExecutable`, and no public CLI override is added. Lifecycle acquisition atomically validates the expected identity and all snapshot inputs come from the lease descriptor.
 - Produces: `capture_registry_snapshot(project_uids, *, require_graphify_projection, user_root=None) -> RegistrySnapshot` as an atomic, bounded, read-only capture.
 - Produces: `query_registry(snapshot, request) -> QueryEnvelope` over only the captured bytes.
 - Produces: canonical registry schema 1 keyed only by `atlasweaver/<project_uid>`.
@@ -2611,6 +4444,21 @@ def test_source_change_makes_registry_stale_without_mutation(tmp_path: Path) -> 
     (repo / "src/app.py").write_text("changed\n", encoding="utf-8")
     assert registry_status(repo, enabled_manifest(), user_root=user_root).status == "stale"
     assert tree_snapshot(user_root) == before
+
+def test_status_uses_existing_shared_lock_without_creating_state(
+    tmp_path: Path,
+) -> None:
+    repo = owned_registry_repository(tmp_path)
+    user_root = tmp_path / "user"
+    assert registry_status(repo, enabled_manifest(), user_root=user_root).status == "missing"
+    assert not user_root.exists()
+    prepare_current_registry(repo, user_root)
+    with held_exclusive_registry_lock(user_root):
+        before = tree_snapshot(user_root)
+        status = registry_status(repo, enabled_manifest(), user_root=user_root)
+        assert status.status == "mismatch"
+        assert status.issues == ("registry_busy",)
+        assert tree_snapshot(user_root) == before
 ```
 
 - [ ] **Step 2: Write failing journal, unmanaged-state, lock, and recovery tests**
@@ -2673,6 +4521,25 @@ def test_two_repository_syncs_serialize_on_one_descriptor_lock(tmp_path: Path) -
     assert all(item.status == "synced" for item in results)
     assert runner.maximum_concurrency == 1
 
+def test_same_uid_and_generation_with_distinct_ownership_do_not_collide(
+    tmp_path: Path,
+) -> None:
+    first, second = same_uid_same_generation_repositories(
+        tmp_path, build_epochs=(7, 9), git_oids=("a" * 40, "b" * 40)
+    )
+    user_root = tmp_path / "user"
+    first_result = registry_sync(
+        first, manifest_for(first), user_root=user_root,
+        runner=GlobalFixtureRunner(), graphify_binary=fixture_graphify(tmp_path),
+    )
+    second_result = registry_sync(
+        second, manifest_for(second), user_root=user_root,
+        runner=GlobalFixtureRunner(), graphify_binary=fixture_graphify(tmp_path),
+    )
+    assert first_result.generation_digest == second_result.generation_digest
+    assert first_result.snapshot_digest != second_result.snapshot_digest
+    assert registry_status(second, manifest_for(second), user_root=user_root).status == "current"
+
 def test_registry_projection_uses_registry_owned_global_add_contract(tmp_path: Path) -> None:
     repo = owned_registry_repository(tmp_path)
     runner = GlobalFixtureRunner()
@@ -2685,6 +4552,65 @@ def test_registry_projection_uses_registry_owned_global_add_contract(tmp_path: P
         "<graphify>", "global", "add", "<registry-graph>",
         "--as", "<registry-key>",
     )
+
+def test_registry_sync_rechecks_live_admission_after_multi_entry_projection(
+    tmp_path: Path,
+) -> None:
+    repo, other = two_owned_registry_repositories(tmp_path)
+    user_root = tmp_path / "user"
+    for initial in (repo, other):
+        registry_sync(
+            initial, manifest_for(initial), user_root=user_root,
+            runner=GlobalFixtureRunner(), graphify_binary=fixture_graphify(tmp_path),
+        )
+    before = tree_snapshot(user_root)
+    runner = MutatingGlobalFixtureRunner(
+        after_last_global_add=lambda: rewrite_safe_source(repo)
+    )
+    with pytest.raises(RegistryError) as raised:
+        registry_sync(
+            repo, manifest_for(repo), user_root=user_root, runner=runner,
+            graphify_binary=fixture_graphify(tmp_path),
+        )
+    assert raised.value.code == "registry_source_changed"
+    assert tree_snapshot(user_root) == before
+
+def test_unchanged_registry_rechecks_manifest_and_generation_before_return(
+    tmp_path: Path, registry_fault,
+) -> None:
+    repo = owned_registry_repository(tmp_path)
+    user_root = tmp_path / "user"
+    registry_sync(
+        repo, enabled_manifest(), user_root=user_root,
+        runner=GlobalFixtureRunner(), graphify_binary=fixture_graphify(tmp_path),
+    )
+    registry_fault.before_unchanged_return(
+        lambda: rewrite_and_restore_manifest_same_inode(repo)
+    )
+    with pytest.raises(ManifestError) as raised:
+        registry_sync(
+            repo, enabled_manifest(), user_root=user_root,
+            runner=GlobalFixtureRunner(), graphify_binary=fixture_graphify(tmp_path),
+        )
+    assert raised.value.kind == "changed"
+
+
+def test_registry_global_add_manifest_guard_is_inside_process_boundary(
+    tmp_path: Path,
+) -> None:
+    repo = owned_registry_repository(tmp_path)
+    runner = GlobalFixtureRunner()
+    install_process_boundary_test_fault(
+        "global-add",
+        before_manifest_callback=lambda: rewrite_and_restore_manifest_same_inode(repo),
+    )
+    with pytest.raises(ManifestError) as raised:
+        registry_sync(
+            repo, enabled_manifest(), user_root=tmp_path / "user",
+            runner=runner, graphify_binary=fixture_graphify(tmp_path),
+        )
+    assert raised.value.kind == "changed"
+    assert runner.calls == []
 
 def test_capture_and_query_registry_are_atomic_read_only_and_uid_ordered(
     tmp_path: Path,
@@ -2750,6 +4676,7 @@ REGISTRY_LOCK = "registry.lock"
 REGISTRY_JOURNAL = "registry-transaction.json"
 MAX_REGISTRY_SNAPSHOT_BYTES = 268_435_456
 GRAPHIFY_PROJECTION_DOMAIN = b"atlasweaver-graphify-projection-v1\0"
+REGISTRY_SNAPSHOT_DOMAIN = b"atlasweaver-registry-snapshot-v1\0"
 
 @dataclass(frozen=True)
 class RegistryError(Exception):
@@ -2764,6 +4691,9 @@ class RegistrySnapshotEntry:
     graphify_version: str
     adapter_id: str
     graph_digest: str
+    evidence_digest: str
+    generation_digest: str
+    snapshot_digest: str
     source_digest: str
     projection_digest: str
     graph_payload: bytes = field(repr=False)
@@ -2789,6 +4719,8 @@ class RegistrySyncResult:
     key: str
     generation: int
     graph_digest: str
+    generation_digest: str
+    snapshot_digest: str
 
 def registry_key(manifest: ProjectManifest) -> str:
     if manifest.schema_version != 2 or manifest.project_uid is None:
@@ -2815,19 +4747,87 @@ The canonical AtlasWeaver document is exact, duplicate-key-free JSON:
       "source_digest": "<64 hex>",
       "projection_digest": "<64 hex>",
       "graph_digest": "<64 hex>",
+      "evidence_digest": "<64 hex>",
+      "generation_digest": "<64 hex>",
       "build_epoch": 1,
+      "impact_trust": "navigation",
+      "impact_limitations": ["pre_dedup_edge_projection_unavailable"],
+      "ownership_sha256": "<64 hex>",
       "manifest_sha256": "<64 hex>",
-      "snapshot": "snapshots/4ed9af24-5aa2-4eac-8d0a-3f622cc74948/<graph digest>"
+      "snapshot_digest": "<64 hex>",
+      "snapshot": "snapshots/4ed9af24-5aa2-4eac-8d0a-3f622cc74948/<snapshot digest>"
     }
   }
 }
 ```
 
-`registry_status` is strictly read-only: if registry is disabled return immediately; if state is absent return missing; if a journal exists return mismatch plus `registry_recovery_required`; strict-load the registry and descriptor-hash both Graphify files; inspect current projection and owned graph. Return stale only for current-source/projection drift. Return mismatch for schema, UID, alias, ownership, digest, snapshot, generation, or Graphify projection disagreement. Return current only when every binding matches. It never opens a creating lock.
+`registry_status` is strictly read-only: it first opens a noncreating
+`RepositoryAccess`, checks the optional expected identity on that descriptor,
+calls `require_current_manifest()` on the supplied manifest, and uses it for the
+current projection and owned graph. If registry is disabled
+return immediately; if state is absent return missing. When managed state
+exists, open the already existing registry lock with `create=False, shared=True`
+before reading the journaled trio; contention returns `mismatch` plus
+`registry_busy` and creates nothing. Under that shared lock, a journal returns
+mismatch plus `registry_recovery_required`; strict-load the registry and
+descriptor-hash both Graphify files; inspect current projection and owned graph
+through the still-open repository access. Return stale only for current-source/
+projection drift. Return mismatch for schema, UID, alias, ownership, digest,
+snapshot, generation, or Graphify projection disagreement. Return current only
+when every binding matches. It never opens a creating lock, reopens the project
+pathname, or observes an in-flight half-generation.
+An expected-identity `TransactionLockError(kind="authority")` is not collapsed
+into `RegistryStatus`; it propagates path-free so fleet can emit
+`fleet_repository_changed`. The same rule applies before `registry_sync`
+acquires any user-global lock or launches Graphify.
+Both status and sync assert the pinned manifest binding immediately before any
+global lock/Graphify call and again before returning or committing their
+snapshot; drift is `manifest_changed`, not registry stale/current.
 
 - [ ] **Step 5: Implement sync, isolated official projection, and journal recovery**
 
-`registry_sync` requires manifest schema 2, `features.registry == "enabled"`, core health exactly healthy, source/projection current, and a validated owned graph. It takes the repository lifecycle lock, then opens the mode-0700 per-user AtlasWeaver root and a descriptor-relative `ExclusiveDescriptorLock`. Under that lock it recovers a valid prior journal, descriptor-copies the complete ownership-listed generation plus its ownership manifest into `snapshots/<uid>/<graph_digest>/owned/`, validates that completed private `owned/` copy with `validate_owned_graph`, builds the prospective canonical registry generation, then rebuilds both Graphify files from every sorted registry entry in an isolated mode-0700 temporary HOME. The registry entry points to the generation directory; the Graphify projector passes only `<snapshot>/owned/graph.json` to `render_graphify_global_add`.
+`registry_sync` requires manifest schema 2, `features.registry == "enabled"`,
+core health exactly healthy, source/projection current, and a validated owned
+graph. It takes the repository lifecycle lock with the optional expected
+identity, captures one `RepositoryAccess` from that live lease, and performs all
+project manifest equality/health/projection/graph/ownership capture through it;
+`require_current_manifest()` runs before any global lock or child; no path-
+taking project helper is called under the lock. It then opens the mode-0700
+per-user AtlasWeaver root and a descriptor-relative `ExclusiveDescriptorLock`.
+Under that lock it recovers a valid prior journal, descriptor-copies the
+complete ownership-listed generation plus its ownership manifest and canonical
+rendered manifest, and validates the completed private `owned/` copy with
+`validate_owned_graph`. It hashes the exact captured ownership and manifest
+bytes, then computes `snapshot_digest = sha256(REGISTRY_SNAPSHOT_DOMAIN +
+canonical_json({"generation_digest": ..., "ownership_sha256": ...,
+"manifest_sha256": ...}))`. The durable path is
+`snapshots/<uid>/<snapshot_digest>/owned/`, with `manifest.yaml` as its sibling.
+Thus two repositories with the same UID and non-ownership generation but
+different build epoch, Git ownership, or manifest bytes cannot collide;
+byte-identical snapshots are safely reusable. It then rebuilds both Graphify
+files from every sorted registry entry in an isolated mode-0700 temporary HOME.
+The registry entry binds all three component digests plus `snapshot_digest` and
+points to that snapshot directory; the Graphify projector passes only
+`<snapshot>/owned/graph.json` to `render_graphify_global_add`.
+
+At initial admission, retain one private `_RegistryProjectAdmission` binding the
+pinned manifest, the complete `ProjectionSnapshot` validator contract, and the
+descriptor-validated live graph/generation/evidence/build-epoch plus exact
+ownership bytes digest. After all sorted `global add` calls and isolated output
+validation, but immediately before the first `prepared` journal/canonical
+registry write, call `_require_registry_project_admission_current` through the
+same lifecycle `RepositoryAccess`: assert the manifest binding, recompute and
+compare the complete projection, revalidate live ownership with the admitted
+source/projection digests, and compare every retained generation/ownership
+field, then assert the manifest binding again as the final statement of the
+gate. Source/projection/ownership drift raises path-free
+`RegistryError("registry_source_changed", "project changed during registry sync")`
+and deletes only transaction-owned temporary/snapshot staging; the prior
+registry and Graphify projection remain byte-identical. The identical-entry
+fast path performs the same final check immediately before returning
+`unchanged`. This gate is the operation's linearization point: a later source
+mutation is a subsequent concurrent event and the next `registry_status`
+reports stale. No source check is deferred until after a committed mutation.
 
 The projector resolves one immutable executable before projection and obtains every official command only from the compatibility registry while holding the global lock:
 
@@ -2835,9 +4835,13 @@ The projector resolves one immutable executable before projection and obtains ev
 rendered = render_graphify_global_add(
     contract,
     binary=executable.path,
-    graph=private_snapshot,
+    graph=durable_snapshot_graph,
     registry_key=registry_key,
 )
+assert durable_snapshot_graph == (
+    committed_snapshot_root / "owned" / "graph.json"
+)
+assert Path(rendered.argv[3]) == durable_snapshot_graph
 run_graphify_operation(
     runner,
     executable,
@@ -2845,14 +4849,20 @@ run_graphify_operation(
     env={"HOME": str(isolated_home), "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PATH": os.defpath},
     timeout=60.0,
     operation=rendered.operation,
+    before_exec=lambda: assert_current_manifest_unchanged(
+        repo_root, manifest, repository_access=repository
+    ),
 )
 ```
 
-The same `executable` object is passed for every sorted registry entry; `run_graphify_operation()` no-follow revalidates it immediately before every `global add`. Add a multi-entry regression whose fake runner replaces the launcher after the first successful add: the second add must fail `graphify_executable_changed`, the journal recovery path preserves the prior committed registry generation, and no second runner call occurs.
+`durable_snapshot_graph` is the exact descriptor-validated, journal-bound
+`snapshots/<uid>/<snapshot_digest>/owned/graph.json` file that the prospective
+registry generation will commit; it is never the temporary validation copy or
+a directory. The same `executable` object is passed for every sorted registry entry; `run_graphify_operation()` no-follow revalidates it immediately before every `global add`. Add a multi-entry regression whose fake runner replaces the launcher after the first successful add: the second add must fail `graphify_executable_changed`, the journal recovery path preserves the prior committed registry generation, and no second runner call occurs.
 
 `render_graphify_global_add` is also the sole validator for the key. It admits only canonical lowercase RFC 9562 UUIDv4 keys matching `atlasweaver/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}` and rechecks `UUID(suffix).version == 4` plus `str(UUID(suffix)) == suffix`. The core never constructs a second Graphify command template and never forwards `--as` from user input.
 
-Capture the resulting isolated `.graphify/global-graph.json` and `global-manifest.json` descriptor-safely. Validate that the manifest has exactly all registry keys, each `source_path` is confined to the isolated private projection root, each 16-hex `source_hash` equals the corresponding full graph SHA-256 prefix, and the global graph contains only correctly prefixed `key::local-id` nodes plus explicitly merged external nodes allowed by 0.9.48. Do not import Graphify internals or use its live HOME as a build target.
+Capture the resulting isolated `.graphify/global-graph.json` and `global-manifest.json` descriptor-safely. The isolated HOME is only the projector's output target; every `global add` input is the durable journal-bound `snapshots/<uid>/<snapshot_digest>/owned/graph.json` that will remain after commit. Validate that the manifest has exactly all registry keys, each `source_path` equals that entry's exact durable snapshot graph path (not a disposable isolated-HOME path), each 16-hex `source_hash` equals the corresponding full graph SHA-256 prefix, and the global graph contains only correctly prefixed `key::local-id` nodes plus explicitly merged external nodes allowed by 0.9.48. Do not import Graphify internals or use its live HOME as a build target.
 
 The mode-0600 journal records transaction ID, phase, old/new SHA-256 and inode for the canonical registry, project snapshot directory and bound files, Graphify graph, and Graphify manifest, plus descriptor-confined backup/new names. Phase order is `prepared`, `snapshot_installed`, `atlas_registry_installed`, `graphify_graph_installed`, `graphify_manifest_installed`, `committed`. After every exclusive write/rename fsync the file and parent. Recovery rolls forward when all new hashes exist or restores all exact backups otherwise. An absent/corrupt journal never authorizes deletion. First sync refuses pre-existing Graphify global files unless the Atlas registry already binds their exact hashes; it never silently takes ownership of unmanaged state.
 
@@ -2860,7 +4870,7 @@ After commit, reread/rehash all three canonical files before returning `synced`;
 
 - [ ] **Step 6: Add atomic read-only fleet capture and bounded registry queries**
 
-Each immutable generation directory also contains canonical `render_manifest_v2(manifest)` bytes as sibling `manifest.yaml`; add `manifest_sha256` to its registry entry and bind that file in the transaction journal. This lets a later registry reader reconstruct the exact strict `ProjectManifest` needed by `validate_owned_graph` without consulting a live repository, while keeping configuration outside the validator's closed `owned/` artifact set. The projector still receives only `owned/graph.json`.
+Each immutable snapshot directory contains canonical `render_manifest_v2(manifest)` bytes as sibling `manifest.yaml`; bind `manifest_sha256`, `ownership_sha256`, and the domain-separated `snapshot_digest` in its registry entry and transaction journal. This lets a later registry reader reconstruct the exact strict `ProjectManifest` needed by `validate_owned_graph` without consulting a live repository, while keeping configuration outside the validator's closed `owned/` artifact set. The projector still receives only `owned/graph.json`.
 
 Implement `capture_registry_snapshot(project_uids: tuple[UUID, ...], *, require_graphify_projection: bool, user_root: Path | None = None) -> RegistrySnapshot` and the following exact query wrapper in `registry.py`, re-exporting `RegistryQueryRequest` imported from `queries.py`:
 
@@ -2875,6 +4885,7 @@ def query_registry(
             project_id=entry.project_id,
             graph_payload=entry.graph_payload,
             evidence_payload=entry.evidence_payload,
+            evidence_digest=entry.evidence_digest,
             contract=resolve_graphify_compatibility(entry.graphify_version),
             trust=entry.impact_trust,
             limitations=entry.impact_limitations,
@@ -2884,9 +4895,9 @@ def query_registry(
     return query_captured_graphs(graphs, request)
 ```
 
-Extend `ExclusiveDescriptorLock` with keyword-only `create: bool = True` and `shared: bool = False`. With `create=False`, open only an already-existing descriptor-relative regular file using `O_NOFOLLOW`, enforce the same owner/mode/inode checks, and never create or chmod it; with `shared=True`, use `LOCK_SH | LOCK_NB`. Capture opens the already-existing user root and registry lock with `create=False, shared=True`; absence is `registry_snapshot_missing`, timeout is `registry_snapshot_busy`, and it creates no path.
+Extend Task 2's existing `ExclusiveDescriptorLock(..., create=...)` with keyword-only `shared: bool = False`; with `shared=True`, use `LOCK_SH | LOCK_NB`. `create=False` continues to open only an already-existing descriptor-relative regular file using `O_NOFOLLOW`, enforce the same owner/mode/inode checks, and never create or chmod it. Status and capture open the already-existing user root and registry lock with `create=False, shared=True`; capture absence is `registry_snapshot_missing`, timeout is `registry_snapshot_busy`, and neither path creates state.
 
-Require `project_uids` to be a tuple of canonical UUIDv4 objects, non-empty and duplicate-free. Under the shared global lock, strict-read the committed registry and reject a journal/non-current generation. For each requested UID in caller order, locate exactly one entry, descriptor-copy its generation into a private mode-0700 temporary directory under the aggregate cap, parse its bound captured `manifest.yaml` bytes with `load_manifest_payload`, and call `validate_owned_graph(private_generation / "owned", manifest, expected_source_digest=entry.source_digest, expected_projection_digest=entry.projection_digest)`. Require artifact schema 2 and exact project UID, adapter, graph/evidence/source/projection/trust/limitations equality with the registry entry. Return graph and evidence bytes only after this validation and remove the private directory before returning; no live path or ownership payload enters `RegistrySnapshotEntry`.
+Require `project_uids` to be a tuple of canonical UUIDv4 objects, non-empty and duplicate-free. Under the shared global lock, strict-read the committed registry and reject a journal/non-current generation. For each requested UID in caller order, locate exactly one entry, descriptor-copy its snapshot into a private mode-0700 temporary directory under the aggregate cap, hash the captured ownership and manifest, recompute the domain-separated `snapshot_digest`, parse its bound captured `manifest.yaml` bytes with `load_manifest_payload`, and call `validate_owned_graph(private_snapshot / "owned", manifest, expected_source_digest=entry.source_digest, expected_projection_digest=entry.projection_digest)`. Require artifact schema 2 and exact project UID, adapter, graph/evidence/generation/source/projection/trust/limitations equality with the registry entry: `entry.evidence_digest == validated.evidence_digest` and independently `entry.generation_digest == validated.generation_digest`, with every other field compared to its corresponding validated field. Require the entry path component, `entry.snapshot_digest`, recomputed snapshot digest, `ownership_sha256`, and `manifest_sha256` all to agree. Evidence, generation, and snapshot digests are distinct domains and are never compared to each other. Return graph and evidence bytes plus those already validated digests only after this validation and remove the private directory before returning; no live path or ownership payload enters `RegistrySnapshotEntry`, and query code never derives its anchor by hashing returned bytes.
 
 Before and after all captures, reread and hash the registry and, when `require_graphify_projection=True`, both Graphify projection files from verified descriptors. Any inode/hash/generation drift is `registry_snapshot_stale` or `registry_snapshot_mismatch`; the function never retries across generations. Enforce 268,435,456 aggregate bytes before retaining payloads and return `registry_snapshot_too_large` without a partial snapshot. `registry_digest` is SHA-256 of the exact canonical registry bytes. `graphify_projection_digest` is `sha256(GRAPHIFY_PROJECTION_DOMAIN + canonical_json({"global_graph_sha256": ..., "global_manifest_sha256": ...}))`; when projection verification is not required, compute it from the committed registry hashes without opening the Graphify files.
 
@@ -2977,6 +4988,14 @@ def test_trusted_preflight_has_semantic_shape_but_no_token_argv() -> None:
         "--binary", "--executable",
     } & options
 
+def test_semantic_preflight_requires_public_model_before_token_or_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    repo = configured_v2_repository(tmp_path)
+    monkeypatch.setenv("ATLASWEAVER_BACKEND_TOKEN", "must-remain-unread")
+    result = invoke_cli(repo, capsys, "preflight", "--backend", "openai", "--json")
+    assert payload(result)["error"]["code"] == "semantic_model_required"
+
 def test_root_version_comes_from_installed_metadata(monkeypatch, capsys) -> None:
     monkeypatch.setattr(importlib.metadata, "version", lambda name: "9.8.7-test")
     with pytest.raises(SystemExit) as raised:
@@ -3014,6 +5033,7 @@ def test_doctor_and_refresh_use_high_level_stable_envelopes(
         "schema_version": 1, "command": "refresh", "status": "refreshed",
         "project_id": "demo", "source_digest": "a" * 64,
         "projection_digest": "b" * 64, "graph_digest": "c" * 64,
+        "generation_digest": "d" * 64,
         "build_epoch": 1, "core_status": "healthy", "trust": "navigation",
         "limitations": ["pre_dedup_edge_projection_unavailable"],
     }
@@ -3025,7 +5045,10 @@ def test_promoted_but_stale_is_emitted_and_returns_nonzero(
     monkeypatch.setattr("project_knowledge.cli.refresh_project", stale_refresh_fixture)
     result = invoke_cli(repo, capsys, "refresh", "--code-only", "--json")
     assert result.returncode == 3
-    assert payload(result)["status"] == "promoted_but_stale"
+    document = payload(result)
+    assert document["status"] == "promoted_but_stale"
+    assert document["generation_digest"] == "d" * 64
+    assert "build_epoch" in document
 
 def test_trusted_semantic_preflight_binds_generic_token_without_extraction_or_leak(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
@@ -3051,7 +5074,7 @@ def test_trusted_semantic_preflight_binds_generic_token_without_extraction_or_le
         "credential_bound": True,
     }
     assert runner.semantic_extractions == 0
-    assert all("ATLASWEAVER_BACKEND_TOKEN" not in env for env in runner.environments)
+    assert all("ATLASWEAVER_BACKEND_TOKEN" not in env for env in runner.all_environments)
     assert token not in result.stdout + result.stderr
 
 def test_preflight_without_backend_does_not_read_generic_token(
@@ -3069,6 +5092,25 @@ def test_preflight_without_backend_does_not_read_generic_token(
     result = invoke_cli(repo, capsys, "preflight", "--json")
     assert payload(result)["credential_bound"] is False
 
+
+@pytest.mark.parametrize("mutate_after_probe_child", range(1, 10))
+def test_preflight_rechecks_admitted_manifest_before_every_probe_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys,
+    mutate_after_probe_child: int,
+) -> None:
+    repo = configured_v2_repository(tmp_path)
+    runner = ManifestMutatingProbeRunner(
+        repo, rewrite_and_restore=True,
+        mutate_after_call=mutate_after_probe_child,
+    )
+    monkeypatch.setattr(
+        "project_knowledge.cli.SubprocessCommandRunner", lambda: runner
+    )
+    result = invoke_cli(repo, capsys, "preflight", "--json")
+    assert payload(result)["error"]["code"] == "manifest_changed"
+    assert len(runner.calls) == mutate_after_probe_child
+    assert not (repo / ".project-knowledge").exists()
+
 def test_semantic_preflight_requires_bound_credential_before_probe(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
 ) -> None:
@@ -3076,7 +5118,9 @@ def test_semantic_preflight_requires_bound_credential_before_probe(
     monkeypatch.delenv("ATLASWEAVER_BACKEND_TOKEN", raising=False)
     runner = CapabilityFixtureRunner()
     monkeypatch.setattr("project_knowledge.cli.SubprocessCommandRunner", lambda: runner)
-    result = invoke_cli(repo, capsys, "preflight", "--backend", "openai", "--json")
+    result = invoke_cli(
+        repo, capsys, "preflight", "--backend", "openai", "--model", "gpt-5", "--json"
+    )
     assert payload(result)["error"]["code"] == "semantic_backend_required"
     assert runner.calls == []
 
@@ -3092,7 +5136,9 @@ def test_refresh_maps_trusted_generic_token_but_local_refresh_keeps_normal_ambie
 
     monkeypatch.setenv("ATLASWEAVER_BACKEND_TOKEN", "trusted-generic-secret")
     monkeypatch.setenv("OPENAI_API_KEY", "unrelated-local-secret")
-    first = invoke_cli(repo, capsys, "refresh", "--backend", "openai", "--json")
+    first = invoke_cli(
+        repo, capsys, "refresh", "--backend", "openai", "--model", "gpt-5", "--json"
+    )
     assert first.returncode == 0
     assert captured[-1] is not None
     assert set(captured[-1]) == {
@@ -3102,11 +5148,51 @@ def test_refresh_maps_trusted_generic_token_but_local_refresh_keeps_normal_ambie
     assert "ATLASWEAVER_BACKEND_TOKEN" not in captured[-1]
 
     monkeypatch.delenv("ATLASWEAVER_BACKEND_TOKEN")
-    second = invoke_cli(repo, capsys, "refresh", "--backend", "openai", "--json")
+    second = invoke_cli(
+        repo, capsys, "refresh", "--backend", "openai", "--model", "gpt-5", "--json"
+    )
     assert second.returncode == 0
     assert captured[-1] is not None
     assert captured[-1]["OPENAI_API_KEY"] == "unrelated-local-secret"
     assert "ATLASWEAVER_BACKEND_TOKEN" not in captured[-1]
+
+@pytest.mark.parametrize(("arguments", "code"), [
+    (("--backend", "openai"), "semantic_model_required"),
+    (("--backend", "openai", "--model=--api-key"), "semantic_model_required"),
+    (("--backend", "openai", "--model", "bad\nmodel"), "semantic_model_required"),
+    (("--backend", "openai", "--model", "ghp_" + "a" * 32), "semantic_model_required"),
+    (("--model", "gpt-5"), "semantic_backend_required"),
+    (("--deep",), "semantic_backend_required"),
+])
+def test_refresh_rejects_semantic_shape_before_any_secret_lookup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys,
+    arguments: tuple[str, ...], code: str,
+) -> None:
+    repo = configured_v2_repository(tmp_path)
+    monkeypatch.setattr(
+        "project_knowledge.cli._read_secret_environment",
+        lambda name: pytest.fail(f"secret environment read before admission: {name}"),
+    )
+    monkeypatch.setattr(
+        "project_knowledge.cli.refresh_project",
+        lambda *args, **kwargs: pytest.fail("refresh called before option admission"),
+    )
+    result = invoke_cli(repo, capsys, "refresh", *arguments, "--json")
+    assert payload(result)["error"]["code"] == code
+
+def test_refresh_recovery_gate_precedes_secret_lookup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys,
+) -> None:
+    repo = configured_v2_repository(tmp_path)
+    seed_init_journal(repo, "recoverable")
+    monkeypatch.setattr(
+        "project_knowledge.cli._read_secret_environment",
+        lambda name: pytest.fail(f"secret environment read before recovery gate: {name}"),
+    )
+    result = invoke_cli(
+        repo, capsys, "refresh", "--backend", "openai", "--model", "gpt-5", "--json"
+    )
+    assert payload(result)["error"]["code"] == "init_recovery_required"
 ```
 
 - [ ] **Step 3: Write failing query, coverage, registry, and lock-routing contracts**
@@ -3157,6 +5243,87 @@ def test_legacy_graph_affecting_commands_enter_lifecycle_lock(
     result = invoke_cli(repo, capsys, command, *arguments, "--json")
     assert result.returncode == 0
     assert entered == [repo.absolute()]
+
+def test_legacy_lock_failure_is_normalized_without_exception_text(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    repo, arguments = configured_legacy_invocation(tmp_path, "promote")
+    monkeypatch.setattr(
+        "project_knowledge.cli.repository_lifecycle_lock",
+        failing_lock(TransactionLockError(
+            f"private path {repo} is busy", kind="busy"
+        )),
+    )
+    result = invoke_cli(repo, capsys, "promote", *arguments, "--json")
+    assert result.returncode == 1
+    assert payload(result)["error"] == {
+        "code": "lifecycle_lock_failed",
+        "message": "repository lifecycle lock failed",
+    }
+    assert str(repo) not in result.stdout + result.stderr
+
+def test_legacy_command_rechecks_journal_after_waiting_for_lifecycle_lock(
+    tmp_path: Path, monkeypatch, capsys,
+) -> None:
+    repo, arguments = configured_legacy_invocation(tmp_path, "promote")
+    live_before = tree_snapshot(repo / "graphify-out")
+    real_lock = repository_lifecycle_lock
+    monkeypatch.setattr(
+        "project_knowledge.cli.repository_lifecycle_lock",
+        lock_that_seeds_journal_before_yield(real_lock, repo, "recoverable"),
+    )
+    monkeypatch.setattr(
+        "project_knowledge.cli._dispatch",
+        lambda *args, **kwargs: pytest.fail("dispatched despite under-lock journal"),
+    )
+    result = invoke_cli(repo, capsys, "promote", *arguments, "--json")
+    assert payload(result)["error"]["code"] == "init_recovery_required"
+    assert tree_snapshot(repo / "graphify-out") == live_before
+
+def test_legacy_command_rebinds_manifest_after_waiting_for_lifecycle_lock(
+    tmp_path: Path, monkeypatch, capsys,
+) -> None:
+    repo, arguments = configured_legacy_invocation(tmp_path, "promote")
+    real_lock = repository_lifecycle_lock
+    monkeypatch.setattr(
+        "project_knowledge.cli.repository_lifecycle_lock",
+        lock_that_rewrites_manifest_before_yield(
+            real_lock, repo, graphify_version="0.9.49"
+        ),
+    )
+    monkeypatch.setattr(
+        "project_knowledge.cli._dispatch",
+        lambda *args, **kwargs: pytest.fail("dispatched with stale manifest"),
+    )
+    result = invoke_cli(repo, capsys, "promote", *arguments, "--json")
+    assert payload(result)["error"]["code"] == "manifest_changed"
+
+def test_unknown_query_error_code_cannot_escape_cli_envelope(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    repo = configured_v2_repository(tmp_path)
+    monkeypatch.setattr(
+        "project_knowledge.cli.open_query_snapshot",
+        raising_query_snapshot(QueryError("internal_path_" + str(repo), "unsafe")),
+    )
+    result = invoke_cli(repo, capsys, "query", "dispatch", "--json")
+    assert payload(result)["error"] == {
+        "code": "query_failed", "message": "graph query failed",
+    }
+    assert str(repo) not in result.stdout + result.stderr
+
+def test_low_level_schema2_validate_refuses_without_external_evidence_anchor(
+    tmp_path: Path, capsys
+) -> None:
+    repo, candidate = configured_schema2_candidate(tmp_path)
+    result = invoke_cli(
+        repo, capsys, "validate", "--candidate", str(candidate), "--json"
+    )
+    assert result.returncode == 1
+    assert payload(result)["error"] == {
+        "code": "evidence_anchor_required",
+        "message": "schema-2 validation requires a trusted evidence anchor",
+    }
 ```
 
 - [ ] **Step 4: Run tests and verify commands are absent**
@@ -3176,7 +5343,7 @@ class CliResponse:
     document: dict[str, object]
     exit_code: int = 0
 
-CONFIGURATION_COMMANDS = frozenset({"init", "manifest-migrate"})
+SELF_LOADING_COMMANDS = frozenset({"init", "manifest-migrate", "doctor"})
 LOCKED_LEGACY_COMMANDS = frozenset({
     "stage", "adapt", "validate", "promote",
     "atlas-prepare", "atlas-promote",
@@ -3189,15 +5356,49 @@ def main(argv: Sequence[str] | None = None) -> int:
         repo = _real_repo(arguments.repo)
         if arguments.command == "init":
             response = _init(arguments, repo)
+        elif arguments.command == "manifest-migrate":
+            response = _manifest_migrate(arguments, repo)
+        elif arguments.command == "doctor":
+            response = CliResponse(doctor_project(repo).to_dict())
         else:
-            manifest = _manifest(repo)
-            if arguments.command == "manifest-migrate":
-                response = _manifest_migrate(arguments, repo, manifest)
-            elif arguments.command in LOCKED_LEGACY_COMMANDS:
-                with repository_lifecycle_lock(repo):
-                    response = CliResponse(_dispatch(arguments, repo, manifest))
-            else:
-                response = _dispatch_response(arguments, repo, manifest)
+            with open_repository_access(repo) as admission_repository:
+                if inspect_init_journal(
+                    repo, repository_access=admission_repository
+                ) != "none":
+                    raise CliFailure(
+                        "init_recovery_required",
+                        "configuration recovery is required",
+                    )
+                manifest = _manifest(
+                    repo, repository_access=admission_repository
+                )
+                expected_identity = admission_repository.identity
+                if arguments.command in LOCKED_LEGACY_COMMANDS:
+                    with repository_lifecycle_lock(
+                        repo,
+                        expected_repository_identity=expected_identity,
+                    ), capture_lifecycle_repository(repo) as repository:
+                        if inspect_init_journal(
+                            repo, repository_access=repository
+                        ) != "none":
+                            raise CliFailure(
+                                "init_recovery_required",
+                                "configuration recovery is required",
+                            )
+                        manifest = require_current_manifest(
+                            repo, manifest,
+                            repository_access=repository,
+                        )
+                        response = CliResponse(_dispatch(
+                            arguments, repo, manifest,
+                            repository_access=repository,
+                        ))
+                else:
+                    response = _dispatch_response(
+                        arguments, repo, manifest,
+                        repository_access=admission_repository,
+                        expected_repository_identity=expected_identity,
+                    )
     except CliFailure as error:
         return _emit_error(arguments, error)
     except DOMAIN_ERROR_TYPES as error:
@@ -3206,7 +5407,31 @@ def main(argv: Sequence[str] | None = None) -> int:
     return response.exit_code
 ```
 
-`init` preview never loads a missing manifest or creates state; only its `--apply` path calls the transaction function, which owns the lifecycle lock. Migration, coverage apply, refresh, queries, and registry sync/status call library functions that own precisely scoped locks, so main must not nest a second repository lock around them. Read-only detect/preflight/scan-secrets/health/doctor remain unlocked; query snapshot briefly locks internally.
+`init` preview never loads a missing manifest or creates state; only its
+`--apply` path calls the transaction function, which owns the lifecycle lock.
+Migration is routed before generic manifest loading and its library preview/apply
+owns the journal gate plus strict v1 capture. Doctor is likewise self-loading
+so it can short-circuit recovery without probing. Every other manifest-using
+command passes the centralized read-only journal gate before `_manifest`.
+That gate, manifest capture, and initial dispatch admission share one
+noncreating `RepositoryAccess`. Its `(device, inode)` is passed as
+`expected_repository_identity` into every high-level boundary that must reopen
+or lock the root; locked legacy dispatch instead receives a
+lease-captured access and repeats the init-journal gate under that acquired
+lock before dispatch. A journal created while the command waited for the lock
+therefore blocks the legacy mutation. A pathname swap after main's admission cannot
+redirect a later read, mutation, Graphify child, registry capture, or credential-
+consuming operation.
+The coverage handler passes this exact `admission_repository` to
+`preview_coverage_approval`; it never calls the pathname wrapper after
+admission. If `--apply` is present, the resulting preview's captured identity
+is the mandatory `expected_repository_identity` used by its own lifecycle lock
+before state creation.
+Migration, coverage apply, refresh, queries, and registry sync/status call
+library functions that own precisely scoped locks, so main must not nest a
+second repository lock around them. Read-only detect/preflight/scan-secrets/
+health/doctor remain unlocked; query snapshot briefly takes only an existing
+noncreating lock internally.
 
 Add root `--version` using `importlib.metadata.version("atlasweaver")`. Remove the legacy public `preflight --graphify-binary` option and its dispatch plumbing; test injection uses only library keyword seams. Do not add a binary/executable override to refresh, preflight, doctor, registry, coverage, query, install, or fleet-facing commands.
 
@@ -3248,9 +5473,9 @@ def add_query_commands(sub) -> None:
 
 Handlers call the exact library APIs from Tasks 3, 5, 7–10. Query handlers use `with open_query_snapshot(...)` and then call the matching traversal. `refresh` constructs `RefreshOptions` from only its four admitted flags. `registry-sync` accepts no aliases or provider input. `_emit` must recognize query/doctor nested result structures without converting lists to Python repr in text mode; JSON stays canonical compact JSON.
 
-For trusted reusable-workflow/fleet preflight, reject `--model`/`--deep` without `--backend`. With a backend, read `ATLASWEAVER_BACKEND_TOKEN` exactly once, call `bind_semantic_backend_credential(contract, backend, token)`, remove the generic name, and validate semantic argv shape through `render_graphify_argv` without executing it. Then run only the official capability probe's private code-only smoke. Return backend/model/deep plus `credential_bound: bool`; never return the generic name, canonical credential name, value, rendered argv, path, or diagnostics. Without backend, do not access the generic variable or call the binder. Preflight creates no repository state or semantic stage.
+For trusted reusable-workflow/fleet preflight, reject `--model`/`--deep` without `--backend`, and reject `--backend` without an explicit valid `--model` as `semantic_model_required` before reading any credential or probing. With both, read `ATLASWEAVER_BACKEND_TOKEN` exactly once through the fixed-name `_read_secret_environment()` boundary, call `bind_semantic_backend_credential(contract, backend, token)`, remove the generic name, and validate semantic argv shape through `render_graphify_argv` without executing it. Then run only the official capability probe's private code-only smoke. The handler retains the dispatcher-supplied `admission_repository`, requires the pinned manifest through it, and calls `probe_graphify(..., before_exec=lambda: assert_current_manifest_unchanged(repo, manifest, repository_access=admission_repository))`; every probe child is therefore inside the same binding boundary, and `ManifestError(kind="changed")` maps to the closed `manifest_changed` CLI code. Return backend/model/deep plus `credential_bound: bool`; never return the generic name, canonical credential name, value, rendered argv, path, or diagnostics. Without backend, do not access the generic variable or call the binder. Preflight creates no repository state or semantic stage.
 
-The refresh CLI has a narrow trusted-boundary opt-in while preserving normal local behavior. With `--backend`, remove `ATLASWEAVER_BACKEND_TOKEN` from a private ambient copy. If its value is present, start from `minimal_environment()` (only `HOME`, `LANG`, `LC_ALL`, `PATH`), merge `bind_semantic_backend_credential(...)`'s one-key canonical mapping, and pass only that five-name mapping as `ambient` to `refresh_project`; no unrelated parent variable survives. If the generic value is absent, pass the ordinary ambient copy so local `OPENAI_API_KEY`/provider-specific use still follows `validate_semantic_backend` and `admitted_graphify_environment`. Without `--backend`, never look up the generic name and let `refresh_project` use its normal ambient path. Neither bridge changes argv or response schemas.
+The refresh CLI has a narrow trusted-boundary opt-in while preserving normal local behavior. It first runs the noncreating init-journal gate, validates backend/model pairing, and applies `validate_public_model_identifier`; missing, leading-flag, control-bearing, or secret-shaped models fail before `_read_secret_environment()`, ambient copying, binding, probing, or `refresh_project`. Only then, with `--backend`, remove `ATLASWEAVER_BACKEND_TOKEN` from a private ambient copy. Read that one fixed generic name exactly once through `_read_secret_environment()`. If its value is present, start from `minimal_environment()` (only `HOME`, `LANG`, `LC_ALL`, `PATH`), merge `bind_semantic_backend_credential(...)`'s one-key canonical mapping, and pass only that five-name mapping as `ambient` to `refresh_project`; no unrelated parent variable survives. If the generic value is absent, pass the ordinary ambient copy so local `OPENAI_API_KEY`/provider-specific use still follows `validate_semantic_backend` and `admitted_graphify_environment`. Without `--backend`, never look up the generic name and let `refresh_project` use its normal ambient path. Neither bridge changes argv or response schemas.
 
 - [ ] **Step 7: Map domain failures and retain evidence-aware low-level commands**
 
@@ -3267,14 +5492,32 @@ ERROR_CODES: tuple[tuple[type[BaseException], str, str], ...] = (
     (AdapterError, "adaptation_failed", "Graphify adaptation failed"),
     (ArtifactValidationError, "artifact_invalid", "graph artifact is invalid"),
     (GraphifyError, "graphify_contract_failed", "Graphify contract failed"),
+    (TransactionLockError, "lifecycle_lock_failed", "repository lifecycle lock failed"),
     (QueryError, "query_failed", "graph query failed"),
     (RegistryError, "registry_failed", "registry operation failed"),
 )
+
+MANIFEST_ERROR_CODES = {
+    "invalid": ("invalid_manifest", "project manifest is invalid"),
+    "changed": ("manifest_changed", "project manifest changed"),
+}
 ```
 
-For `RefreshError`, `QueryError`, and `RegistryError`, pass through only their documented stable `code`. For `CompatibilityError`, pass through only `semantic_backend_required`; use the table code for every other compatibility failure and every other mapped type. `promoted_but_stale` is a successful result envelope with exit code 3, not an error envelope. Argparse usage remains exit 2.
+For `ManifestError`, look up only its constructor-validated `kind` in
+`MANIFEST_ERROR_CODES`; never parse its message. For `RefreshError` and
+`RegistryError`, pass through only their executable documented-code allowlists.
+For `QueryError`, pass through only membership in Task 9's immutable
+`DOCUMENTED_QUERY_ERROR_CODES`; every unknown/forged code maps to table fallback
+`query_failed` with constant text. For `CompatibilityError`, pass through only
+`semantic_backend_required` and `semantic_model_required`; use the table code
+for every other compatibility failure and every other mapped type. No mapper
+serializes an arbitrary `.code` or `str(error)`. `promoted_but_stale` is a
+successful result envelope with exit code 3, not an error envelope. Its
+serializer omits `recovery_id` when null and permits a non-null value only with
+`cleanup_failed`; the ID must satisfy the fixed lowercase-hex recovery grammar
+and never contains a path. Argparse usage remains exit 2.
 
-Add `inspect_candidate_schema` as a strict, capped, descriptor-safe read of candidate `graph.json` returning only schema 1 or 2. Retained low-level validate/promote passes `build_epoch=None` for schema 1 and `_next_build_epoch(repo, manifest)` for schema 2, plus `expected_projection_digest` for schema 2. It never copies a candidate-provided epoch. Adapt without evidence remains schema 1/navigation. Refresh is the only public command that assembles evidence schema 2.
+Add `inspect_candidate_schema` as a strict, capped, descriptor-safe read of candidate `graph.json` returning only schema 1 or 2. Retained low-level validate/promote accepts schema 1 with `build_epoch=None` and no evidence anchor. Before calling `validate_candidate`, its CLI handler checks the returned schema and raises the closed `CliFailure("evidence_anchor_required", "schema-2 validation requires a trusted evidence anchor")` for schema 2. This code therefore does not depend on or pass through arbitrary `ArtifactValidationError` text/code. The CLI has no trusted descriptor from which to obtain `expected_evidence_digest`, and hashing candidate bytes would make the evidence self-authorizing. It never copies a candidate-provided epoch or digest. Adapt without evidence remains schema 1/navigation. Refresh is the only core public command that assembles evidence schema 2 in-process; artifact install/pull later supplies a descriptor-captured bundle digest through its library path.
 
 - [ ] **Step 8: Run the complete CLI and domain suites**
 
@@ -3388,7 +5631,7 @@ def test_real_semantic_refresh_without_backend_fails_before_extraction(tmp_path:
     assert result.returncode == 1
     assert json.loads(result.stdout)["error"]["code"] == "semantic_backend_required"
     assert not (repo / "graphify-out").exists()
-    assert not (repo / ".project-knowledge/runs").exists()
+    assert not (repo / ".project-knowledge").exists()
 ```
 
 - [ ] **Step 3: Run tests and verify current v1/docs/manual workflow fail**
@@ -3439,7 +5682,7 @@ project-knowledge health --repo /path/to/project --json
 project-knowledge query --repo /path/to/project "authentication" --json
 ```
 
-Document semantic refresh as `--backend <declared-backend> [--model <model>] [--deep]`, with credentials read only from the compatibility allowlist. Document init/migration preview versus apply, sensitive source scan versus sensitive data deny, exact coverage approval, health v2, navigation trust, post-promotion stale exit 3, registry opt-in/status/sync, and immutable query limits. Keep the manual stage/adapt/validate/promote sequence only under “low-level recovery”; state that it is not the ordinary refresh path.
+Document semantic refresh as `--backend <declared-backend> --model <public-model-id> [--deep]`, with credentials read only from the compatibility allowlist and no upstream default model. Document init/migration preview versus apply, sensitive source scan versus sensitive data deny, exact coverage approval, health v2, navigation trust, post-promotion stale exit 3, registry opt-in/status/sync, and immutable query limits. Keep the manual stage/adapt/validate/promote sequence only under “low-level recovery”; state that it is not the ordinary refresh path.
 
 Update the bundled skill to run `doctor` before substantive graph use, call `health`, use AtlasWeaver query commands rather than native opaque output, require source verification for navigation trust, and never refresh/register/publish/commit/push without exact authority. The workflow reference must include stable error-code handling and explain that disabled optional features do not make core health partial.
 
@@ -3447,7 +5690,15 @@ Add an `Unreleased` changelog section for manifest/privacy/health/lifecycle/quer
 
 - [ ] **Step 6: Keep CI on the inter-plan compatibility contract**
 
-Preserve the compatibility plan's full-SHA action pins and registry-derived Graphify version. Add mandatory focused invocations for `tests/test_real_graphify_pipeline.py`, `tests/test_cli_adoption.py`, and `tests/test_queries.py` to both Python 3.10/3.13 matrix jobs. Do not add tokens, semantic credentials, registry writes, artifact publication, or an unpinned `pip install`.
+Preserve, byte-for-byte where not intentionally extended, the compatibility
+plan's full-SHA action pins, scheduled upstream-probe workflow, report upload,
+and registry-derived Graphify version. README/CHANGELOG edits append the core
+lifecycle story without deleting Impact Task 8's registry/evidence/adapter
+contribution guidance. Add mandatory focused invocations for
+`tests/test_real_graphify_pipeline.py`, `tests/test_cli_adoption.py`, and
+`tests/test_queries.py` to both Python 3.10/3.13 matrix jobs. Do not add tokens,
+semantic credentials, registry writes, artifact publication, or an unpinned
+`pip install`.
 
 - [ ] **Step 7: Run public, skill, real Graphify, and CLI gates**
 

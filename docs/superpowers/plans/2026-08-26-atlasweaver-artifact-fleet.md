@@ -21,7 +21,7 @@
 - GitHub Release v1 supports only `github.com`, at most three HTTPS redirects, and only `api.github.com`, `github.com`, `objects.githubusercontent.com`, and `release-assets.githubusercontent.com`.
 - Authorization is sent only to `api.github.com` and is stripped before every cross-host redirect; ambient proxies, netrc, cookies, and redirect-auth state are ignored.
 - Publication is workflow-only: no local `publish` command is added.
-- The rolling tag is `atlasweaver-graph-<project-uid>-<channel>` and the asset is `atlasweaver-graph-<project-uid>-<source-digest>-<projection-digest>.zip` with full lowercase SHA-256 digests.
+- The rolling tag is `atlasweaver-graph-<project-uid>-<channel>` and the asset is `atlasweaver-graph-<project-uid>-<source-digest>-<projection-digest>-<bundle-sha256>.zip` with full lowercase SHA-256 digests. The archive component prevents bundles that differ only in Git/build/tool transport metadata from colliding; `artifact.json` independently binds the non-ownership generation digest.
 - A reusable publish runs only for a protected branch, exact manifest `source_ref`, exact clean `HEAD == github.sha`, and configured immutable `github.repository_id`.
 - The publish workflow retains the 20 most recent digest-addressed assets and deletes nothing until the new asset's remote size and digest have been verified.
 - Initial agent platforms are exactly `codex` and `agents`; hooks remain separate and ordinary package installation never installs them.
@@ -56,7 +56,10 @@ ProjectManifest.graphify_version: str
 ProjectManifest.track_html: bool
 ProjectManifest.artifacts: ArtifactIntent
 
-def load_manifest(path: Path, repo_root: Path) -> ProjectManifest: ...
+def load_manifest(
+    path: Path, repo_root: Path, *,
+    repository_access: RepositoryAccess | None = None,
+) -> ProjectManifest: ...
 def load_manifest_payload(payload: bytes, repo_root: Path) -> ProjectManifest: ...
 
 @dataclass(frozen=True)
@@ -81,16 +84,47 @@ class StagedInput:
     coverage_approvals: tuple[CoverageApproval, ...] = ()
     projection_files: tuple[ProjectionFile, ...] = ()
 
-def inspect_projection(repo_root: Path, manifest: ProjectManifest) -> ProjectionSnapshot: ...
-def stage_input(repo_root: Path, manifest: ProjectManifest, destination: Path) -> StagedInput: ...
+def inspect_projection(
+    repo_root: Path, manifest: ProjectManifest, *, repository_access: RepositoryAccess | None = None
+) -> ProjectionSnapshot: ...
+def stage_input(
+    repo_root: Path, manifest: ProjectManifest, destination: Path,
+    *, repository_access: RepositoryAccess | None = None,
+) -> StagedInput: ...
 ```
 
 `load_manifest_payload()` is an explicit amendment to Core Task 1 and must land in the same `manifest.py` commit: `load_manifest()` descriptor-captures/caps its file and delegates parsing to this byte-owned entry point. Fleet passes only bytes captured from the already opened repository descriptor, so no fleet code reopens a validated manifest pathname or reimplements strict YAML/schema validation.
 
 ```python
 # project_knowledge.locking / lifecycle / health / doctor
+RepositoryIdentity = tuple[int, int]
+
+@dataclass
+class RepositoryAccess(AbstractContextManager["RepositoryAccess"]):
+    descriptor: int
+    identity: RepositoryIdentity
+
+def open_repository_access(
+    repo_root: Path, *,
+    expected_repository_identity: RepositoryIdentity | None = None,
+) -> RepositoryAccess: ...
+def capture_lifecycle_repository(repo_root: Path) -> AbstractContextManager[RepositoryAccess]: ...
+def require_current_manifest(
+    repo_root: Path, supplied: ProjectManifest, *,
+    repository_access: RepositoryAccess,
+) -> ProjectManifest: ...
+def assert_current_manifest_unchanged(
+    repo_root: Path, manifest: ProjectManifest, *,
+    repository_access: RepositoryAccess,
+) -> None: ...
+def inspect_init_journal(
+    repo_root: Path, *,
+    repository_access: RepositoryAccess | None = None,
+    expected_repository_identity: RepositoryIdentity | None = None,
+) -> Literal["none", "recoverable", "corrupt"]: ...
 def repository_lifecycle_lock(
-    repo_root: Path, timeout: float = 5.0
+    repo_root: Path, timeout: float = 5.0, *, create: bool = True,
+    expected_repository_identity: RepositoryIdentity | None = None,
 ) -> RepositoryLifecycleLock: ...
 
 @dataclass(frozen=True)
@@ -109,6 +143,7 @@ def refresh_project(
     fs: RefreshFileSystem = REAL_REFRESH_FS,
     ambient: Mapping[str, str] | None = None,
     graphify_binary: Path | None = None,
+    expected_repository_identity: RepositoryIdentity | None = None,
 ) -> RefreshResult: ...
 def inspect_project_state(
     repo_root: Path,
@@ -117,14 +152,18 @@ def inspect_project_state(
     atlas: FeatureHealth | None = None,
     registry: FeatureHealth | None = None,
     artifacts: FeatureHealth | None = None,
+    repository_access: RepositoryAccess | None = None,
+    expected_repository_identity: RepositoryIdentity | None = None,
 ) -> KnowledgeState: ...
 def assess_health(state: KnowledgeState) -> KnowledgeHealth: ...
 def doctor_project(
     repo_root: Path,
     *,
-    graphify_binary: Path = Path("graphify"),
+    graphify_binary: Path | None = None,
     runner: CommandRunner | None = None,
     package_version: str | None = None,
+    expected_repository_identity: RepositoryIdentity | None = None,
+    expected_manifest: ProjectManifest | None = None,
 ) -> DoctorResult: ...
 ```
 
@@ -167,12 +206,14 @@ def bind_semantic_backend_credential(
     backend: str,
     credential: str | None,
 ) -> dict[str, str]: ...
+def validate_public_model_identifier(model: object) -> str: ...
 def validate_candidate(
     candidate_dir: Path,
     staged: StagedInput,
     manifest: ProjectManifest,
     *,
     expected_projection_digest: str | None = None,
+    expected_evidence_digest: str | None = None,
     build_epoch: int | None = None,
     git_identity: GitIdentity | None = None,
 ) -> ValidatedGraph: ...
@@ -182,11 +223,14 @@ def validate_owned_graph(
     *,
     expected_source_digest: str | None = None,
     expected_projection_digest: str | None = None,
+    repository_access: RepositoryAccess | None = None,
 ) -> ValidatedGraph: ...
 def promote_graph(
     candidate: ValidatedGraph,
     repo_root: Path,
     fs: FileSystem = REAL_FS,
+    *,
+    repository_access: RepositoryAccess | None = None,
 ) -> PromotionResult: ...
 ```
 
@@ -195,7 +239,8 @@ Task 1 owns private `CapturedGeneration`, `_capture_validated_generation()`, and
 ```python
 # project_knowledge.queries / registry
 def open_query_snapshot(
-    repo_root: Path, manifest: ProjectManifest
+    repo_root: Path, manifest: ProjectManifest, *,
+    expected_repository_identity: RepositoryIdentity | None = None,
 ) -> AbstractContextManager[QuerySnapshot]: ...
 def query_nodes(snapshot: QuerySnapshot, term: str, *, limit: int = 20) -> QueryEnvelope: ...
 def shortest_path(
@@ -210,7 +255,8 @@ def affected_nodes(
     relations: tuple[str, ...] = (),
 ) -> QueryEnvelope: ...
 def registry_status(
-    repo_root: Path, manifest: ProjectManifest, *, user_root: Path | None = None
+    repo_root: Path, manifest: ProjectManifest, *, user_root: Path | None = None,
+    expected_repository_identity: RepositoryIdentity | None = None,
 ) -> RegistryStatus: ...
 def registry_sync(
     repo_root: Path,
@@ -220,6 +266,7 @@ def registry_sync(
     runner: CommandRunner | None = None,
     graphify_binary: Path | None = None,
     fs=REAL_REGISTRY_FS,
+    expected_repository_identity: RepositoryIdentity | None = None,
 ) -> RegistrySyncResult: ...
 ```
 
@@ -234,6 +281,9 @@ class RegistrySnapshotEntry:
     graphify_version: str
     adapter_id: str
     graph_digest: str
+    evidence_digest: str
+    generation_digest: str
+    snapshot_digest: str
     source_digest: str
     projection_digest: str
     graph_payload: bytes = field(repr=False)
@@ -257,7 +307,7 @@ class RegistryQueryRequest:
     node: str | None = None
     limit: int = 20
     max_depth: int = 32
-    depth: int = 1
+    depth: int | None = None
     relations: tuple[str, ...] = ()
 
 def capture_registry_snapshot(
@@ -271,7 +321,12 @@ def query_registry(
 ) -> QueryEnvelope: ...
 ```
 
-The registry stores each complete generation as `snapshots/<uid>/<graph_digest>/owned/` with its canonical captured manifest at sibling `manifest.yaml`; the internal registry binds that manifest SHA-256 and the Graphify projector receives only `owned/graph.json`. `capture_registry_snapshot()` takes the existing shared global lock without creating state, descriptor-captures every selected snapshot, parses the captured manifest, revalidates `owned/`, validates the internal manifest digest and Graphify compatibility projection, discards ownership/manifest bytes, and returns exact caller UID order. The aggregate graph/evidence cap is 256 MiB. Stable failures are `registry_snapshot_missing`, `registry_snapshot_stale`, `registry_snapshot_mismatch`, `registry_snapshot_too_large`, or `registry_snapshot_busy`; returned payloads have no live paths and are `repr=False`.
+`query_registry` normalizes `depth=None` by command: explain uses 1 and
+affected uses 2, matching the single-repository APIs and CLI defaults. An
+explicit explain depth must be 1..2; an explicit affected depth must be 0..8;
+query/path reject any non-null depth before traversal.
+
+The registry stores each complete capture as `snapshots/<uid>/<snapshot_digest>/owned/` with its canonical captured manifest at sibling `manifest.yaml`. `snapshot_digest` is the Core-owned domain-separated hash of generation digest plus exact ownership and manifest SHA-256 values; the internal registry binds all components and the Graphify projector receives only `owned/graph.json`. `capture_registry_snapshot()` takes the existing shared global lock without creating state, descriptor-captures every selected snapshot, recomputes the snapshot identity, parses the captured manifest, revalidates `owned/`, validates the internal manifest digest and Graphify compatibility projection, discards ownership/manifest bytes, and returns exact caller UID order. The aggregate graph/evidence cap is 256 MiB. Stable failures are `registry_snapshot_missing`, `registry_snapshot_stale`, `registry_snapshot_mismatch`, `registry_snapshot_too_large`, or `registry_snapshot_busy`; returned payloads have no live paths and are `repr=False`.
 
 ## File map
 
@@ -315,13 +370,16 @@ The registry stores each complete generation as `snapshots/<uid>/<graph_digest>/
 
 **Interfaces:**
 - Consumes: exact `repository_lifecycle_lock`, `inspect_projection`, `resolve_graphify_compatibility`, `parse_graph_evidence`, and `validate_owned_graph` prerequisite signatures above.
-- Produces: `BundleError(code: str, message: str)`.
+- Produces: `BundleError(code: str, message: str, recovery_id: str | None = None)`; a recovery ID is constructor-validated lowercase hex and non-null only for private cleanup/output-recovery failures.
 - Produces: `PayloadDescriptor(path: PurePosixPath, sha256: str, byte_length: int)`.
 - Produces: `ArtifactManifest.from_bytes(payload: bytes) -> ArtifactManifest` and `ArtifactManifest.to_bytes() -> bytes`.
 - Produces: `PackRequest(repo_root: Path, output: Path)` and `PackedBundle(path: Path, sha256: str, byte_length: int, artifact: ArtifactManifest)`.
-- Produces: `pack_bundle(request: PackRequest) -> PackedBundle`.
+- Produces: `pack_bundle(request: PackRequest, *, expected_repository_identity: RepositoryIdentity | None = None, expected_manifest: ProjectManifest | None = None) -> PackedBundle`; both expectations are library-only. Identity is checked on the lifecycle root descriptor, and a supplied manifest is compared in full through the retained access before capture or output creation.
 - Produces private immutable `CapturedGeneration(manifest: ProjectManifest, validated: ValidatedGraph, payloads: tuple[CapturedPayload, ...])`, `_capture_validated_generation(validated: ValidatedGraph, manifest: ProjectManifest, destination: Path) -> CapturedGeneration`, and `_capture_owned_generation(repo_root: Path, manifest: ProjectManifest, projection: ProjectionSnapshot, destination: Path) -> CapturedGeneration`.
-- Produces private `_pack_captured_generation(generation: CapturedGeneration, output: Path, *, version_provider: Callable[[], str] = installed_atlasweaver_version) -> PackedBundle`, shared with the privileged workflow but never exported through CLI.
+- Produces private mutable `_PackCommitState(output_committed=False)`, allocated
+  by the outer pack/publication wrapper and never serialized, plus
+  `_pack_captured_generation(generation: CapturedGeneration, output: Path, *, commit_state: _PackCommitState, version_provider: Callable[[], str] = installed_atlasweaver_version, precommit_check: Callable[[], None] = _noop) -> PackedBundle`, shared with the privileged workflow but never exported through CLI. The helper requires a fresh false state and flips it immediately after the exclusive output link is durable, before temporary-name cleanup, checkpoints, or return. The callback runs after all private bytes are finalized and immediately before exclusive output publication; failure leaves the output absent.
+- Produces private `OperationTempCleanupError(operation: str, recovery_id: str)`, whose fields are closed and constructor-validated, plus injected `managed_operation_temp_root(operation: str, recovery_id: str, *, fs=REAL_OPERATION_TEMP_FS) -> ManagedOperationTempRoot(path, cleanup_failed)`. It creates one descriptor-bound mode-0700 system root and never raises a raw `TemporaryDirectory`/OS cleanup error. Nested `ExitStack` resources close before it. On normal body exit it catches/sanitizes cleanup `Exception` into `cleanup_failed`; callers inspect that flag only after leaving the context and apply their explicit pre/post-commit rule with the same opaque recovery ID. If an ordinary body `Exception` is already pending and cleanup also fails, the manager replaces it with `OperationTempCleanupError(operation, recovery_id) from None`, and the enclosing public operation maps that closed private error to its family-specific cleanup code. A pending non-ordinary `BaseException` is never suppressed or replaced even when cleanup fails. The CLI/workflow exposes no temp-root override.
 
 - [ ] **Step 1: Write failing canonical-schema and deterministic-byte tests**
 
@@ -338,6 +396,7 @@ def test_artifact_manifest_is_closed_canonical_and_does_not_self_hash(owned_repo
     assert artifact["project_uid"] == "4ed9af24-5aa2-4eac-8d0a-3f622cc74948"
     assert artifact["graphify_version"] == "0.9.48"
     assert artifact["adapter_id"] == "graphify-0.9.48"
+    assert artifact["generation_digest"] == first.artifact.generation_digest
     assert artifact["build_epoch"] == 1_777_777_777
     assert "artifact.json" not in {item["path"] for item in artifact["payloads"]}
     assert all(set(item) == {"byte_length", "path", "sha256"} for item in artifact["payloads"])
@@ -375,10 +434,10 @@ Use this closed top-level wire schema and fixed ZIP metadata:
 ARTIFACT_SCHEMA_VERSION = 1
 ZIP_EPOCH = (1980, 1, 1, 0, 0, 0)
 ALLOWED_PAYLOADS = (
-    PurePosixPath("graphify-out/graph.json"),
-    PurePosixPath("graphify-out/GRAPH_REPORT.md"),
     PurePosixPath("graphify-out/GRAPH_EVIDENCE.json"),
+    PurePosixPath("graphify-out/GRAPH_REPORT.md"),
     PurePosixPath("graphify-out/graph.html"),
+    PurePosixPath("graphify-out/graph.json"),
 )
 
 @dataclass(frozen=True)
@@ -392,6 +451,7 @@ class ArtifactManifest:
     source_digest: str
     projection_digest: str
     graph_digest: str
+    generation_digest: str
     git: GitIdentity | None
     build_epoch: int
     transport: LocalTransport | GithubTransport
@@ -413,20 +473,59 @@ def _zip_info(path: str) -> zipfile.ZipInfo:
     return info
 ```
 
-The canonical manifest dictionary has exactly these keys: `adapter_id`, `atlasweaver_version`, `build_epoch`, `git`, `graph_digest`, `graphify_version`, `payloads`, `project_id`, `project_uid`, `projection_digest`, `schema_version`, `source_digest`, and `transport`. `LocalTransport` serializes exactly `{"channel": null, "provider": "none"}`. `GithubTransport` serializes exactly `channel`, `host`, `provider`, `repository`, `repository_id`, and `source_ref`; signer settings remain trusted local configuration and are not copied into the bundle. Reject duplicate JSON keys, non-finite numbers, unknown keys, invalid UUID/digest/OID/version/channel/provider types, unordered or duplicate payload paths, and `graph.html` policy mismatches.
+The canonical manifest dictionary has exactly these keys: `adapter_id`, `atlasweaver_version`, `build_epoch`, `generation_digest`, `git`, `graph_digest`, `graphify_version`, `payloads`, `project_id`, `project_uid`, `projection_digest`, `schema_version`, `source_digest`, and `transport`. `generation_digest` must equal the prerequisite validator's domain-separated digest over the exact owned-root artifact descriptor set, so graph-identical report/evidence generations remain distinct. Bundle verification deterministically strips the single `graphify-out/` transport prefix before recomputing the same owned-root names; it does not define a second digest domain. `LocalTransport` serializes exactly `{"channel": null, "provider": "none"}`. `GithubTransport` serializes exactly `channel`, `host`, `provider`, `repository`, `repository_id`, and `source_ref`; signer settings remain trusted local configuration and are not copied into the bundle. Reject duplicate JSON keys, non-finite numbers, unknown keys, invalid UUID/digest/OID/version/channel/provider types, unordered or duplicate payload paths, and `graph.html` policy mismatches.
+
+`ALLOWED_PAYLOADS` above is already ascending by raw ASCII/UTF-8 path bytes;
+both writer and parser use that one tuple. ZIP entry order is exactly
+`artifact.json` followed by the present tuple entries in that order, and the
+manifest `payloads` array uses the identical order.
 
 `pack_bundle()` must:
 
-1. resolve the real repository/output parent without following symlinks, reject an output located beneath any safe include root, and refuse an existing output;
-2. take the lifecycle lock;
-3. call `inspect_projection`, validate the live owned generation against both current digests, descriptor-capture its ownership plus the closed approved artifacts into a mode-0700 temporary snapshot, validate the captured generation again, and call `inspect_projection` again;
-4. require before/owned/after source and projection digests to be identical;
-5. select evidence only from the immutable `CapturedGeneration.payloads` descriptor, read its descriptor-captured bytes, validate them through `parse_graph_evidence(payload, resolve_graphify_compatibility(manifest.graphify_version), expected_digest=evidence_capture.sha256)`, and require schema-v2 evidence even when trust is navigation; `evidence_capture.sha256` comes from the no-follow, double-digest generation capture, never from hashing caller bytes at the parser call site;
-6. release the lock only after the copied snapshot validates as one generation;
-7. call `_pack_captured_generation` to build exclusively from the snapshot, writing `artifact.json` first and approved payloads in `ALLOWED_PAYLOADS` order;
-8. fsync an exclusive mode-0600 sibling temporary, atomically `linkat` that inode to the absent destination (or use a capability-probed `renameat2(RENAME_NOREPLACE)` equivalent), fsync the parent, unlink the temporary name, fsync again, and return its SHA-256/length.
+1. open and retain the output-parent descriptor without following symlinks and refuse an existing output; pathname checks alone never authorize publication;
+2. take the lifecycle lock with the optional expected repository identity and capture one `RepositoryAccess` from its live lease;
+3. require `inspect_init_journal(..., repository_access=repository) == "none"` inside that lock before manifest/projection/capture work, otherwise fail `init_recovery_required` without producing output; when an expected manifest is supplied, call `require_current_manifest` for full semantic equality, otherwise descriptor-load and pin the manifest, then use descriptor identity/relative containment to reject an output located beneath any safe include root, beneath reserved `.git`, `.project-knowledge`, or `graphify-out` directories, or at the exact repository control/config names `.graphify-project.yaml`, `.graphifyignore`, `.graphify-secret-exceptions.yaml`, and `.atlasweaver-coverage.yaml` (whether currently present or absent);
+4. call `inspect_projection` through that same repository access, validate the live owned generation against both current digests, descriptor-capture its ownership plus the closed approved artifacts into a mode-0700 temporary snapshot, validate the captured generation again, and call `inspect_projection` again through the same access;
+5. require before/owned/after source and projection digests to be identical;
+6. recompute and require `CapturedGeneration.validated.generation_digest` over the immutable owned-root payload descriptors (before adding the transport prefix), then select evidence only from that descriptor, read its descriptor-captured bytes, validate them through `parse_graph_evidence(payload, resolve_graphify_compatibility(manifest.graphify_version), expected_digest=evidence_capture.sha256)`, and require schema-v2 evidence even when trust is navigation; `evidence_capture.sha256` comes from the no-follow, double-digest generation capture, never from hashing caller bytes at the parser call site;
+7. release the lock only after the copied snapshot validates as one generation;
+8. call `_pack_captured_generation` to build exclusively from the snapshot, writing `artifact.json` first and approved payloads in `ALLOWED_PAYLOADS` order;
+9. fsync an exclusive mode-0600 sibling temporary, atomically `linkat` that inode through the retained output-parent descriptor to the absent destination (or use a capability-probed `renameat2(RENAME_NOREPLACE)` equivalent), fsync the parent, set the caller-owned `_PackCommitState.output_committed` bit, invoke the injected post-link checkpoint, unlink the temporary name, fsync the parent again, and return its SHA-256/length. The first parent fsync is the commit boundary; the second durably records cleanup of the private sibling name.
+
+No pack step after lifecycle acquisition calls a repository pathname API.
+Journal, manifest, projection, ownership, and artifact reads all derive from the
+captured lease descriptor. If the root is renamed/replaced mid-capture, the
+bundle is built wholly from the original inode (and descriptor-bound output
+parent) or fails before publication; replacement bytes never enter the bundle.
 
 The output publication must never call clobbering `os.rename`/`os.replace`. If a failure occurs after the no-replace link, unlink the destination only when its descriptor-bound device/inode/size/SHA-256 still match this transaction; otherwise return `bundle_output_recovery_required` without deleting another process's path. Derive `atlasweaver_version` from `importlib.metadata.version("atlasweaver")`; tests may inject a private metadata-version provider, but `PackRequest`, CLI, manifest, and environment cannot override it. Do not read `time`, `SOURCE_DATE_EPOCH`, locale, ZIP comments, extra fields, live graph paths, or the invocation environment when constructing bytes.
+
+Generate one opaque recovery ID for pack and use the shared managed temp root;
+never return from inside an ordinary `TemporaryDirectory` context. A cleanup
+failure before the exclusive output link raises constant
+`bundle_cleanup_failed` and leaves output absent. A cleanup failure after the
+verified link/fsync raises `bundle_output_recovery_required`, preserves the
+exact committed output, includes only the recovery ID, and never reports a raw
+cleanup exception or deletes the committed inode. Operation state records this
+as output-recovery-required, not a successful pack.
+
+The implementation is an explicit state machine: initialize one
+`commit_state = _PackCommitState()` and `packed = None`, enter
+`managed_operation_temp_root("pack", recovery_id)`, construct the captured ZIP,
+pass that exact state to `_pack_captured_generation`, assign `packed`, and leave
+the context without returning. The helper—not its caller—sets the state at the
+durable no-replace-link boundary. Catch
+`OperationTempCleanupError` and every other ordinary `Exception` outside the
+context: if `commit_state.output_committed` is true, raise
+`BundleError("bundle_output_recovery_required", ..., recovery_id) from None`;
+otherwise cleanup failure maps to
+`BundleError("bundle_cleanup_failed", ..., recovery_id) from None` and the
+original precommit operation exception propagates when cleanup succeeded. After a
+normal body exit, `temporary.cleanup_failed and commit_state.output_committed` raises
+`bundle_output_recovery_required`; the same flag while uncommitted raises
+`bundle_cleanup_failed`. Only a non-null `packed` with no cleanup failure may be
+returned. This ordering is covered for both cleanup checkpoints and makes a raw
+cleanup exception impossible at the public boundary.
 
 - [ ] **Step 4: Run deterministic pack and legacy artifact regression tests**
 
@@ -453,6 +552,111 @@ def test_pack_source_drift_leaves_no_output(owned_repo, capture_fault):
     with pytest.raises(BundleError, match="bundle_source_drift"):
         pack_bundle(PackRequest(owned_repo.root, owned_repo.root / "drift.zip"))
     assert not (owned_repo.root / "drift.zip").exists()
+
+
+def test_pack_expected_manifest_change_precedes_capture_and_output(
+    owned_repo, tmp_path,
+) -> None:
+    with open_repository_access(owned_repo.root) as repository:
+        expected_identity = repository.identity
+        expected_manifest = load_manifest(
+            owned_repo.root / ".graphify-project.yaml", owned_repo.root,
+            repository_access=repository,
+        )
+    rewrite_manifest_semantically(
+        owned_repo.root,
+        project_id=expected_manifest.project_id,
+        project_uid=expected_manifest.project_uid,
+        privacy=privacy_with_extra_include("private"),
+        output="alternate-output",
+    )
+    output = tmp_path / "bundle.zip"
+    with pytest.raises(ManifestError) as raised:
+        pack_bundle(
+            PackRequest(owned_repo.root, output),
+            expected_repository_identity=expected_identity,
+            expected_manifest=expected_manifest,
+        )
+    assert raised.value.kind == "changed"
+    assert not output.exists()
+
+@pytest.mark.parametrize("committed", [False, True])
+def test_pack_cleanup_failure_has_stable_pre_or_post_output_semantics(
+    owned_repo, operation_temp_fault, committed,
+) -> None:
+    output = owned_repo.root.parent / "bundle.zip"
+    operation_temp_fault.fail_cleanup(
+        "pack", after_output_publication=committed
+    )
+    with pytest.raises(BundleError) as raised:
+        pack_bundle(PackRequest(owned_repo.root, output))
+    assert raised.value.code == (
+        "bundle_output_recovery_required" if committed else "bundle_cleanup_failed"
+    )
+    assert raised.value.recovery_id is not None
+    assert output.exists() is committed
+    if committed:
+        assert inspect_bundle_manifest(output).project_uid == str(
+            current_manifest(owned_repo.root).project_uid
+        )
+
+
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_pack_ordinary_failure_after_output_commit_is_output_recovery(
+    owned_repo, pack_fault, operation_temp_fault, cleanup_fails,
+) -> None:
+    output = owned_repo.root.parent / "bundle.zip"
+    pack_fault.after_durable_output_link(
+        lambda: (_ for _ in ()).throw(RuntimeError("private"))
+    )
+    if cleanup_fails:
+        operation_temp_fault.fail_cleanup("pack")
+    with pytest.raises(BundleError) as raised:
+        pack_bundle(PackRequest(owned_repo.root, output))
+    assert raised.value.code == "bundle_output_recovery_required"
+    assert raised.value.recovery_id is not None
+    assert inspect_bundle_manifest(output).project_uid == str(
+        current_manifest(owned_repo.root).project_uid
+    )
+
+@pytest.mark.parametrize("relative_output", [
+    "graphify-out/bundle.zip",
+    ".project-knowledge/bundle.zip",
+    ".git/objects/bundle.zip",
+    ".graphify-secret-exceptions.yaml",
+    ".atlasweaver-coverage.yaml",
+])
+def test_pack_rejects_reserved_repository_destinations_without_graph_damage(
+    owned_repo, relative_output: str,
+) -> None:
+    before = tree_snapshot(owned_repo.root / "graphify-out")
+    before_health = assess_health(inspect_project_state(
+        owned_repo.root, current_manifest(owned_repo.root)
+    ))
+    with pytest.raises(BundleError, match="bundle_output_in_source"):
+        pack_bundle(PackRequest(
+            owned_repo.root, owned_repo.root / relative_output
+        ))
+    assert tree_snapshot(owned_repo.root / "graphify-out") == before
+    assert assess_health(inspect_project_state(
+        owned_repo.root, current_manifest(owned_repo.root)
+    )) == before_health
+
+def test_pack_root_replacement_after_lock_captures_only_original(
+    owned_repo, capture_fault, tmp_path,
+) -> None:
+    original = tmp_path / "original"
+    replacement = owned_repo.root
+    capture_fault.after_lock(
+        lambda: replace_repository_root(
+            replacement, original, attacker_owned_repository(tmp_path)
+        )
+    )
+    output = tmp_path / "packed.zip"
+    packed = pack_bundle(PackRequest(replacement, output))
+    assert validate_test_bundle(packed.path).artifact.graph_digest == owned_repo.graph_digest
+    assert not (replacement / ".project-knowledge").exists()
+    assert not (replacement / "graph.zip").exists()
 
 
 @pytest.mark.parametrize("mutation", ["rewrite_same_inode", "truncate_same_inode"])
@@ -502,8 +706,8 @@ git commit -m "feat: add deterministic graph bundle packing"
 - Consumes: `ArtifactManifest.from_bytes()` and `ALLOWED_PAYLOADS` from Task 1.
 - Produces: `ArchiveLimits(total_bytes=268_435_456, payload_bytes=267_386_880, entry_bytes=134_217_728)`.
 - Produces: `PayloadBinding(path: PurePosixPath, candidate_name: str, sha256: str, byte_length: int, device: int, inode: int)`.
-- Produces: `ParsedBundle(root: Path, artifact: ArtifactManifest, payloads: tuple[PayloadBinding, ...], archive_sha256: str, archive_size: int)` with `read_payload(path: PurePosixPath, max_bytes: int) -> bytes` that reopens through the bound directory descriptor and revalidates inode/digest/length.
-- Produces: `parse_bundle(bundle: Path, destination: Path) -> ParsedBundle`.
+- Produces: `ParsedBundle(AbstractContextManager["ParsedBundle"], root: Path, artifact: ArtifactManifest, payloads: tuple[PayloadBinding, ...], archive_sha256: str, archive_size: int)` owning a private bound destination-directory descriptor (excluded from repr), with idempotent `close()` and `read_payload(path: PurePosixPath, max_bytes: int) -> bytes` that opens through that retained descriptor and revalidates inode/digest/length. Reads after close fail with constant `bundle_invalid`; `__exit__` always closes the descriptor before any enclosing temporary directory is cleaned.
+- Produces: `parse_bundle(bundle: Path, destination: Path) -> ParsedBundle`; every successful caller must use `with parse_bundle(...) as parsed:`.
 - Produces: `inspect_bundle_manifest(bundle: Path) -> ArtifactManifest`, which validates archive structure and reads only bounded `artifact.json`.
 
 For every later evidence parse, `expected_digest` is the matched `PayloadBinding.sha256`. `parse_bundle()` obtains that value from the closed `artifact.json` payload descriptor and verifies it against the captured archive bytes before returning; `read_payload()` revalidates the same binding. Consumers must not hash the bytes returned by `read_payload()` and use that self-derived value as an authority.
@@ -528,11 +732,13 @@ def test_parser_rejects_malformed_archive_without_extracting(tmp_path, valid_bun
 
 
 def test_parser_maps_only_approved_graph_files_to_root_candidate(tmp_path, valid_bundle):
-    parsed = parse_bundle(valid_bundle, tmp_path / "private")
-    assert sorted(path.name for path in parsed.root.iterdir()) == [
-        "GRAPH_EVIDENCE.json", "GRAPH_REPORT.md", "graph.json"
-    ]
-    assert all(path.stat().st_mode & 0o777 == 0o600 for path in parsed.root.iterdir())
+    with parse_bundle(valid_bundle, tmp_path / "private") as parsed:
+        assert sorted(path.name for path in parsed.root.iterdir()) == [
+            "GRAPH_EVIDENCE.json", "GRAPH_REPORT.md", "graph.json"
+        ]
+        assert all(path.stat().st_mode & 0o777 == 0o600 for path in parsed.root.iterdir())
+    with pytest.raises(BundleError, match="bundle_invalid"):
+        parsed.read_payload(PurePosixPath("graphify-out/graph.json"), 1024)
 
 
 @pytest.mark.parametrize("mutation", ["rewrite_same_inode", "truncate_same_inode"])
@@ -600,9 +806,12 @@ git commit -m "feat: validate graph bundles byte by byte"
 
 **Interfaces:**
 - Consumes: `parse_bundle`, Core projection/validator/promotion APIs, compatibility evidence validation, and the sole evidence cap `project_knowledge.evidence.GRAPH_EVIDENCE_MAX_BYTES`.
-- Produces: `InstallResult(project_id: str, project_uid: str, graph_digest: str, changed: bool, status: Literal["installed", "already_current", "promoted_but_stale"])`.
-- Produces: `install_local_bundle(repo_root: Path, bundle: Path) -> InstallResult`.
-- Produces privately for Task 6: `_install_verified_pull(repo_root: Path, bundle: Path, authorization: _PullAuthorization) -> InstallResult`; `_PullAuthorization` cannot be accepted by any public CLI/parser API.
+- Produces: `InstallResult(project_id: str, project_uid: str, graph_digest: str | None, generation_digest: str | None, build_epoch: int | None, changed: bool | None, status: Literal["installed", "already_current", "promoted_but_stale"], recovery_id: str | None = None)`; installed/already-current require complete descriptor-revalidated identity and null recovery ID, while committed-but-unverifiable uses `None` for all identity fields and `changed`. A non-null opaque recovery ID is allowed only for committed cleanup failure.
+- Produces privately: `_InstallExecution(result: InstallResult, promotion_committed: bool)`. Cleanup and pull orchestration branch only on this explicit commit marker, never infer commit state from a public status or nullable identity field.
+- Produces privately mutable `_InstallCommitState(promotion_committed=False, project_id=None, project_uid=None, installed=None)`, owned by the wrapper and never serialized. `_postcommit_install_execution(state, recovery_id=None)` constructs stale output from only descriptor-validated `state.installed`, otherwise an all-null identity.
+- Produces privately: `_install_bundle_scoped(..., recovery_id: str) -> _InstallExecution`; `_install_bundle` is the sole wrapper that generates/retains the ID and normalizes `OperationTempCleanupError`.
+- Produces: `install_local_bundle(repo_root: Path, bundle: Path, *, expected_repository_identity: RepositoryIdentity | None = None, expected_manifest: ProjectManifest | None = None) -> InstallResult`.
+- Produces privately for Task 6: `_install_verified_pull_execution(repo_root: Path, bundle: Path, authorization: _PullAuthorization, *, expected_repository_identity: RepositoryIdentity | None = None, expected_manifest: ProjectManifest | None = None, recovery_id: str | None = None) -> _InstallExecution`; the test-facing compatibility wrapper `_install_verified_pull(...) -> InstallResult` returns only `.result`. `_PullAuthorization`, the execution marker, and the shared operation recovery ID cannot be accepted by any public CLI/parser API.
 
 - [ ] **Step 1: Write failing end-to-end local install identity tests**
 
@@ -612,6 +821,8 @@ def test_local_bundle_installs_through_candidate_validator_and_promotion(source_
     result = install_local_bundle(clean_clone, bundle.path)
     assert result.status == "installed"
     assert result.project_uid == "4ed9af24-5aa2-4eac-8d0a-3f622cc74948"
+    assert result.generation_digest == bundle.artifact.generation_digest
+    assert result.build_epoch == bundle.artifact.build_epoch
     ownership = load_owned_generation(clean_clone / "graphify-out")
     assert ownership.build_epoch == 1_777_777_777
     assert ownership.source_digest == bundle.artifact.source_digest
@@ -620,7 +831,7 @@ def test_local_bundle_installs_through_candidate_validator_and_promotion(source_
 
 @pytest.mark.parametrize("field", [
     "project_id", "project_uid", "graphify_version", "adapter_id",
-    "source_digest", "projection_digest", "graph_digest", "build_epoch",
+    "source_digest", "projection_digest", "graph_digest", "generation_digest", "build_epoch",
 ])
 def test_install_rejects_every_identity_mismatch_without_touching_live_graph(clean_clone, forged_bundle, field):
     before = tree_snapshot(clean_clone / "graphify-out")
@@ -632,6 +843,72 @@ def test_install_rejects_every_identity_mismatch_without_touching_live_graph(cle
 def test_public_install_rejects_github_bundle_even_with_copied_receipt(clean_clone, github_bundle):
     with pytest.raises(BundleError, match="bundle_pull_required"):
         install_local_bundle(clean_clone, github_bundle)
+
+
+def test_post_promotion_manifest_rewrite_returns_stale_verified_identity(
+    clean_clone, valid_bundle, install_fault,
+) -> None:
+    install_fault.after_promotion(
+        lambda: rewrite_and_restore_manifest_same_inode(clean_clone)
+    )
+    result = install_local_bundle(clean_clone, valid_bundle)
+    owned = validate_owned_graph(clean_clone / "graphify-out", current_manifest(clean_clone))
+    assert result.status == "promoted_but_stale"
+    assert (result.graph_digest, result.generation_digest, result.build_epoch) == (
+        owned.graph_digest, owned.generation_digest, owned.build_epoch,
+    )
+
+
+def test_install_cleanup_failure_after_changed_promotion_returns_recovery_id(
+    clean_clone, valid_bundle, operation_temp_fault,
+) -> None:
+    operation_temp_fault.fail_cleanup("install")
+    result = install_local_bundle(clean_clone, valid_bundle)
+    assert result.status == "promoted_but_stale"
+    assert result.recovery_id is not None
+    assert validate_owned_graph(
+        clean_clone / "graphify-out", current_manifest(clean_clone)
+    ).generation_digest == result.generation_digest
+
+
+def test_install_cleanup_failure_without_new_promotion_is_closed_error(
+    clean_clone, valid_bundle, operation_temp_fault,
+) -> None:
+    installed = install_local_bundle(clean_clone, valid_bundle)
+    operation_temp_fault.fail_cleanup("install")
+    with pytest.raises(BundleError) as raised:
+        install_local_bundle(clean_clone, valid_bundle)
+    assert raised.value.code == "bundle_cleanup_failed"
+    assert raised.value.recovery_id is not None
+    assert validate_owned_graph(
+        clean_clone / "graphify-out", current_manifest(clean_clone)
+    ).generation_digest == installed.generation_digest
+
+
+def test_install_ordinary_revalidation_failure_after_commit_is_stale_not_error(
+    clean_clone, valid_bundle, install_fault,
+) -> None:
+    install_fault.raise_during_postcommit_revalidation(RuntimeError("private"))
+    result = install_local_bundle(clean_clone, valid_bundle)
+    assert result.status == "promoted_but_stale"
+    assert (
+        result.graph_digest, result.generation_digest,
+        result.build_epoch, result.changed,
+    ) == (None, None, None, None)
+
+
+def test_install_postcommit_exception_plus_cleanup_failure_keeps_commit_recovery(
+    clean_clone, valid_bundle, install_fault, operation_temp_fault,
+) -> None:
+    install_fault.raise_during_postcommit_revalidation(RuntimeError("private"))
+    operation_temp_fault.fail_cleanup("install")
+    result = install_local_bundle(clean_clone, valid_bundle)
+    assert result.status == "promoted_but_stale"
+    assert result.recovery_id is not None
+    assert (
+        result.graph_digest, result.generation_digest,
+        result.build_epoch, result.changed,
+    ) == (None, None, None, None)
 ```
 
 - [ ] **Step 2: Run and observe the missing install API**
@@ -643,17 +920,98 @@ Expected: import/collection fails for `install_local_bundle`.
 - [ ] **Step 3: Implement validation and promotion under one lifecycle boundary**
 
 ```python
-def install_local_bundle(repo_root: Path, bundle: Path) -> InstallResult:
-    return _install_bundle(repo_root, bundle, authorization=None)
+def install_local_bundle(
+    repo_root: Path,
+    bundle: Path,
+    *,
+    expected_repository_identity: RepositoryIdentity | None = None,
+    expected_manifest: ProjectManifest | None = None,
+) -> InstallResult:
+    return _install_bundle(
+        repo_root, bundle, authorization=None,
+        expected_repository_identity=expected_repository_identity,
+        expected_manifest=expected_manifest,
+    ).result
 
 
-def _install_bundle(repo_root: Path, bundle: Path, authorization: _PullAuthorization | None) -> InstallResult:
-    manifest = load_manifest(repo_root / ".graphify-project.yaml", repo_root)
-    with repository_lifecycle_lock(repo_root):
-        with TemporaryDirectory(prefix="atlasweaver-install-") as temporary:
-            private = Path(temporary)
-            before = stage_input(repo_root, manifest, private / "source-before")
-            parsed = parse_bundle(bundle, private / "candidate")
+def _install_bundle(
+    repo_root: Path,
+    bundle: Path,
+    authorization: _PullAuthorization | None,
+    *,
+    expected_repository_identity: RepositoryIdentity | None = None,
+    expected_manifest: ProjectManifest | None = None,
+    recovery_id: str | None = None,
+) -> _InstallExecution:
+    recovery_id = recovery_id or secrets.token_hex(16)
+    commit_state = _InstallCommitState()
+    try:
+        return _install_bundle_scoped(
+            repo_root, bundle, authorization,
+            expected_repository_identity=expected_repository_identity,
+            expected_manifest=expected_manifest,
+            recovery_id=recovery_id,
+            commit_state=commit_state,
+        )
+    except OperationTempCleanupError:
+        if commit_state.promotion_committed:
+            return _postcommit_install_execution(
+                commit_state, recovery_id=recovery_id
+            )
+        raise BundleError(
+            "bundle_cleanup_failed", "private install cleanup failed",
+            recovery_id,
+        ) from None
+    except Exception:
+        if commit_state.promotion_committed:
+            return _postcommit_install_execution(commit_state)
+        raise
+
+
+def _install_bundle_scoped(
+    repo_root: Path,
+    bundle: Path,
+    authorization: _PullAuthorization | None,
+    *,
+    expected_repository_identity: RepositoryIdentity | None,
+    expected_manifest: ProjectManifest | None,
+    recovery_id: str,
+    commit_state: _InstallCommitState,
+) -> _InstallExecution:
+    with repository_lifecycle_lock(
+        repo_root,
+        expected_repository_identity=expected_repository_identity,
+    ), capture_lifecycle_repository(repo_root) as repository:
+        if inspect_init_journal(
+            repo_root, repository_access=repository
+        ) != "none":
+            raise BundleError(
+                "init_recovery_required", "configuration recovery is required"
+            )
+        if expected_manifest is None:
+            manifest = load_manifest(
+                repo_root / ".graphify-project.yaml", repo_root,
+                repository_access=repository,
+            )
+            manifest = require_current_manifest(
+                repo_root, manifest, repository_access=repository
+            )
+        else:
+            manifest = require_current_manifest(
+                repo_root, expected_manifest,
+                repository_access=repository,
+            )
+        with managed_operation_temp_root(
+            "install", recovery_id
+        ) as temporary, ExitStack() as parsed_scope:
+            private = temporary.path
+            before = stage_input(
+                repo_root, manifest, private / "source-before",
+                repository_access=repository,
+            )
+            parsed = parsed_scope.enter_context(
+                parse_bundle(bundle, private / "candidate")
+            )
             _require_transport_authority(parsed, manifest, authorization)
             _require_project_snapshot_identity(parsed.artifact, manifest, before)
             compatibility = resolve_graphify_compatibility(manifest.graphify_version)
@@ -672,37 +1030,143 @@ def _install_bundle(repo_root: Path, bundle: Path, authorization: _PullAuthoriza
             validated = validate_candidate(
                 parsed.root, before, manifest,
                 expected_projection_digest=before.projection_digest,
+                expected_evidence_digest=evidence_binding.sha256,
                 build_epoch=parsed.artifact.build_epoch,
                 git_identity=parsed.artifact.git,
             )
             immediately_before = stage_input(
-                repo_root, manifest, private / "source-immediately-before"
+                repo_root, manifest, private / "source-immediately-before",
+                repository_access=repository,
             )
             _require_same_validation_projection(before, immediately_before)
-            promoted = promote_graph(validated, repo_root)
+            assert_current_manifest_unchanged(
+                repo_root, manifest, repository_access=repository
+            )
+            promoted = promote_graph(
+                validated, repo_root, repository_access=repository
+            )
+            promotion_committed = promoted.changed is True
+            if promotion_committed:
+                commit_state.promotion_committed = True
+                commit_state.project_id = manifest.project_id
+                commit_state.project_uid = str(manifest.project_uid)
+            installed = _revalidate_installed_generation(
+                repo_root, manifest,
+                repository_access=repository,
+            )
+            if promotion_committed and installed is not None:
+                commit_state.installed = installed
+            installed_identity_matches = (
+                installed is not None
+                and promoted.digest == installed.graph_digest
+                and promoted.generation_digest == installed.generation_digest
+                and promoted.build_epoch == installed.build_epoch
+                and installed.graph_digest == validated.graph_digest
+                and installed.generation_digest == validated.generation_digest
+                and (
+                    not promoted.changed
+                    or installed.build_epoch == validated.build_epoch
+                )
+            )
             try:
-                after = stage_input(repo_root, manifest, private / "source-after")
-                current = _same_validation_projection(before, after)
-            except StagingError:
+                after = stage_input(
+                    repo_root, manifest, private / "source-after",
+                    repository_access=repository,
+                )
+                assert_current_manifest_unchanged(
+                    repo_root, manifest, repository_access=repository
+                )
+                current = (
+                    installed_identity_matches
+                    and _same_validation_projection(before, after)
+                )
+            except (StagingError, ManifestError):
                 current = False
             if not current:
-                return InstallResult(
+                result = InstallResult(
                     project_id=manifest.project_id,
                     project_uid=str(manifest.project_uid),
-                    graph_digest=validated.graph_digest,
-                    changed=promoted.changed,
+                    graph_digest=(None if installed is None else installed.graph_digest),
+                    generation_digest=(
+                        None if installed is None else installed.generation_digest
+                    ),
+                    build_epoch=(None if installed is None else installed.build_epoch),
+                    changed=(promoted.changed if installed_identity_matches else None),
                     status="promoted_but_stale",
                 )
-            return InstallResult(
-                project_id=manifest.project_id,
-                project_uid=str(manifest.project_uid),
-                graph_digest=validated.graph_digest,
-                changed=promoted.changed,
-                status="installed" if promoted.changed else "already_current",
+            else:
+                assert installed is not None
+                result = InstallResult(
+                    project_id=manifest.project_id,
+                    project_uid=str(manifest.project_uid),
+                    graph_digest=installed.graph_digest,
+                    generation_digest=installed.generation_digest,
+                    build_epoch=installed.build_epoch,
+                    changed=promoted.changed,
+                    status="installed" if promoted.changed else "already_current",
+                )
+        if temporary.cleanup_failed:
+            if promotion_committed:
+                return _postcommit_install_execution(
+                    commit_state, recovery_id=recovery_id
+                )
+            raise BundleError(
+                "bundle_cleanup_failed", "private install cleanup failed",
+                recovery_id,
             )
+        return _InstallExecution(result, promotion_committed)
+
+
+def _postcommit_install_execution(
+    state: _InstallCommitState, *, recovery_id: str | None = None,
+) -> _InstallExecution:
+    assert state.promotion_committed
+    assert state.project_id is not None and state.project_uid is not None
+    installed = state.installed
+    return _InstallExecution(
+        InstallResult(
+            project_id=state.project_id,
+            project_uid=state.project_uid,
+            graph_digest=None if installed is None else installed.graph_digest,
+            generation_digest=(
+                None if installed is None else installed.generation_digest
+            ),
+            build_epoch=None if installed is None else installed.build_epoch,
+            changed=None if installed is None else True,
+            status="promoted_but_stale",
+            recovery_id=recovery_id,
+        ),
+        promotion_committed=True,
+    )
 ```
 
-`_same_validation_projection()` compares the complete immutable validator input contract: `source_digest`, `projection_digest`, sorted safe paths, `projection_files`, `reason_counts`, and `coverage_approvals`. The before/immediately-before/after stages therefore use the same canonical privacy/coverage/scanner walk as `validate_candidate`; a lightweight `ProjectionSnapshot` is never passed where a `StagedInput` is required. The installer rejects a null schema-v2 projection digest, any bundled ownership file before mapping, regenerates ownership only through `validate_candidate`, preserves the immutable bundle `build_epoch`, validates current evidence/trust without promoting trust, and leaves the prior graph untouched on every pre-promotion failure. `promoted_but_stale` is nonzero at the CLI layer and does not claim rollback.
+`_same_validation_projection()` compares the complete immutable validator input contract: `source_digest`, `projection_digest`, sorted safe paths, `projection_files`, `reason_counts`, and `coverage_approvals`. The before/immediately-before/after stages therefore use the same canonical privacy/coverage/scanner walk as `validate_candidate`; a lightweight `ProjectionSnapshot` is never passed where a `StagedInput` is required. The installer rejects a null schema-v2 projection digest, any bundled ownership file before mapping, and any mismatch among bundle, validated candidate, and descriptor-validated `PromotionResult` graph/generation/epoch identity; it regenerates ownership only through `validate_candidate`, preserves the immutable bundle `build_epoch` for a changed-generation promotion, validates current evidence/trust without promoting trust, and leaves the prior graph untouched on every pre-promotion failure. Exact-generation no-op ignores a different proposed bundle epoch, returns the descriptor-validated installed ownership epoch, and does not rewrite ownership.
+
+After every committed promotion, `_revalidate_installed_generation` validates
+the live owned tree through the same lease `RepositoryAccess` and returns graph
+digest, generation digest, and positive epoch only from that validator. The
+promotion summary is comparison-only. A summary mismatch with valid live
+ownership returns `promoted_but_stale` using the revalidated identity; if live
+ownership is unverifiable, graph digest, generation digest, epoch, and changed
+are all `None`. It never mixes verified and unverified identity fields.
+`promoted_but_stale` uses global exit code 3, demotes downstream trust, and does
+not claim rollback. From lifecycle entry through post-promotion verification,
+journal, manifest, staging, current ownership, promotion, and health are all
+rooted in the one captured lease descriptor. A root replacement can neither
+supply validation bytes nor receive the promoted graph.
+
+The whole managed-root block is enclosed by an outer
+`except OperationTempCleanupError` that raises the same closed
+`BundleError("bundle_cleanup_failed", ..., recovery_id) from None` before
+commit. The wrapper-owned `_InstallCommitState` is set immediately after a
+changed `promote_graph` returns, so either `OperationTempCleanupError` or any
+other ordinary postcommit `Exception` instead becomes
+`_postcommit_install_execution`: it uses a descriptor-validated installed
+identity captured before the failure when available, otherwise all identity
+fields and `changed` are null. A coincident cleanup failure adds the recovery
+ID; an ordinary postcommit verification failure alone does not. A non-ordinary
+`BaseException` still wins. An exact-generation no-op never sets the marker and
+therefore raises the closed cleanup error rather than fabricating a commit.
 
 Same-process GitHub authorization uses a module-private identity registry:
 
@@ -713,9 +1177,55 @@ class _PullAuthorization:
 
 _AUTHORIZED_PULLS: dict[int, tuple[_PullAuthorization, str, int, int]] = {}
 _AUTHORIZED_PULLS_LOCK = threading.Lock()
+
+@contextmanager
+def registered_pull_authorization(
+    bundle: Path,
+    receipt: DownloadReceipt,
+    verified: VerifiedAttestation,
+    manifest: ProjectManifest,
+) -> Iterator[_PullAuthorization]:
+    authorization = _new_bound_pull_authorization(
+        bundle, receipt, verified, manifest
+    )
+    entry = (
+        authorization, receipt.archive_sha256,
+        receipt.archive_size, receipt.identity.asset_id,
+    )
+    # The cleanup handler is active before the entry can become reachable.
+    try:
+        with _AUTHORIZED_PULLS_LOCK:
+            if id(authorization) in _AUTHORIZED_PULLS:
+                raise BundleError(
+                    "bundle_unattested", "bundle is not authorized for install"
+                )
+            _AUTHORIZED_PULLS[id(authorization)] = entry
+        _after_pull_authorization_insert_checkpoint()
+        yield authorization
+    finally:
+        _discard_pull_authorization(authorization)
 ```
 
-The stored tuple binds the exact authorization object identity, archive SHA-256, archive byte length, and immutable GitHub asset ID. Registration and consumption hold `_AUTHORIZED_PULLS_LOCK`; consumption atomically pops the entry before validation/promotion, so exactly one of two concurrent consumers can proceed. `_install_verified_pull` rejects a copied/reconstructed object or mutated bundle and leaves no registry entry whether install succeeds or fails.
+The stored tuple binds the exact authorization object identity, archive SHA-256, archive byte length, and immutable GitHub asset ID. Registration and consumption hold `_AUTHORIZED_PULLS_LOCK`; consumption atomically pops the entry before validation/promotion, so exactly one of two concurrent consumers can proceed. `_install_verified_pull_execution` rejects a copied/reconstructed object or mutated bundle and leaves no registry entry whether install succeeds or fails; the result-only wrapper preserves that behavior.
+
+`_new_bound_pull_authorization` repeats the bounded file device/inode/size/hash
+check against the verified receipt before constructing the nonce; it does not
+insert anything. `registered_pull_authorization` is the only insertion API.
+Its `try/finally` is established before the locked dictionary assignment, and
+the injected checkpoint runs immediately after insertion but before the
+context yields. Therefore assignment-adjacent failure, cancellation, or
+`KeyboardInterrupt` cannot strand an entry. `_discard_pull_authorization`
+holds the same lock and removes only an entry whose stored object `is` the
+supplied authorization.
+
+`_install_verified_pull_execution` wraps `_install_bundle` in `try/finally` and calls
+`_discard_pull_authorization(authorization)` in the `finally`. Discard holds the
+registry lock and removes an entry only when the registered authorization is
+the exact same object; a copied object cannot revoke another capability. Normal
+transport admission still atomically pops before validation. The final discard
+is therefore a no-op after consumption, but it purges authorization when an
+expected-identity/lifecycle failure happens before `_require_transport_authority`
+can consume it.
 
 - [ ] **Step 4: Add pre-promotion and post-promotion drift/race tests**
 
@@ -732,8 +1242,77 @@ def test_install_drift_after_promotion_is_explicit(clean_clone, local_bundle, in
     install_fault.after_promote(lambda: rewrite_safe_source(clean_clone))
     result = install_local_bundle(clean_clone, local_bundle)
     assert result.status == "promoted_but_stale"
+    assert result.generation_digest == local_bundle.artifact.generation_digest
     manifest = load_manifest(clean_clone / ".graphify-project.yaml", clean_clone)
     assert assess_health(inspect_project_state(clean_clone, manifest)).core_status == "stale"
+
+@pytest.mark.parametrize("field", ["digest", "generation_digest", "build_epoch"])
+def test_install_malformed_promotion_summary_uses_only_live_owned_identity(
+    clean_clone, local_bundle, install_fault, field,
+) -> None:
+    install_fault.corrupt_promotion_summary(
+        field, "f" * 64 if field != "build_epoch" else None
+    )
+    result = install_local_bundle(clean_clone, local_bundle)
+    manifest = load_manifest(clean_clone / ".graphify-project.yaml", clean_clone)
+    owned = validate_owned_graph(clean_clone / "graphify-out", manifest)
+    assert result.status == "promoted_but_stale"
+    assert (result.graph_digest, result.generation_digest, result.build_epoch) == (
+        owned.graph_digest, owned.generation_digest, owned.build_epoch
+    )
+    assert result.changed is None
+
+def test_install_unverifiable_committed_tree_reports_null_complete_identity(
+    clean_clone, local_bundle, install_fault,
+) -> None:
+    install_fault.corrupt_owned_tree_after_promotion()
+    result = install_local_bundle(clean_clone, local_bundle)
+    assert result.status == "promoted_but_stale"
+    assert (
+        result.graph_digest, result.generation_digest,
+        result.build_epoch, result.changed,
+    ) == (None, None, None, None)
+
+def test_install_root_replacement_after_lock_promotes_only_original_descriptor(
+    clean_clone, local_bundle, install_fault, tmp_path,
+) -> None:
+    original = tmp_path / "original"
+    replacement = clean_clone
+    install_fault.after_lock(
+        lambda: replace_repository_root(
+            replacement, original, attacker_repository_with_copied_identity(tmp_path)
+        )
+    )
+    result = install_local_bundle(replacement, local_bundle)
+    assert result.status in {"installed", "already_current"}
+    assert (original / "graphify-out/graph.json").is_file()
+    assert not (replacement / "graphify-out").exists()
+    assert not (replacement / ".project-knowledge").exists()
+
+def test_exact_generation_reinstall_reports_installed_identity_without_rewrite(
+    clean_clone, local_bundle
+) -> None:
+    first = install_local_bundle(clean_clone, local_bundle)
+    ownership_before = inode_and_bytes(clean_clone / "graphify-out" / OWNERSHIP_MANIFEST)
+    second = install_local_bundle(clean_clone, local_bundle)
+    assert second.status == "already_current"
+    assert (second.graph_digest, second.generation_digest, second.build_epoch) == (
+        first.graph_digest, first.generation_digest, first.build_epoch,
+    )
+    assert inode_and_bytes(clean_clone / "graphify-out" / OWNERSHIP_MANIFEST) == ownership_before
+
+def test_exact_generation_noop_ignores_different_proposed_bundle_epoch(
+    clean_clone, local_bundle
+) -> None:
+    installed = install_local_bundle(clean_clone, local_bundle)
+    assert installed.build_epoch is not None
+    proposed = repack_same_generation_with_epoch(
+        local_bundle, installed.build_epoch + 100
+    )
+    result = install_local_bundle(clean_clone, proposed)
+    assert result.status == "already_current"
+    assert result.generation_digest == installed.generation_digest
+    assert result.build_epoch == installed.build_epoch
 
 
 def test_verified_pull_authorization_is_atomic_single_use(clean_clone, verified_download):
@@ -745,6 +1324,37 @@ def test_verified_pull_authorization_is_atomic_single_use(clean_clone, verified_
     assert sum(isinstance(value, InstallResult) for value in results) == 1
     assert sum(isinstance(value, BundleError) and value.code == "bundle_unattested"
                for value in results) == 1
+
+def test_verified_pull_identity_failure_purges_unconsumed_authorization(
+    clean_clone, verified_download, tmp_path,
+) -> None:
+    with open_repository_access(clean_clone) as loaded:
+        expected = loaded.identity
+    clean_clone.rename(tmp_path / "original")
+    replacement = repository_with_copied_id_uid(clean_clone)
+    before = tree_snapshot(replacement)
+    with pytest.raises(TransactionLockError) as raised:
+        _install_verified_pull(
+            replacement, verified_download.path,
+            verified_download.authorization,
+            expected_repository_identity=expected,
+        )
+    assert raised.value.kind == "authority"
+    assert authorization_registry_size() == 0
+    assert tree_snapshot(replacement) == before
+
+@pytest.mark.parametrize("operation", ["pack", "install"])
+@pytest.mark.parametrize("journal_state", ["recoverable", "corrupt"])
+def test_artifact_library_mutations_recheck_init_journal_under_lock(
+    operation, journal_state, artifact_fixture
+) -> None:
+    repo = artifact_fixture.repo
+    seed_init_journal(repo, journal_state)
+    before = tree_snapshot(repo)
+    with pytest.raises(BundleError) as raised:
+        invoke_artifact_library_operation(operation, artifact_fixture)
+    assert raised.value.code == "init_recovery_required"
+    assert tree_snapshot(repo) == before
 ```
 
 Run: `uv run pytest -q tests/test_bundles_install.py tests/test_artifacts.py tests/test_health.py`
@@ -768,10 +1378,10 @@ git commit -m "feat: install local graph bundles atomically"
 
 **Interfaces:**
 - Produces: `CoverageMetrics(represented: int, approved_omissions: int, denied: int)`.
-- Produces: `SuccessfulOperation(operation: str, duration_ms: int, safe_file_count: int, coverage: CoverageMetrics, source_digest: str, projection_digest: str, graph_digest: str | None, artifact_channel: str | None)`.
+- Produces: `SuccessfulOperation(operation: str, duration_ms: int, safe_file_count: int, coverage: CoverageMetrics, source_digest: str, projection_digest: str, graph_digest: str | None, generation_digest: str | None, build_epoch: int | None, artifact_channel: str | None)`.
 - Produces: `FailureRecord(operation: str, failure_code: str)`.
 - Produces: `OperationState(schema_version: int, last_success: SuccessfulOperation | None, last_failure: FailureRecord | None)`.
-- Produces: `record_success(repo_root: Path, operation: SuccessfulOperation) -> None`, `record_failure(repo_root: Path, failure: FailureRecord) -> None`, `load_operation_state(repo_root: Path) -> OperationState`, and `render_ci_summary(results: Sequence[dict[str, object]]) -> tuple[bytes, str]`.
+- Produces: `record_success(repo_root: Path, operation: SuccessfulOperation, *, repository_access: RepositoryAccess | None = None, expected_repository_identity: RepositoryIdentity | None = None) -> None`, the analogous `record_failure`, `load_operation_state(repo_root: Path, *, expected_repository_identity=None) -> OperationState`, and `render_ci_summary(results: Sequence[dict[str, object]]) -> tuple[bytes, str]`. Writer authority keywords are mutually exclusive; an access requires a live lifecycle lease.
 - Produces internal `python -m project_knowledge.operation_state ci-summary --output-json PATH --preflight PATH --doctor PATH --scan PATH --health PATH` for workflow-only content-free rendering.
 
 - [ ] **Step 1: Write failing state schema, redaction, and atomicity tests**
@@ -782,7 +1392,8 @@ def test_state_contains_only_content_free_closed_schema(repo):
         operation="artifact_install", duration_ms=125, safe_file_count=7,
         coverage=CoverageMetrics(represented=6, approved_omissions=1, denied=3),
         source_digest="1" * 64, projection_digest="2" * 64,
-        graph_digest="3" * 64, artifact_channel=None,
+        graph_digest="3" * 64, generation_digest="4" * 64,
+        build_epoch=7, artifact_channel=None,
     ))
     payload = (repo / ".project-knowledge/state.json").read_text(encoding="utf-8")
     assert set(json.loads(payload)) == {"last_failure", "last_success", "schema_version"}
@@ -822,9 +1433,25 @@ Expected: collection fails for missing `project_knowledge.operation_state`.
 
 - [ ] **Step 3: Implement strict private state and deterministic CI outputs**
 
-State JSON uses canonical sorted keys, schema version 1, integer non-negative counts/duration, lowercase 64-hex digests, operation names from an immutable allowlist, and stable failure codes from the CLI error registry. Every read/update takes `.project-knowledge/state.lock`; lock order is repository lifecycle lock then state lock. Open the real mode-0700 state directory once with `O_DIRECTORY|O_NOFOLLOW`, read existing state via `openat(O_NOFOLLOW)` with pre/open/post inode binding, write a mode-0600 sibling temp with `O_EXCL|O_NOFOLLOW`, fsync it, verify the destination still has the captured binding, `renameat` within the opened parent, then fsync the directory. Reject symlink/wrong-type/swap/duplicate-key/non-finite/unknown-field state and serialize concurrent pack/install updates so the last completed operation wins without a lost update.
+State JSON uses canonical sorted keys, schema version 1, integer non-negative
+counts/duration, lowercase 64-hex digests, operation names from an immutable
+allowlist, and stable failure codes from the CLI error registry. Every update
+takes the repository lifecycle lock then `.project-knowledge/state.lock`.
+Install records through its already captured lease access before releasing the
+transaction. Pack retains the captured repository identity and, after archive
+publication, reacquires the lifecycle boundary with that expected identity
+before recording; replacement state is never touched. A direct writer without
+an access likewise acquires/validates the optional identity itself. Read-only
+load uses `open_repository_access` and never creates state. Open the real
+mode-0700 state directory relative to that repository access, read existing
+state via `openat(O_NOFOLLOW)` with pre/open/post inode binding, write a
+mode-0600 sibling temp with `O_EXCL|O_NOFOLLOW`, fsync it, verify the destination
+still has the captured binding, `renameat` within the opened parent, then fsync
+the directory. Reject symlink/wrong-type/swap/duplicate-key/non-finite/unknown-
+field state and serialize concurrent pack/install updates so the last completed
+operation wins without a lost update.
 
-`render_ci_summary()` returns canonical machine JSON and Markdown containing only project ID/UID, operation, status, counts, duration, digests, channel, trust, and stable limitations. It rejects values under keys matching `path`, `file`, `query`, `environment`, `fingerprint`, or `message` rather than trying to redact arbitrary content.
+`render_ci_summary()` returns canonical machine JSON and Markdown containing only project ID/UID, operation, status, counts, duration, source/projection/graph/generation digests, installed build epoch, channel, trust, and stable limitations. It rejects values under keys matching `path`, `file`, `query`, `environment`, `fingerprint`, or `message` rather than trying to redact arbitrary content. Artifact pack/install success records require non-null graph/generation digests and a positive exact epoch. A committed-but-unverifiable install has all installed-identity fields null in its result, records the last verified successful identity plus a stable failure, and never promotes partial/unverified identity into success state.
 
 The module's strict `argparse` `__main__` accepts only the `ci-summary` verb and exact file arguments above. It reads each bounded duplicate-key-free JSON envelope, projects only those allowlisted fields, writes canonical JSON to the exclusive requested output, and prints Markdown to stdout. The preflight projection admits only backend/model/deep mode and `credential_bound: bool`, never an environment name or credential. It never writes repository state.
 
@@ -854,23 +1481,26 @@ git commit -m "feat: record content-free graph operations"
 
 **Interfaces:**
 - Consumes: `ArtifactManifest`, core `ArtifactIntent`, `inspect_bundle_manifest`, `V1_LIMITS`, and the current `ProjectionSnapshot` from `inspect_projection()`.
+- Produces: `GithubArtifactError(code: str, message: str, recovery_id: str | None = None)`; a non-null constructor-validated recovery ID is allowed only for `github_cleanup_failed`.
 - Produces: `HttpsRequest(method: Literal["GET"], url: str, headers: tuple[tuple[str, str], ...], timeout_seconds: float)`.
 - Produces protocol: `HttpsTransport.open(request: HttpsRequest) -> HttpsResponse`, where `HttpsResponse.status`, `headers`, `read(size)`, and `close()` are bounded/injectable.
-- Produces: `ReleaseAssetIdentity(repository_id: int, release_id: int, tag: str, asset_id: int, asset_name: str, asset_size: int, asset_digest: str, source_commit_oid: str)`.
+- Produces: `ReleaseAssetIdentity(repository_id: int, release_id: int, tag: str, asset_id: int, asset_name: str, asset_size: int, asset_digest: str, generation_digest: str, source_commit_oid: str)`.
 - Produces: `DownloadReceipt(identity: ReleaseAssetIdentity, archive_sha256: str, archive_size: int, artifact_git_commit_oid: str)`.
-- Produces: `GithubCredentials(token: str = field(repr=False))`.
-- Produces: `resolve_and_download(config: ArtifactIntent, project_uid: UUID, projection: ProjectionSnapshot, destination: Path, credentials: GithubCredentials, transport: HttpsTransport = REAL_HTTPS) -> DownloadReceipt`.
+- Produces: `GithubCredentials(token: str = field(repr=False))`; `__post_init__` requires an exact `str`, UTF-8 length 1..4096 bytes, and no C0/C1 controls, DEL, CR/LF, or surrounding whitespace. Every invalid value raises only `GithubArtifactError("github_token_required", "GitHub credential is required")` before request/header construction.
+- Produces: `resolve_and_download(config: ArtifactIntent, project_uid: UUID, projection: ProjectionSnapshot, destination: Path, credentials: GithubCredentials, transport: HttpsTransport = REAL_HTTPS, *, before_request: Callable[[], None] = _noop) -> DownloadReceipt`. The private callback is a library-test/high-level binding hook, never public configuration, and is invoked immediately before every HTTP open including every redirect hop; an exception propagates before request headers, credentials, or bytes are sent.
 
 - [ ] **Step 1: Write fake-transport tests for exact API construction and immutable identity**
 
 ```python
 def test_resolver_binds_repository_release_asset_and_commit(github_config, fake_https, tmp_path):
+    bundle_bytes = github_bundle_bytes(git_oid="b" * 40)
+    archive_sha = hashlib.sha256(bundle_bytes).hexdigest()
     fake_https.queue_json("https://api.github.com/repos/acme/widgets", {
         "id": 123456789, "full_name": "acme/widgets"
     })
     fake_https.queue_json(
         "https://api.github.com/repos/acme/widgets/releases/tags/atlasweaver-graph-4ed9af24-5aa2-4eac-8d0a-3f622cc74948-main",
-        release_response(release_id=44, asset_id=55, digest="sha256:" + "a" * 64),
+        release_response(release_id=44, asset_id=55, digest="sha256:" + archive_sha),
     )
     fake_https.queue_json("https://api.github.com/repos/acme/widgets/commits/" + "b" * 40, {
         "sha": "b" * 40,
@@ -881,7 +1511,7 @@ def test_resolver_binds_repository_release_asset_and_commit(github_config, fake_
     )
     fake_https.queue_bytes(
         "https://release-assets.githubusercontent.com/github-production-release-asset/file.zip",
-        github_bundle_bytes(git_oid="b" * 40),
+        bundle_bytes,
     )
     receipt = resolve_and_download(
         github_config, PROJECT_UID, projection("1" * 64, "2" * 64),
@@ -892,10 +1522,59 @@ def test_resolver_binds_repository_release_asset_and_commit(github_config, fake_
         tag="atlasweaver-graph-4ed9af24-5aa2-4eac-8d0a-3f622cc74948-main",
         asset_id=55,
         asset_name=("atlasweaver-graph-4ed9af24-5aa2-4eac-8d0a-3f622cc74948-"
-                    + "1" * 64 + "-" + "2" * 64 + ".zip"),
-        asset_size=len(github_bundle_bytes(git_oid="b" * 40)),
-        asset_digest="a" * 64, source_commit_oid="b" * 40,
+                    + "1" * 64 + "-" + "2" * 64 + "-" + archive_sha + ".zip"),
+        asset_size=len(bundle_bytes),
+        asset_digest=archive_sha, generation_digest="3" * 64,
+        source_commit_oid="b" * 40,
     )
+
+def test_before_request_runs_for_every_api_and_redirect_hop(
+    github_config, fake_https, current_projection, tmp_path,
+) -> None:
+    seed_successful_resolution(fake_https, git_oid="b" * 40)
+    checkpoints: list[int] = []
+    resolve_and_download(
+        github_config, PROJECT_UID, current_projection,
+        tmp_path / "download.zip", GithubCredentials("token-value"), fake_https,
+        before_request=lambda: checkpoints.append(len(fake_https.requests)),
+    )
+    assert len(checkpoints) == len(fake_https.requests)
+
+def test_before_request_failure_precedes_next_https_open_and_credentials(
+    github_config, fake_https, current_projection, tmp_path,
+) -> None:
+    seed_successful_resolution(fake_https, git_oid="b" * 40)
+    calls = 0
+    def stop_before_second_request() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise ManifestError("project manifest changed", kind="changed")
+    with pytest.raises(ManifestError) as raised:
+        resolve_and_download(
+            github_config, PROJECT_UID, current_projection,
+            tmp_path / "download.zip", GithubCredentials("must-remain-unused"),
+            fake_https, before_request=stop_before_second_request,
+        )
+    assert raised.value.kind == "changed"
+    assert len(fake_https.requests) == 1
+
+
+@pytest.mark.parametrize("token", [
+    "", " token", "token ", "line\nbreak", "header\rvalue", "nul\x00value",
+    "x" * 4097, b"not-text", True,
+])
+def test_github_credentials_reject_invalid_header_values_before_request(
+    github_config, fake_https, current_projection, tmp_path, token,
+) -> None:
+    with pytest.raises(GithubArtifactError) as raised:
+        credentials = GithubCredentials(token)
+        resolve_and_download(
+            github_config, PROJECT_UID, current_projection,
+            tmp_path / "download.zip", credentials, fake_https,
+        )
+    assert raised.value.code == "github_token_required"
+    assert fake_https.requests == []
 ```
 
 The fake records every request and asserts `Accept: application/vnd.github+json` for JSON API calls, `Accept: application/octet-stream` for the asset endpoint, `X-GitHub-Api-Version: 2022-11-28`, and `Authorization: Bearer token-value` only on `api.github.com`.
@@ -1001,7 +1680,13 @@ def _headers(host: str, token: str, *, asset: bool) -> tuple[tuple[str, str], ..
     return tuple(headers)
 ```
 
-Read each JSON response with a 1 MiB cap, strict duplicate-key/non-finite JSON, and a closed projection of required fields. Resolve repository identity, rolling-tag release, and exactly one exact-name asset. After bounded structural parsing of downloaded `artifact.json`, resolve `/repos/<owner>/<repo>/commits/<claimed_git_commit_oid>` and require the exact returned SHA/repository; do not derive the asset's source commit from the rolling release `target_commitish`, because retained digest-addressed assets remain valid after the rolling branch advances. Require numeric IDs to be positive non-boolean integers and every returned name/digest/size to match configuration/current projection.
+Read each JSON response with a 1 MiB cap, strict duplicate-key/non-finite JSON, and a closed projection of required fields. Resolve repository identity and the rolling-tag release. Select only assets whose exact name matches the UID/current-source/current-projection prefix plus one lowercase full bundle SHA-256; sort matching assets by validated `(created_at, numeric_id)` newest-first and choose exactly the newest, rejecting duplicate exact names/IDs or malformed/ambiguous ordering. The clean clone need not know generation identity before download. Stream the selected asset while hashing it and require the computed archive SHA-256, GitHub's `sha256:<hex>` digest, and the exact final name component to agree before bounded structural parsing of `artifact.json`. Then resolve `/repos/<owner>/<repo>/commits/<claimed_git_commit_oid>` and require the exact returned SHA/repository; do not derive the asset's source commit from the rolling release `target_commitish`, because retained digest-addressed assets remain valid after the rolling branch advances. Require numeric IDs to be positive non-boolean integers and every returned name/digest/size plus full manifest source/projection/generation identity to match configuration/current projection and the parsed bundle. Generation digest and bundle SHA-256 are distinct domains and are never compared.
+
+Construct and validate `GithubCredentials` before `_headers`, URL parsing,
+transport selection, or any `HttpsTransport.open`. `_headers` accepts only that
+validated object/token and cannot encounter a raw header-value `ValueError`;
+defense-in-depth translates any unexpected header/HTTP library `Exception` to
+the operation's closed GitHub error family from `None`.
 
 Stream the asset to an exclusive mode-0600 file in a mode-0700 parent, enforce header length and the bundle hard maximum while reading, fsync, then call `inspect_bundle_manifest()` without parsing graph content. Require claimed Git OID to equal the API-resolved source commit. Finally require the streamed SHA-256 to match GitHub's `sha256:<hex>` asset digest and return the private receipt. Any failure descriptor-unlinks the file and returns a redacted stable code.
 
@@ -1028,14 +1713,15 @@ git commit -m "feat: download graph bundles from verified GitHub releases"
 - Test: `tests/test_operation_state.py`
 
 **Interfaces:**
-- Consumes: `resolve_and_download`, `DownloadReceipt`, private `_PullAuthorization`, and `_install_verified_pull`.
+- Consumes: `resolve_and_download`, `DownloadReceipt`, private `_PullAuthorization`, result-only `_install_verified_pull`, and commit-aware `_install_verified_pull_execution`.
 - Produces protocol: `GhCommandRunner.run(argv: tuple[str, ...], env: Mapping[str, str], timeout_seconds: float, output_limit: int) -> CompletedCommand`; this transport runner is distinct from Core's Graphify `CommandRunner`.
 - Produces: `VerifiedAttestation(subject_sha256: str, signer_workflow: str, signer_digest: str, source_ref: str, source_digest: str, predicate_type: str)`.
-- Produces: `ResolvedGhExecutable(path: Path, device: int, inode: int, sha256: str, version: str)` and narrow protocol `GhToolResolver.resolve() -> ResolvedGhExecutable`.
+- Produces: `ResolvedGhExecutable(path: Path, device: int, inode: int, sha256: str, version: str)` and narrow protocol `GhToolResolver.resolve(*, before_exec: Callable[[], None] = _noop) -> ResolvedGhExecutable`; the callback runs immediately before each bounded capability child.
 - Produces private `SYSTEM_GH_RESOLVER` and `resolve_gh_executable(resolver: GhToolResolver = SYSTEM_GH_RESOLVER) -> ResolvedGhExecutable`; neither can resolve Graphify and neither is exposed through CLI/workflow input.
-- Produces: `verify_attestation(bundle: Path, receipt: DownloadReceipt, config: ArtifactIntent, credentials: GithubCredentials, gh: ResolvedGhExecutable, runner: GhCommandRunner = SUBPROCESS_GH_RUNNER) -> VerifiedAttestation`.
+- Produces: `AttestationPolicy(repository: str, signer_workflow: str, signer_digest: str, source_ref: str, source_digest: str, predicate_type: str, deny_self_hosted_runners: bool = True)` and `verify_attestation_policy(bundle: Path, policy: AttestationPolicy, credentials: GithubCredentials, gh: ResolvedGhExecutable, runner: GhCommandRunner = SUBPROCESS_GH_RUNNER, *, before_exec: Callable[[], None] = _noop) -> VerifiedAttestation`. This primitive authenticates a subject/policy and knows nothing about releases, assets, or pull authorization; the callback runs immediately before the verifier child.
+- Produces: `verify_attestation(bundle: Path, receipt: DownloadReceipt, config: ArtifactIntent, credentials: GithubCredentials, gh: ResolvedGhExecutable, runner: GhCommandRunner = SUBPROCESS_GH_RUNNER, *, before_exec: Callable[[], None] = _noop) -> VerifiedAttestation`.
 - Produces: `PullDependencies(transport: HttpsTransport, runner: GhCommandRunner, gh_resolver: GhToolResolver)` for test injection only.
-- Produces: `PullResult(download: DownloadReceipt, install: InstallResult)` and `pull_bundle(repo_root: Path, credentials: GithubCredentials, *, dependencies: PullDependencies = REAL_PULL_DEPENDENCIES) -> PullResult`.
+- Produces: `PullResult(download: DownloadReceipt, install: InstallResult)` and `pull_bundle(repo_root: Path, credentials: GithubCredentials, *, dependencies: PullDependencies = REAL_PULL_DEPENDENCIES, expected_repository_identity: RepositoryIdentity | None = None, expected_manifest: ProjectManifest | None = None) -> PullResult`. The expected manifest is a library-only CLI/fleet admission binding, never a CLI flag.
 
 - [ ] **Step 1: Write failing exact-argv/minimal-environment attestation tests**
 
@@ -1060,6 +1746,23 @@ def test_attestation_verifier_uses_exact_policy_and_minimal_environment(tmp_path
     assert set(fake_runner.env) == {"GH_CONFIG_DIR", "GH_TOKEN", "LANG", "LC_ALL"}
     assert fake_runner.env["GH_TOKEN"] == "secret"
     assert verified.subject_sha256 == sha256(bundle.read_bytes())
+
+
+def test_policy_verifier_requires_no_release_receipt_and_cannot_authorize_pull(
+    tmp_path, workflow_policy, fake_runner, resolved_gh,
+) -> None:
+    bundle = tmp_path / "prepared.zip"
+    bundle.write_bytes(b"prepared publication bytes")
+    fake_runner.result = gh_result(
+        subject=sha256(bundle.read_bytes()),
+        source=workflow_policy.source_digest,
+    )
+    verified = verify_attestation_policy(
+        bundle, workflow_policy, GithubCredentials("token"),
+        resolved_gh, fake_runner,
+    )
+    assert verified.subject_sha256 == sha256(bundle.read_bytes())
+    assert active_pull_authorization_count() == 0
 ```
 
 The test runner must also assert a 60-second timeout, a 256 KiB combined stdout/stderr cap, a mode-0700 empty `GH_CONFIG_DIR`, and deletion of that directory after success/failure.
@@ -1068,23 +1771,48 @@ The test runner must also assert a 60-second timeout, a 256 KiB combined stdout/
 
 ```python
 @pytest.mark.parametrize("case", [
-    "missing_result", "two_matching_results", "wrong_subject", "wrong_repository",
+    "missing_result", "conflicting_results", "wrong_subject", "wrong_repository",
     "wrong_workflow", "wrong_signer_digest", "wrong_source_ref", "wrong_source_commit",
     "wrong_predicate", "self_hosted", "duplicate_json_key", "nonfinite_json",
-    "oversized_output", "timeout", "nonzero_exit",
+    "oversized_output", "timeout", "nonzero_exit", "one_char_token",
 ])
 def test_attestation_failure_is_redacted_and_non_authorizing(
     tmp_path, receipt, github_config, fake_runner, resolved_gh, case
 ):
     bundle = tmp_path / "bundle.zip"
-    bundle.write_bytes(b"untrusted bundle bytes")
-    fake_runner.result = malformed_gh_result(case)
-    with pytest.raises(GithubArtifactError, match="attestation_"):
+    original = b"untrusted bundle bytes"
+    bundle.write_bytes(original)
+    token = "x" if case == "one_char_token" else "token-value"
+    raw_stdout = f"runner stdout {token} {bundle}"
+    raw_stderr = f"runner stderr {token} {bundle}"
+    fake_runner.result = malformed_gh_result(
+        case, stdout=raw_stdout, stderr=raw_stderr
+    )
+    with pytest.raises(GithubArtifactError, match="attestation_") as raised:
         verify_attestation(
-            bundle, receipt, github_config, GithubCredentials("token-value"),
+            bundle, receipt, github_config, GithubCredentials(token),
             resolved_gh, fake_runner
         )
+    rendered = f"{raised.value!s}\n{raised.value!r}"
+    assert token not in rendered
+    assert raw_stdout not in rendered
+    assert raw_stderr not in rendered
+    assert str(bundle) not in rendered
     assert bundle.read_bytes() == original
+    assert active_pull_authorization_count() == 0
+
+
+def test_repeated_identical_policy_attestations_are_idempotent(
+    bundle, receipt, github_config, fake_runner, resolved_gh,
+) -> None:
+    fake_runner.result = two_valid_results_with_same_authority_projection(
+        bundle, receipt, github_config
+    )
+    verified = verify_attestation(
+        bundle, receipt, github_config, GithubCredentials("token"),
+        resolved_gh, fake_runner,
+    )
+    assert verified.subject_sha256 == sha256(bundle.read_bytes())
 
 
 def test_pull_rechecks_projection_under_lock_before_promotion(repo, fake_https, fake_runner, pull_fault):
@@ -1100,12 +1828,198 @@ def test_pull_rechecks_projection_under_lock_before_promotion(repo, fake_https, 
         )
     assert tree_snapshot(repo / "graphify-out") == before
 
+def test_pull_expected_identity_mismatch_precedes_https_gh_and_token_use(
+    repo, fake_https, fake_runner, tmp_path,
+) -> None:
+    with open_repository_access(repo) as loaded:
+        expected = loaded.identity
+    repo.rename(tmp_path / "original")
+    replacement = github_repository_with_copied_id_uid(
+        repo, repository="attacker/redirect"
+    )
+    with pytest.raises(TransactionLockError) as raised:
+        pull_bundle(
+            replacement, GithubCredentials("must-remain-unused"),
+            dependencies=PullDependencies(
+                transport=fake_https, runner=fake_runner,
+                gh_resolver=fake_gh_resolver,
+            ),
+            expected_repository_identity=expected,
+        )
+    assert raised.value.kind == "authority"
+    assert fake_https.calls == []
+    assert fake_runner.calls == []
+    assert not (replacement / ".project-knowledge").exists()
+
+
+def test_pull_expected_manifest_mismatch_precedes_network_and_token_use(
+    repo, fake_https, fake_runner,
+) -> None:
+    admitted = load_manifest(repo / ".graphify-project.yaml", repo)
+    rewrite_manifest_semantically(
+        repo,
+        project_id=admitted.project_id,
+        project_uid=admitted.project_uid,
+        artifacts=github_artifacts(repository="attacker/redirect"),
+    )
+    with pytest.raises(ManifestError) as raised:
+        pull_bundle(
+            repo, GithubCredentials("must-remain-unused"),
+            dependencies=PullDependencies(
+                transport=fake_https, runner=fake_runner,
+                gh_resolver=fake_gh_resolver,
+            ),
+            expected_manifest=admitted,
+        )
+    assert raised.value.kind == "changed"
+    assert fake_https.calls == []
+    assert fake_runner.calls == []
+
+
+@pytest.mark.parametrize(
+    "checkpoint,https_may_run,gh_may_run",
+    [
+        ("before_first_https", False, False),
+        ("after_download", True, False),
+        ("during_gh_capability", True, True),
+        ("before_attestation", True, True),
+        ("before_authorization", True, True),
+        ("before_install_handoff", True, True),
+    ],
+)
+def test_pull_rewrite_restore_is_detected_at_every_privileged_boundary(
+    repo, fake_https, fake_runner, pull_fault,
+    checkpoint: str, https_may_run: bool, gh_may_run: bool,
+) -> None:
+    pull_fault.rewrite_and_restore_manifest_at(checkpoint, repo)
+    with pytest.raises(ManifestError) as raised:
+        pull_bundle(
+            repo, GithubCredentials("token"),
+            dependencies=pull_fault.dependencies(fake_https, fake_runner),
+        )
+    assert raised.value.kind == "changed"
+    assert bool(fake_https.calls) is https_may_run
+    assert bool(fake_runner.calls) is gh_may_run
+    assert pull_fault.install_calls == []
+    assert active_pull_authorization_count() == 0
+
+
+def test_pull_manifest_drift_after_committed_install_returns_stale_result(
+    repo, fake_https, fake_runner, pull_fault,
+) -> None:
+    pull_fault.rewrite_and_restore_manifest_at("after_install", repo)
+    result = pull_bundle(
+        repo, GithubCredentials("token"),
+        dependencies=pull_fault.dependencies(fake_https, fake_runner),
+    )
+    assert result.install.status == "promoted_but_stale"
+    assert result.install.graph_digest == pull_fault.installed_identity.graph_digest
+    assert result.install.generation_digest == pull_fault.installed_identity.generation_digest
+    assert result.install.build_epoch == pull_fault.installed_identity.build_epoch
+    assert active_pull_authorization_count() == 0
+
 
 def test_verified_authorization_is_single_use(repo, verified_download):
     first = _install_verified_pull(repo, verified_download.path, verified_download.authorization)
     assert first.status in {"installed", "already_current"}
     with pytest.raises(BundleError, match="bundle_unattested"):
         _install_verified_pull(repo, verified_download.path, verified_download.authorization)
+
+
+def test_pull_handoff_failure_discards_registered_authorization(
+    repo, fake_https, fake_runner, pull_fault,
+) -> None:
+    pull_fault.after_authorization_registered(
+        lambda: (_ for _ in ()).throw(KeyboardInterrupt())
+    )
+    with pytest.raises(KeyboardInterrupt):
+        pull_bundle(
+            repo, GithubCredentials("token"),
+            dependencies=PullDependencies(
+                transport=fake_https, runner=fake_runner,
+                gh_resolver=fake_gh_resolver,
+            ),
+        )
+    assert active_pull_authorization_count() == 0
+
+
+def test_pull_cleanup_failure_after_exact_noop_is_closed_github_error(
+    repo, verified_download, operation_temp_fault,
+) -> None:
+    install_local_bundle(repo, verified_download.path_for_local_install)
+    operation_temp_fault.fail_cleanup("pull")
+    with pytest.raises(GithubArtifactError) as raised:
+        verified_download.pull_into(repo)
+    assert raised.value.code == "github_cleanup_failed"
+    assert raised.value.recovery_id is not None
+
+
+def test_pull_cleanup_failure_after_committed_install_returns_stale_recovery(
+    repo, verified_download, operation_temp_fault,
+) -> None:
+    operation_temp_fault.fail_cleanup("pull")
+    result = verified_download.pull_into(repo)
+    assert result.install.status == "promoted_but_stale"
+    assert result.install.recovery_id is not None
+
+
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_pull_postcommit_install_exception_preserves_commit_outcome(
+    repo, verified_download, install_fault, operation_temp_fault,
+    cleanup_fails: bool,
+) -> None:
+    install_fault.raise_during_postcommit_revalidation(RuntimeError("private"))
+    if cleanup_fails:
+        operation_temp_fault.fail_cleanup("install")
+    result = verified_download.pull_into(repo)
+    assert result.install.status == "promoted_but_stale"
+    assert (
+        result.install.graph_digest, result.install.generation_digest,
+        result.install.build_epoch, result.install.changed,
+    ) == (None, None, None, None)
+    assert (result.install.recovery_id is not None) is cleanup_fails
+    assert active_pull_authorization_count() == 0
+
+
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_pull_outer_postinstall_exception_preserves_commit_outcome(
+    repo, verified_download, pull_fault, operation_temp_fault,
+    cleanup_fails: bool,
+) -> None:
+    pull_fault.after_install(
+        lambda: (_ for _ in ()).throw(RuntimeError("private"))
+    )
+    if cleanup_fails:
+        operation_temp_fault.fail_cleanup("pull")
+    result = verified_download.pull_into(repo)
+    assert result.install.status == "promoted_but_stale"
+    assert (
+        result.install.graph_digest, result.install.generation_digest,
+        result.install.build_epoch,
+    ) == (
+        pull_fault.installed_identity.graph_digest,
+        pull_fault.installed_identity.generation_digest,
+        pull_fault.installed_identity.build_epoch,
+    )
+    assert (result.install.recovery_id is not None) is cleanup_fails
+    assert active_pull_authorization_count() == 0
+
+
+def test_authorization_registration_baseexception_cannot_leak_entry(
+    verified_download, authorization_fault,
+) -> None:
+    authorization_fault.after_registry_insert(
+        lambda: (_ for _ in ()).throw(KeyboardInterrupt())
+    )
+    with pytest.raises(KeyboardInterrupt):
+        with registered_pull_authorization(
+            verified_download.path,
+            verified_download.receipt,
+            verified_download.attestation,
+            verified_download.manifest,
+        ):
+            pytest.fail("registration checkpoint should have interrupted")
+    assert active_pull_authorization_count() == 0
 ```
 
 - [ ] **Step 3: Run focused tests and confirm attestation APIs are missing**
@@ -1116,36 +2030,226 @@ Expected: FAIL for missing `verify_attestation`/`pull_bundle`.
 
 - [ ] **Step 4: Implement capability-checked verification and exact result projection**
 
-Resolve `gh` exactly once through Task 6's private, gh-only `SYSTEM_GH_RESOLVER`; no public CLI/request/workspace/workflow input can name an alternate executable. It returns an absolute no-follow regular path, captures device/inode/SHA-256, and capability-checks `--version` plus `attestation verify --help` through the bounded process-group runner. Revalidate the gh executable binding immediately before exec and invoke only its absolute path under the minimal environment. This boundary has no `graphify` name, branch, type, or return value; Graphify authority remains exclusively in Impact/Core. Require the exact attestation flags listed in the spec. Use no shell. Construct only the exact argv shown in Step 1. Parse stdout with duplicate-key rejection and accept exactly one result whose authenticated certificate/verification projection contains the ZIP subject SHA-256, configured workflow identity and digest, configured source ref, receipt/bundle source commit, SLSA provenance predicate type, and hosted-runner policy. Ignore free-form statement predicate fields when making authority decisions.
+Resolve `gh` exactly once through Task 6's private, gh-only `SYSTEM_GH_RESOLVER`; no public CLI/request/workspace/workflow input can name an alternate executable. It returns an absolute no-follow regular path, captures device/inode/SHA-256, and capability-checks `--version` plus `attestation verify --help` through the bounded process-group runner. Revalidate the gh executable binding immediately before exec and invoke only its absolute path under the minimal environment. This boundary has no `graphify` name, branch, type, or return value; Graphify authority remains exclusively in Impact/Core. `verify_attestation_policy` owns the exact attestation flags listed in the spec. Use no shell. Construct only the exact argv shown in Step 1. Parse stdout with duplicate-key rejection and require at least one result. Every returned result must have the same authority-relevant authenticated projection and must contain the ZIP subject SHA-256, policy workflow identity and digest, policy source ref/digest, SLSA provenance predicate type, and hosted-runner policy. Identical repeated valid attestations are deduplicated to one `VerifiedAttestation`, making workflow retries safe; any conflicting or malformed result fails closed as `attestation_ambiguous`. Ignore free-form statement predicate fields when making authority decisions.
 
-Require all four identity sources to agree: immutable repository ID/name from the TLS GitHub API receipt, local manifest config, untrusted bounded `artifact.json` claims, and `gh` fields explicitly enforced by flags. `verify_attestation` never creates `_PullAuthorization`; only `pull_bundle`, after all comparisons succeed, registers one authorization bound to the exact file/receipt.
+`verify_attestation` is the pull-only wrapper: derive an
+`AttestationPolicy` from the strict local config plus receipt source commit,
+call `verify_attestation_policy`, then require all four pull identity sources to
+agree in their corresponding domains: the TLS GitHub API receipt authenticates
+immutable numeric repository ID plus release/asset identity; the verifier
+authenticates repository slug, subject, workflow, and source; local manifest
+config and untrusted bounded `artifact.json` claims must agree with both. A caller-fabricated/missing receipt can
+never enter this wrapper. Neither verifier creates `_PullAuthorization`; only
+`pull_bundle`, after all comparisons succeed, registers one authorization bound
+to the exact file/receipt. The policy primitive cannot be passed to install and
+is insufficient to authorize a downloaded release asset.
 
 `pull_bundle()` sequence is exact:
 
 ```python
-def pull_bundle(repo_root: Path, credentials: GithubCredentials, *,
-                dependencies: PullDependencies = REAL_PULL_DEPENDENCIES) -> PullResult:
-    manifest = load_manifest(repo_root / ".graphify-project.yaml", repo_root)
-    config = require_github_release_provider(manifest.artifacts)
-    projection = inspect_projection(repo_root, manifest)
-    if manifest.project_uid is None or projection.projection_digest is None:
-        raise GithubArtifactError("manifest_migration_required", "portable identity is required")
-    with TemporaryDirectory(prefix="atlasweaver-pull-") as temporary:
-        bundle = Path(temporary) / "bundle.zip"
-        receipt = resolve_and_download(
-            config, manifest.project_uid, projection, bundle,
-            credentials, dependencies.transport,
+def pull_bundle(
+    repo_root: Path,
+    credentials: GithubCredentials,
+    *,
+    dependencies: PullDependencies = REAL_PULL_DEPENDENCIES,
+    expected_repository_identity: RepositoryIdentity | None = None,
+    expected_manifest: ProjectManifest | None = None,
+) -> PullResult:
+    with open_repository_access(
+        repo_root,
+        expected_repository_identity=expected_repository_identity,
+    ) as repository:
+        if inspect_init_journal(
+            repo_root, repository_access=repository
+        ) != "none":
+            raise GithubArtifactError(
+                "init_recovery_required", "configuration recovery is required"
+            )
+        if expected_manifest is None:
+            manifest = load_manifest(
+                repo_root / ".graphify-project.yaml", repo_root,
+                repository_access=repository,
+            )
+            manifest = require_current_manifest(
+                repo_root, manifest, repository_access=repository
+            )
+        else:
+            manifest = require_current_manifest(
+                repo_root, expected_manifest,
+                repository_access=repository,
+            )
+        config = require_github_release_provider(manifest.artifacts)
+        projection = inspect_projection(
+            repo_root, manifest, repository_access=repository
         )
-        gh = dependencies.gh_resolver.resolve()
-        verified = verify_attestation(
-            bundle, receipt, config, credentials, gh, dependencies.runner
-        )
-        authorization = _register_pull_authorization(bundle, receipt, verified, manifest)
-        installed = _install_verified_pull(repo_root, bundle, authorization)
-        return PullResult(receipt, installed)
+        admitted_repository_identity = repository.identity
+        if manifest.project_uid is None or projection.projection_digest is None:
+            raise GithubArtifactError(
+                "manifest_migration_required", "portable identity is required"
+            )
+        recovery_id = secrets.token_hex(16)
+        result: PullResult | None = None
+        receipt: DownloadReceipt | None = None
+        execution: _InstallExecution | None = None
+        try:
+            with managed_operation_temp_root(
+                "pull", recovery_id
+            ) as temporary:
+                bundle = temporary.path / "bundle.zip"
+                assert_current_manifest_unchanged(
+                    repo_root, manifest, repository_access=repository
+                )
+                receipt = resolve_and_download(
+                    config, manifest.project_uid, projection, bundle,
+                    credentials, dependencies.transport,
+                    before_request=lambda: assert_current_manifest_unchanged(
+                        repo_root, manifest, repository_access=repository
+                    ),
+                )
+                assert_current_manifest_unchanged(
+                    repo_root, manifest, repository_access=repository
+                )
+                gh = dependencies.gh_resolver.resolve(
+                    before_exec=lambda: assert_current_manifest_unchanged(
+                        repo_root, manifest, repository_access=repository
+                    )
+                )
+                assert_current_manifest_unchanged(
+                    repo_root, manifest, repository_access=repository
+                )
+                verified = verify_attestation(
+                    bundle, receipt, config, credentials, gh,
+                    dependencies.runner,
+                    before_exec=lambda: assert_current_manifest_unchanged(
+                        repo_root, manifest, repository_access=repository
+                    ),
+                )
+                assert_current_manifest_unchanged(
+                    repo_root, manifest, repository_access=repository
+                )
+                with registered_pull_authorization(
+                    bundle, receipt, verified, manifest
+                ) as authorization:
+                    _pull_handoff_checkpoint()
+                    assert_current_manifest_unchanged(
+                        repo_root, manifest, repository_access=repository
+                    )
+                    execution = _install_verified_pull_execution(
+                        repo_root, bundle, authorization,
+                        expected_repository_identity=admitted_repository_identity,
+                        expected_manifest=manifest,
+                        recovery_id=recovery_id,
+                    )
+                    # Retain commit state before any subsequent outer work.
+                    _after_pull_install_checkpoint()
+                    installed = execution.result
+                    try:
+                        assert_current_manifest_unchanged(
+                            repo_root, manifest, repository_access=repository
+                        )
+                    except ManifestError:
+                        installed = replace(
+                            installed, status="promoted_but_stale"
+                        )
+                    result = PullResult(receipt, installed)
+        except OperationTempCleanupError:
+            if (
+                receipt is not None
+                and execution is not None
+                and execution.promotion_committed
+            ):
+                return _postcommit_pull_result(
+                    receipt, execution, recovery_id=recovery_id
+                )
+            raise GithubArtifactError(
+                "github_cleanup_failed", "private GitHub cleanup failed",
+                recovery_id,
+            ) from None
+        except Exception:
+            if (
+                receipt is not None
+                and execution is not None
+                and execution.promotion_committed
+            ):
+                return _postcommit_pull_result(receipt, execution)
+            raise
+        assert result is not None
+        assert execution is not None
+        if temporary.cleanup_failed:
+            if not execution.promotion_committed:
+                raise GithubArtifactError(
+                    "github_cleanup_failed", "private GitHub cleanup failed",
+                    recovery_id,
+                )
+            result = PullResult(
+                result.download,
+                replace(
+                    result.install,
+                    status="promoted_but_stale",
+                    recovery_id=recovery_id,
+                ),
+            )
+        return result
 ```
 
-`inspect_projection` before the network is advisory for exact asset resolution; `_install_verified_pull` creates the authoritative private `StagedInput` inside the lifecycle lock. `GithubCredentials` and every secret-bearing fleet/refresh request field use `field(repr=False)`. Never put the token in argv, repr, output, operation state, exception text, or a Graphify environment. Record `artifact_pull` content-free state only after the install outcome is known.
+`_postcommit_pull_result(receipt, execution, recovery_id=None)` preserves only
+the inner install result's descriptor-validated identity and changes its status
+to `promoted_but_stale`. With no supplied recovery ID it preserves any recovery
+ID already produced by the inner installer; with a supplied ID it replaces it
+with the outer pull operation's ID. The private post-install checkpoint runs
+only after the complete `_InstallExecution` has been retained. Consequently an
+ordinary outer exception, alone or combined with pull-root cleanup failure,
+cannot erase a committed install or leak private exception text.
+
+The first repository open atomically checks the optional fleet identity before
+journal, manifest, projection, transport, `gh`, or credential-consuming work.
+It also compares every semantic field of the optional admitted manifest to the
+descriptor-owned current manifest before provider resolution or transport;
+preserving ID/UID while changing repository, signer, source ref, channel,
+compatibility version, privacy, or feature intent still fails closed.
+The journal gate is read-only and runs through that access before manifest,
+projection, network, or credential use; `_install_verified_pull_execution` reopens the
+path only through the lifecycle boundary and requires the exact identity just
+captured, then rechecks the same journal gate and full admitted manifest under
+lock through `_install_bundle`.
+`resolve_and_download` invokes its retained-manifest callback immediately before
+every HTTPS open/redirect; the gh resolver invokes it before every capability
+child, and attestation invokes it immediately before the verifier child. The
+outer access asserts again before authorization registration and the install
+handoff. If the final outer assertion detects drift after nested install has
+committed, pull preserves only that install result's descriptor-verified
+identity, changes its status to `promoted_but_stale`, returns exit semantics 3,
+and never converts a committed mutation into an ordinary exception.
+`inspect_projection` before the network is advisory for exact asset resolution;
+`_install_verified_pull_execution` creates the authoritative private `StagedInput` inside
+the lifecycle lock. A root swap after the first open therefore uses only the
+original descriptor's trusted provider/projection and then either reacquires
+that same identity or fails before install; a replacement manifest can never
+redirect authenticated GitHub traffic. `GithubCredentials` and every secret-
+bearing fleet/refresh request field use `field(repr=False)`. Never put the token
+in argv, repr, output, operation state, exception text, or a Graphify
+environment. Record `artifact_pull` content-free state only after the install
+outcome is known.
+
+The managed pull root is commit-aware. A coincident ordinary body failure and
+cleanup failure before install commit becomes the closed `github_cleanup_failed`
+error with the same recovery ID. After install commit, either an ordinary outer
+failure or its combination with cleanup failure returns the closed stale
+result above. After a normal body exit it branches only on the retained private
+`_InstallExecution.promotion_committed` bit, never on status: false is the
+closed cleanup error; true preserves the descriptor-verified identity, returns
+`promoted_but_stale`, and attaches the recovery ID. Thus final manifest drift
+cannot make an exact-generation no-op look committed, and post-promotion stale
+validation cannot hide a real commit. A pending non-ordinary `BaseException`
+remains unsuppressed.
+
+The registration context's internal `finally` is active before insertion and
+closes the registration-to-wrapper handoff gap, including
+`BaseException`/cancellation at the injected post-insert checkpoint. The
+installer wrapper retains its own idempotent `finally` for failures after
+entry. Both discard only the exact authorization object under
+`_AUTHORIZED_PULLS_LOCK`; normal atomic consumption makes either later discard
+a no-op.
 
 - [ ] **Step 5: Run transport, provenance, install, and state tests together**
 
@@ -1170,8 +2274,12 @@ git commit -m "feat: verify provenance before pulling graph bundles"
 
 **Interfaces:**
 - Consumes: strict bundle parsing, candidate validation, deterministic packing, core `ArtifactIntent`, and the GitHub HTTPS/JSON boundary from Task 5.
+- Produces: `WorkflowPublishError(code: str, message: str, recovery_id: str | None = None)`; a non-null constructor-validated recovery ID is allowed only for `workflow_cleanup_failed` and `workflow_output_recovery_required`.
 - Produces: `WorkflowContext(repository: str, repository_id: int, ref: str, ref_type: str, ref_protected: bool, sha: str, run_id: int)` containing caller/source identity only; it never represents called-workflow signer identity.
-- Produces: `prepare_publication(repo_root: Path, build_bundle: Path, output: Path, context: WorkflowContext) -> PackedBundle`.
+- Produces privately: `WorkflowGitScope(checkout_descriptor, project_descriptor, project_segments, checkout_identity, project_identity, revalidate)` created only from Task 12's retained `WorkflowRepository`, or an equivalent root scope with empty segments for direct root-level library tests. It proves that the selected project descriptor is the exact descendant reached through the retained checkout chain.
+- Produces privately: `GitCheckoutSnapshot(object_format: Literal["sha1", "sha256"], commit_oid: str, commit_tree_oid: str, index_tree_oid: str, safe_projection_digest: str)` and `capture_descriptor_git_checkout(scope: WorkflowGitScope, staged: StagedInput, expected_oid: str, runner: DescriptorGitRunner, *, before_exec: Callable[[], None] = _noop) -> GitCheckoutSnapshot`. This is the only publication Git authority and has no public executable/config/argv input; it opens `.git` from the retained checkout descriptor, scopes index/worktree/tree comparisons to the literal selected-root segment tuple, strips that prefix before comparison with `staged`, and invokes both scope revalidation and the callback immediately before every Git child.
+- Produces privately: `PublicationDependencies(git_runner: DescriptorGitRunner)` with `REAL_PUBLICATION_DEPENDENCIES`; injection exists only for tests.
+- Produces: `prepare_publication(repo_root: Path, build_bundle: Path, output: Path, context: WorkflowContext, *, dependencies: PublicationDependencies = REAL_PUBLICATION_DEPENDENCIES, expected_repository_identity: RepositoryIdentity | None = None, expected_manifest: ProjectManifest | None = None, workflow_git_scope: WorkflowGitScope | None = None) -> PackedBundle`. The three expected/authority values are library-only workflow-boundary seams and have no internal-verb override; identity is checked atomically at lifecycle acquisition, the supplied Git scope must bind that same project identity, and the manifest is compared in full before Git/bundle/output. Absence of a scope creates only a root-level empty-prefix scope from the already retained repository descriptor for direct tests; it never searches upward by pathname.
 - Produces: `publish_release_asset(bundle: PackedBundle, context: WorkflowContext, credentials: GithubCredentials, client: GithubMutationClient = REAL_GITHUB_MUTATIONS) -> PublishedAsset`.
 - The module is importable only as a library/internal `python -m project_knowledge.workflow_publish`; it is not added to `[project.scripts]` and no `publish` subcommand is added.
 
@@ -1187,6 +2295,110 @@ def test_prepare_publication_revalidates_and_repackages_build_output(repo, build
     assert prepared.artifact.git.commit_oid == workflow_context.sha
     assert prepared.artifact.transport.repository_id == workflow_context.repository_id
     assert prepared.path.read_bytes() == repeated.path.read_bytes()
+
+def test_prepare_publication_root_swap_after_lock_uses_only_original_checkout(
+    repo, build_bundle, workflow_context, publication_fault, tmp_path,
+) -> None:
+    original = tmp_path / "original-checkout"
+    publication_fault.after_lock(
+        lambda: replace_repository_root(
+            repo, original, attacker_repository_with_copied_id_uid(tmp_path)
+        )
+    )
+    prepared = prepare_publication(
+        repo, build_bundle, tmp_path / "release.zip", workflow_context
+    )
+    assert prepared.artifact.project_uid == manifest_uid(original)
+    assert not (repo / ".project-knowledge").exists()
+
+
+def test_prepare_publication_root_swap_before_git_check_never_reads_replacement(
+    repo, build_bundle, workflow_context, publication_fault, tmp_path,
+) -> None:
+    original = tmp_path / "original-checkout"
+    replacement = attacker_repository_with_copied_id_uid(tmp_path)
+    publication_fault.before_git_check(
+        lambda: replace_repository_root(repo, original, replacement)
+    )
+    prepared = prepare_publication(
+        repo, build_bundle, tmp_path / "release.zip", workflow_context
+    )
+    assert prepared.artifact.project_uid == manifest_uid(original)
+    assert publication_fault.git_worktree_identity == repository_identity(original)
+    assert publication_fault.git_worktree_identity != repository_identity(repo)
+
+
+def test_workflow_admission_swap_before_prepare_fails_before_git_or_output(
+    repo, build_bundle, workflow_context, fake_descriptor_git_runner, tmp_path,
+) -> None:
+    with open_repository_access(repo) as admitted_repository:
+        expected_identity = admitted_repository.identity
+        expected_manifest = load_manifest(
+            repo / ".graphify-project.yaml", repo,
+            repository_access=admitted_repository,
+        )
+    repo.rename(tmp_path / "original")
+    replacement = attacker_repository_with_copied_id_uid(tmp_path, at=repo)
+    output = tmp_path / "release.zip"
+    with pytest.raises(TransactionLockError) as raised:
+        prepare_publication(
+            repo, build_bundle, output, workflow_context,
+            dependencies=PublicationDependencies(fake_descriptor_git_runner),
+            expected_repository_identity=expected_identity,
+            expected_manifest=expected_manifest,
+        )
+    assert raised.value.kind == "authority"
+    assert fake_descriptor_git_runner.calls == []
+    assert not output.exists()
+    assert not (replacement / ".project-knowledge").exists()
+
+
+@pytest.mark.parametrize("change", ["manifest_rewrite_restore", "safe_source", "coverage_control"])
+def test_prepare_publication_drift_before_output_leaves_output_absent(
+    repo, build_bundle, workflow_context, publication_fault, tmp_path, change,
+) -> None:
+    output = tmp_path / "release.zip"
+    publication_fault.before_output_commit(
+        lambda: apply_publication_precommit_change(repo, change)
+    )
+    with pytest.raises((ManifestError, WorkflowPublishError)):
+        prepare_publication(repo, build_bundle, output, workflow_context)
+    assert not output.exists()
+
+
+def test_descriptor_git_runner_checks_manifest_before_every_child(
+    repo, staged, fake_descriptor_git_runner, root_workflow_git_scope,
+) -> None:
+    checks: list[int] = []
+    capture_descriptor_git_checkout(
+        root_workflow_git_scope(repo), staged, head_oid(repo),
+        fake_descriptor_git_runner,
+        before_exec=lambda: checks.append(len(fake_descriptor_git_runner.calls)),
+    )
+    assert len(checks) == len(fake_descriptor_git_runner.calls)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="real publisher is Linux-only")
+def test_real_descriptor_git_runner_uses_traversable_proc_fds(
+    repo, staged, root_workflow_git_scope,
+) -> None:
+    snapshot = capture_descriptor_git_checkout(
+        root_workflow_git_scope(repo), staged, head_oid(repo),
+        SYSTEM_DESCRIPTOR_GIT_RUNNER,
+    )
+    assert snapshot.commit_oid == head_oid(repo)
+
+
+def test_non_linux_real_publication_fails_closed_before_git_or_output(
+    repo, build_bundle, workflow_context, tmp_path,
+) -> None:
+    if sys.platform == "linux":
+        pytest.skip("unsupported-platform branch")
+    output = tmp_path / "release.zip"
+    with pytest.raises(WorkflowPublishError) as raised:
+        prepare_publication(repo, build_bundle, output, workflow_context)
+    assert raised.value.code == "workflow_platform_unsupported"
+    assert not output.exists()
 
 
 def test_prepare_publication_rejects_mismatching_non_null_build_git(
@@ -1219,9 +2431,109 @@ def test_prepare_publication_fails_closed_before_github_write(
             changed_repo, changed_bundle, tmp_path / "release.zip", changed_context
         )
     assert mutation_client.calls == []
+
+
+@pytest.mark.parametrize("journal_state", ["recoverable", "corrupt"])
+def test_prepare_publication_gates_recovery_before_git_parse_or_output(
+    repo, build_bundle, workflow_context, publication_spies, tmp_path,
+    journal_state,
+) -> None:
+    seed_init_journal(repo, journal_state)
+    before = tree_snapshot(repo)
+    output = tmp_path / "release.zip"
+    with pytest.raises(WorkflowPublishError) as raised:
+        prepare_publication(repo, build_bundle, output, workflow_context)
+    assert raised.value.code == "init_recovery_required"
+    assert publication_spies.git_calls == []
+    assert publication_spies.bundle_parse_calls == []
+    assert publication_spies.github_calls == []
+    assert not output.exists()
+    assert tree_snapshot(repo) == before
+
+
+def test_prepare_publication_cleanup_after_output_preserves_zip_and_blocks_upload(
+    repo, build_bundle, workflow_context, operation_temp_fault,
+    mutation_client, tmp_path,
+) -> None:
+    output = tmp_path / "release.zip"
+    operation_temp_fault.fail_cleanup("publish")
+    with pytest.raises(WorkflowPublishError) as raised:
+        prepare_verify_and_publish(
+            repo, build_bundle, output, workflow_context, mutation_client
+        )
+    assert raised.value.code == "workflow_output_recovery_required"
+    assert raised.value.recovery_id is not None
+    assert inspect_bundle_manifest(output).git.commit_oid == workflow_context.sha
+    assert mutation_client.calls == []
+
+
+def test_prepare_publication_supports_nested_project_and_ignores_sibling_delta(
+    monorepo_checkout, nested_build_bundle, workflow_context,
+    trusted_tool_checkout, tmp_path,
+) -> None:
+    # This tracked sibling is outside the selected project prefix and must not
+    # enter either its cleanliness decision or safe commit projection.
+    (monorepo_checkout / "services/sibling/app.py").write_text(
+        "locally changed sibling\n", encoding="utf-8"
+    )
+    with open_workflow_repository(
+        monorepo_checkout, "services/api",
+        forbidden_checkout=trusted_tool_checkout,
+    ) as workflow_repository:
+        prepared = prepare_publication(
+            monorepo_checkout / "services/api", nested_build_bundle,
+            tmp_path / "nested-release.zip", workflow_context,
+            expected_repository_identity=workflow_repository.identity,
+            expected_manifest=workflow_repository.manifest,
+            workflow_git_scope=workflow_repository.git_scope,
+        )
+    assert prepared.artifact.git.commit_oid == workflow_context.sha
+
+
+def test_nested_publication_rejects_uncommitted_safe_file_inside_prefix(
+    monorepo_checkout, nested_build_bundle, workflow_context,
+    trusted_tool_checkout, tmp_path,
+) -> None:
+    (monorepo_checkout / "services/api/src/untracked.py").write_text(
+        "print('new')\n", encoding="utf-8"
+    )
+    with open_workflow_repository(
+        monorepo_checkout, "services/api",
+        forbidden_checkout=trusted_tool_checkout,
+    ) as workflow_repository:
+        with pytest.raises(WorkflowPublishError, match="workflow_source_mismatch"):
+            prepare_publication(
+                monorepo_checkout / "services/api", nested_build_bundle,
+                tmp_path / "nested-release.zip", workflow_context,
+                expected_repository_identity=workflow_repository.identity,
+                expected_manifest=workflow_repository.manifest,
+                workflow_git_scope=workflow_repository.git_scope,
+            )
+
+
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_prepare_publication_pack_helper_postlink_failure_preserves_zip(
+    repo, build_bundle, workflow_context, pack_fault, operation_temp_fault,
+    mutation_client, tmp_path, cleanup_fails,
+) -> None:
+    output = tmp_path / "release.zip"
+    pack_fault.after_durable_output_link(
+        lambda: (_ for _ in ()).throw(RuntimeError("private"))
+    )
+    if cleanup_fails:
+        operation_temp_fault.fail_cleanup("publish")
+    with pytest.raises(WorkflowPublishError) as raised:
+        prepare_verify_and_publish(
+            repo, build_bundle, output, workflow_context, mutation_client
+        )
+    assert raised.value.code == "workflow_output_recovery_required"
+    assert raised.value.recovery_id is not None
+    assert "private" not in repr(raised.value)
+    assert inspect_bundle_manifest(output).git.commit_oid == workflow_context.sha
+    assert mutation_client.calls == []
 ```
 
-The tracked-clean check must compare Git index/HEAD plus the safe projection: ignored private state and `graphify-out` do not make the checkout dirty, while every safe corpus byte must be represented by `context.sha`.
+The tracked-clean check must compare Git index/HEAD plus the safe projection: ignored private state and `graphify-out` do not make the checkout dirty, while every safe corpus byte must be represented by `context.sha`. The Git checks in both root-swap tests must either complete wholly against the original opened repository inode or fail with constant `workflow_git_unavailable`; they may never inspect the replacement.
 
 - [ ] **Step 2: Write upload-before-tag-move and verify-before-delete tests**
 
@@ -1262,9 +2574,20 @@ def test_remote_digest_mismatch_never_moves_tag_or_deletes_old_assets(bundle, co
         )
     assert "move_tag" not in fake_mutations.call_names
     assert "delete_asset" not in fake_mutations.call_names
+
+
+def test_publication_retry_accepts_repeated_identical_attestations_and_reuses_asset(
+    bundle, context, fake_mutations, fake_attestation_runner,
+) -> None:
+    fake_attestation_runner.return_two_identical_valid_results(bundle, context)
+    first = verify_then_publish(bundle, context, fake_attestation_runner, fake_mutations)
+    second = verify_then_publish(bundle, context, fake_attestation_runner, fake_mutations)
+    assert second.asset_id == first.asset_id
+    assert fake_mutations.upload_count == 1
+    assert "delete_asset" not in fake_mutations.call_names
 ```
 
-Add idempotency cases: an exact-name asset with matching size/digest is reused; an exact name with mismatched bytes fails; a retry after upload but before tag move completes safely; retention sorts digest-addressed assets by `(created_at, id)` newest-first and never deletes unrelated assets.
+Add idempotency cases: an exact-name asset with matching size/digest is reused; an exact name with mismatched bytes fails; a retry after upload but before tag move completes safely; retention sorts digest-addressed assets by `(created_at, id)` newest-first and never deletes unrelated assets. Also repack one generation with different authenticated Git ownership and one with a different injected AtlasWeaver package version: both retain `generation_digest` but produce different ZIP SHA-256 values and therefore different valid asset names rather than a collision.
 
 - [ ] **Step 3: Run and observe the missing workflow module**
 
@@ -1274,15 +2597,113 @@ Expected: collection fails for missing `project_knowledge.workflow_publish`.
 
 - [ ] **Step 4: Implement internal publication preparation**
 
+The real publication runner is intentionally Linux-only because the privileged
+reusable workflow is fixed to a GitHub-hosted Ubuntu job. At module entry it
+requires `sys.platform == "linux"` and capability-checks traversal through
+`/proc/self/fd/<retained-directory-fd>` before any Git command or output. A
+missing/non-traversable procfs boundary is stable
+`workflow_platform_unsupported`. The public package remains cross-platform:
+no public command invokes this workflow-only module. Unit tests on every
+platform inject a closed fake `DescriptorGitRunner`; the real-runner
+integration is Linux-marked, and non-Linux tests require fail-closed behavior.
+No environment/CLI/workflow input can select a runner.
+
+`capture_descriptor_git_checkout` descriptor-opens `.git` from the retained
+consumer-checkout descriptor in `WorkflowGitScope`, never from the selected
+nested project directory. A real directory is opened no-follow; a worktree marker is
+bounded to one strict `gitdir:` line and every target component is opened
+no-follow into retained gitdir/common-dir descriptors. It resolves and binds
+the system Git executable privately, then a single-purpose Linux child runner
+duplicates those descriptors, performs `fchdir()` to the retained worktree,
+and invokes only exact read-only plumbing with the worktree/gitdir exposed as
+inherited `/proc/self/fd/<n>` descriptor paths. It never runs `git -C <repo_root>`,
+uses a pathname `cwd`, rediscovers `.git` from the mutable root, or invokes a
+shell, hook, filter, fsmonitor, pager, editor, credential helper, network
+transport, submodule, or LFS process.
+
+The runner uses a fixed minimal environment including
+`GIT_LITERAL_PATHSPECS=1`, disables system/global config,
+fsmonitor, untracked-cache, optional locks, prompts, replacements, and
+submodule recursion, validates the executable binding before every exec, and
+caps/redacts both streams. Exact commands establish the object format,
+`HEAD^{commit}`, `HEAD^{tree}`, project-prefix index state, and project-prefix
+tracked worktree cleanliness. The resolved HEAD commit must equal `context.sha`.
+For an empty prefix the index tree must equal the resolved
+`context.sha^{tree}` OID; for a nested prefix, fixed plumbing compares only the
+literal selected subtree in index/worktree against that commit, so a tracked
+sibling delta outside the prefix is irrelevant while any selected-root delta
+fails. A tree OID is never compared to a commit OID. The helper also enumerates
+only the selected prefix of the commit tree through bounded
+`ls-tree`/`cat-file` plumbing, strips the exact prefix, applies the identical
+privacy projection, and requires its relative path-to-byte-digest map and
+projection digest to equal `staged`; therefore an untracked safe file,
+deleted/modified tracked safe file, or committed safe-byte mismatch inside the
+project fails even when Git ignore rules would hide it. Ignored private state,
+`graphify-out`, and checkout siblings are outside that comparison. All Git output is parsed from closed schemas and
+bounded before allocation. A path swap at any checkpoint can only leave the
+retained descriptors on the original checkout or produce the stable path-free
+`workflow_git_unavailable` error.
+
 `prepare_publication()` must parse caller/source `WorkflowContext` only from a strict allowlist of GitHub environment names, require all fields, validate full SHA/repository ID/ref types, validate the manifest signer path grammar, check the exact Git object format/OID and tracked safe projection, and reject any consumer-supplied shell/config override. It must not compare signer digest to normal `github.workflow_sha`; called-workflow identity becomes authoritative only through the post-attestation verification step. Its lifecycle-locked core is exact:
 
 ```python
-with repository_lifecycle_lock(repo_root):
-    with TemporaryDirectory(prefix="atlasweaver-publish-") as temporary:
-        private = Path(temporary)
-        staged = stage_input(repo_root, manifest, private / "source")
-        parsed = parse_bundle(build_bundle, private / "candidate")
-        _require_publication_identity(parsed.artifact, manifest, staged, context)
+with repository_lifecycle_lock(
+    repo_root,
+    expected_repository_identity=expected_repository_identity,
+), capture_lifecycle_repository(
+    repo_root
+) as repository:
+    if inspect_init_journal(
+        repo_root, repository_access=repository
+    ) != "none":
+        raise WorkflowPublishError(
+            "init_recovery_required", "configuration recovery is required"
+        )
+    if expected_manifest is None:
+        manifest = load_manifest(
+            repo_root / ".graphify-project.yaml", repo_root,
+            repository_access=repository,
+        )
+        manifest = require_current_manifest(
+            repo_root, manifest, repository_access=repository
+        )
+    else:
+        manifest = require_current_manifest(
+            repo_root, expected_manifest, repository_access=repository
+        )
+    recovery_id = secrets.token_hex(16)
+    prepared: PackedBundle | None = None
+    commit_state = _PackCommitState()
+    try:
+      with managed_operation_temp_root(
+          "publish", recovery_id
+      ) as temporary, ExitStack() as parsed_scope:
+        private = temporary.path
+        staged = stage_input(
+            repo_root, manifest, private / "source",
+            repository_access=repository,
+        )
+        git_scope = (
+            workflow_git_scope
+            if workflow_git_scope is not None
+            else capture_root_workflow_git_scope(repository)
+        )
+        git_scope.require_project_identity(repository.identity)
+        def publication_git_checkpoint() -> None:
+            git_scope.revalidate()
+            assert_current_manifest_unchanged(
+                repo_root, manifest, repository_access=repository
+            )
+        git = capture_descriptor_git_checkout(
+            git_scope, staged, context.sha, dependencies.git_runner,
+            before_exec=publication_git_checkpoint,
+        )
+        parsed = parsed_scope.enter_context(
+            parse_bundle(build_bundle, private / "candidate")
+        )
+        _require_publication_identity(
+            parsed.artifact, manifest, staged, git, context
+        )
         evidence_path = PurePosixPath("graphify-out/GRAPH_EVIDENCE.json")
         evidence_binding = next(
             item for item in parsed.payloads if item.path == evidence_path
@@ -1300,23 +2721,124 @@ with repository_lifecycle_lock(repo_root):
             staged,
             manifest,
             expected_projection_digest=staged.projection_digest,
+            expected_evidence_digest=evidence_binding.sha256,
             build_epoch=parsed.artifact.build_epoch,
             git_identity=git_identity_for_oid(context.sha),
         )
-        immediately_before = stage_input(repo_root, manifest, private / "source-check")
+        immediately_before = stage_input(
+            repo_root, manifest, private / "source-check",
+            repository_access=repository,
+        )
         _require_same_validation_projection(staged, immediately_before)
         captured = _capture_validated_generation(
             validated, manifest, private / "captured-generation"
         )
-        prepared = _pack_captured_generation(captured, output)
-        after = stage_input(repo_root, manifest, private / "source-after")
+        after = stage_input(
+            repo_root, manifest, private / "source-after",
+            repository_access=repository,
+        )
         _require_same_validation_projection(staged, after)
-        return prepared
+        assert_current_manifest_unchanged(
+            repo_root, manifest, repository_access=repository
+        )
+        def publication_precommit_check() -> None:
+            assert_current_manifest_unchanged(
+                repo_root, manifest, repository_access=repository
+            )
+            precommit_source = stage_input(
+                repo_root, manifest, private / "source-precommit",
+                repository_access=repository,
+            )
+            _require_same_validation_projection(staged, precommit_source)
+            assert_current_manifest_unchanged(
+                repo_root, manifest, repository_access=repository
+            )
+        prepared = _pack_captured_generation(
+            captured, output,
+            commit_state=commit_state,
+            precommit_check=publication_precommit_check,
+        )
+        _after_publication_output_commit_checkpoint()
+    except OperationTempCleanupError:
+        if commit_state.output_committed:
+            raise WorkflowPublishError(
+                "workflow_output_recovery_required",
+                "publication output recovery is required", recovery_id,
+            ) from None
+        raise WorkflowPublishError(
+            "workflow_cleanup_failed", "private publication cleanup failed",
+            recovery_id,
+        ) from None
+    except Exception:
+        if commit_state.output_committed:
+            raise WorkflowPublishError(
+                "workflow_output_recovery_required",
+                "publication output recovery is required", recovery_id,
+            ) from None
+        raise
+    if temporary.cleanup_failed:
+        # A normal body exit implies _pack_captured_generation completed its
+        # no-replace link and fsync contract; preserve that committed output.
+        raise WorkflowPublishError(
+            "workflow_output_recovery_required",
+            "publication output recovery is required", recovery_id,
+        )
+    assert prepared is not None
+    return prepared
 ```
 
-Require schema v2/non-null projection. The unprivileged build bundle may carry `git: null`, because normal Core refresh creates schema-2 ownership with `git_identity=None`; if it carries a non-null Git identity, require it to equal the authenticated workflow context SHA/object format or fail `workflow_source_mismatch`. Authority comes only from the privileged checkout/context: pass `git_identity_for_oid(context.sha)` to `validate_candidate`, require the returned `ValidatedGraph.git_identity` to equal it, and require the final prepared bundle's non-null Git identity to equal it before attestation. This validates/re-owns a private candidate and packs directly from its descriptor-captured ownership generation; it does not require or promote a live `graphify-out` in the privileged checkout. Task 6 still requires the attestation source digest, download receipt source commit, final bundle Git identity, and manifest source ref to agree. It must never trust the build job's health JSON, booleans, path, backend output, archive digest, or consumer `pyproject.toml`.
+Require the descriptor-rooted init journal to be `none` before manifest or
+bundle parsing; recoverable/corrupt state is stable `init_recovery_required`
+and produces no output or GitHub action. Require schema v2/non-null projection
+and exact equality between the parsed manifest, revalidated candidate,
+recaptured generation, and final prepared bundle generation digest. Every
+checkout-side journal/manifest/projection/stage read uses the one lease-captured
+repository descriptor; a pathname replacement after lock acquisition cannot
+enter privileged output. The packer's final precommit callback reasserts the
+pinned manifest and re-stages/recompares the complete source/projection/control
+contract after ZIP bytes are finalized but immediately before exclusive output
+publication; failure leaves output absent. Derive the asset-name final component only from
+`PackedBundle.sha256` after the final privileged ZIP bytes exist, and require
+that name component, local archive hash, uploaded GitHub digest, and attested
+subject digest to agree. The unprivileged build bundle may carry `git: null`,
+because normal Core refresh creates schema-2 ownership with
+`git_identity=None`; if it carries a non-null Git identity, require it to equal
+the authenticated workflow context SHA/object format or fail
+`workflow_source_mismatch`. Authority comes only from the privileged checkout/
+context: pass `git_identity_for_oid(context.sha)` to `validate_candidate`,
+require the returned `ValidatedGraph.git_identity` to equal it, and require the
+final prepared bundle's non-null Git identity to equal it before attestation.
+This validates/re-owns a private candidate and packs directly from its
+descriptor-captured ownership generation; it does not require or promote a
+live `graphify-out` in the privileged checkout. Task 6 still requires the
+attestation source digest, download receipt source commit, final bundle Git
+identity, generation digest, archive digest, and manifest source ref to agree
+in their corresponding domains. It must never trust the build job's health
+JSON, booleans, path, backend output, archive digest, or consumer
+`pyproject.toml`.
 
-The internal module accepts only fixed `prepare`, `verify-attestation`, and `upload` verbs when invoked with `python -m`; each requires `GITHUB_ACTIONS=true`, a complete `WorkflowContext`, and exact file paths created by the workflow under `$RUNNER_TEMP`. `verify-attestation` reads signer workflow/digest only from the strict project manifest and applies Task 6's exact verifier after the attestation action; it has no signer override flag. This is defense in depth, not a public authorization claim; the absence of a public entry point/subcommand is the product boundary.
+When the workflow boundary supplies expectations, lifecycle acquisition first
+checks its retained root identity atomically, then
+`require_current_manifest(..., expected_manifest)` compares the entire admitted
+semantic contract before Git, bundle parsing, staging, or output. The internal
+prepare driver always supplies both values from `WorkflowRepository`; neither
+is accepted from workflow input or a public command. A swap between workflow
+root admission and this lock therefore fails before privileged preparation
+rather than adopting a copied-ID/UID replacement.
+
+Publication never returns from inside a temporary-root context. It passes a
+fresh wrapper-owned `_PackCommitState` into `_pack_captured_generation`, so the
+durable output commit remains visible even when that helper never returns.
+Cleanup failure before an output commit is mapped to closed
+`workflow_cleanup_failed`; cleanup failure after the helper's durable link
+preserves the verified ZIP, returns `workflow_output_recovery_required` with
+only the opaque recovery ID, records no publication success, and prevents
+attestation/upload. A pending
+non-ordinary `BaseException` remains authoritative. The internal verb driver
+does not continue from any `WorkflowPublishError` to `verify-attestation` or
+`upload`.
+
+The internal module accepts only fixed `prepare`, `verify-attestation`, and `upload` verbs when invoked with `python -m`; each requires `GITHUB_ACTIONS=true`, a complete `WorkflowContext`, and exact file paths created by the workflow under `$RUNNER_TEMP`. `verify-attestation` reads signer workflow/digest only from the strict project manifest, constructs Task 6's `AttestationPolicy` from that manifest plus the authenticated caller repository/ref/SHA context, and calls `verify_attestation_policy` after the attestation action. It does not fabricate or accept a `DownloadReceipt`, release ID, or asset ID and cannot create `_PullAuthorization`; those are pull-only authorities that do not exist before upload. It has no signer override flag. This is defense in depth for the just-created subject, not a release-asset authorization claim; the absence of a public entry point/subcommand is the product boundary.
 
 - [ ] **Step 5: Implement GitHub mutation sequencing**
 
@@ -1471,7 +2993,7 @@ SKILL_RELATIVE = PurePosixPath("skills/using-project-knowledge-graphs")
 MANAGED_MARKER = ".atlasweaver-managed.json"
 ```
 
-Resolve an explicit `--home` as the real user-home directory or create its absent final directory with mode 0700; the CLI default is `Path.home()`. Resolve the compatibility contract and select its one `AgentInstallContract` for the requested platform. The contract's `home_relative_skill` must be `.codex/skills/graphify/SKILL.md` for `codex` or `.agents/skills/graphify/SKILL.md` for `agents`; derive AtlasWeaver's separate managed destination as the corresponding platform root plus `skills/using-project-knowledge-graphs`. Before calling Graphify, validate any existing Atlas destination and require a valid marker plus exact current tree digest. Call the injected production alias of Core's `resolve_graphify_executable()` once, then run compatibility-owned `probe_graphify(resolved, contract, runner)`; the probe's version/help/seven-operation smoke uses its own private temporary `HOME` and cannot touch the requested user home. No artifact-layer Graphify resolver, identity type, or PATH lookup exists. Render only `render_graphify_agent_install(contract, binary=resolved.path, platform=request.platform).argv` and invoke it through Core's `run_graphify_operation(runner, resolved, rendered.argv, ...)`, which no-follow revalidates the same device/inode/launcher digest immediately before spawn. The final install receives only `HOME=<user-home>`, `LANG=C.UTF-8`, and `LC_ALL=C.UTF-8`; no public argv can replace the executable and no local argv template, passthrough, `--project`, or `--strict` flag exists. Then copy package resources through `importlib.resources.as_file()` into a sibling mode-0700 stage, reject symlinks/special files, write the canonical mode-0600 marker, fsync, back up an existing owned destination, replace, fsync parent, and delete backup. Restore the backup on every caught replace failure.
+Resolve an explicit `--home` as the real user-home directory or create its absent final directory with mode 0700; the CLI default is `Path.home()`. Resolve the compatibility contract and select its one `AgentInstallContract` for the requested platform. The contract's `home_relative_skill` must be `.codex/skills/graphify/SKILL.md` for `codex` or `.agents/skills/graphify/SKILL.md` for `agents`; derive AtlasWeaver's separate managed destination as the corresponding platform root plus `skills/using-project-knowledge-graphs`. Before calling Graphify, validate any existing Atlas destination and require a valid marker plus exact current tree digest. Call the injected production alias of Core's `resolve_graphify_executable()` once, then run compatibility-owned `probe_graphify(resolved, contract, runner)`; the probe's version/help/seven-operation smoke uses its own private temporary `HOME` and cannot touch the requested user home. No artifact-layer Graphify resolver, identity type, or PATH lookup exists. Render only `render_graphify_agent_install(contract, binary=resolved.path, platform=request.platform).argv` and invoke it through Core's `run_graphify_operation(runner, resolved, rendered.argv, ...)`, which no-follow revalidates the same device/inode/launcher digest immediately before spawn. The final install receives exactly `HOME=<user-home>`, `LANG=C.UTF-8`, `LC_ALL=C.UTF-8`, and `PATH=os.defpath`; this supports a pinned `/usr/bin/env python` launcher without inheriting ambient PATH. No public argv can replace the executable and no local argv template, passthrough, `--project`, or `--strict` flag exists. Then copy package resources through `importlib.resources.as_file()` into a sibling mode-0700 stage, reject symlinks/special files, write the canonical mode-0600 marker, fsync, back up an existing owned destination, replace, fsync parent, and delete backup. Restore the backup on every caught replace failure.
 
 `uninstall_agent()` validates the marker and current digest, renames the exact owned directory to a private tombstone, fsyncs, then deletes it; it refuses modified/unmanaged trees and does not run any Graphify uninstall command. The reviewed package skill is the managed instruction fragment; repository hooks and project `AGENTS.md` edits remain outside this command.
 
@@ -1498,9 +3020,10 @@ git commit -m "feat: package and install AtlasWeaver agent guidance"
 - Test: `tests/test_manifest.py`
 
 **Interfaces:**
-- Consumes: strict project `load_manifest_payload(payload, repo_root)` and v2 `ProjectManifest.project_uid`.
-- Produces: `FleetProject(id: str, repository: PurePosixPath, root: Path, project_uid: UUID)`.
+- Consumes: strict project `load_manifest_payload(payload, repo_root)`, read-only descriptor-rooted `inspect_init_journal(..., repository_access=repository)`, and v2 `ProjectManifest.project_uid`.
+- Produces: `FleetProject(id: str, repository: PurePosixPath, root: Path, repository_identity: RepositoryIdentity, project_uid: UUID)`; identity is library-only and never serialized.
 - Produces: `FleetWorkspace(schema_version: int, root: Path, projects: tuple[FleetProject, ...], max_parallel: int)`.
+- Produces privately: `FleetAliasKey(kind: Literal["git", "repository"], identity: RepositoryIdentity)` and `_git_alias_key(repository: RepositoryAccess) -> FleetAliasKey`; the key is inode authority, never a canonical pathname.
 - Produces: `load_fleet_workspace(path: Path) -> FleetWorkspace` and `select_fleet_projects(workspace: FleetWorkspace, project_ids: tuple[str, ...]) -> tuple[FleetProject, ...]`.
 
 - [ ] **Step 1: Write the valid minimal/default/explicit schema tests**
@@ -1520,6 +3043,10 @@ defaults:
     assert workspace.max_parallel == 2
     assert [project.id for project in workspace.projects] == ["api", "documentation"]
     assert all(project.root.is_relative_to(tmp_path.resolve()) for project in workspace.projects)
+    assert all(
+        project.repository_identity == opened_identity(project.root)
+        for project in workspace.projects
+    )
 
 
 def test_max_parallel_defaults_to_two(tmp_path):
@@ -1558,12 +3085,66 @@ def test_fleet_manifest_path_swap_cannot_change_validated_project(tmp_path, mani
     workspace = load_fleet_workspace(workspace_path)
     assert workspace.projects[0].id == "api"
 
+def test_fleet_identity_comes_from_same_descriptor_as_manifest_capture(
+    tmp_path, repository_capture_spy,
+) -> None:
+    workspace = load_fleet_workspace(valid_workspace_fixture(tmp_path))
+    assert [project.repository_identity for project in workspace.projects] == [
+        repository_capture_spy.manifest_descriptor_identity(project.id)
+        for project in workspace.projects
+    ]
+
+
+def test_fleet_git_alias_capture_never_follows_post_open_path_swap(
+    tmp_path, fleet_fault,
+) -> None:
+    workspace_path, original_git_identity, replacement_git_identity = (
+        worktree_workspace_with_distinct_git_targets(tmp_path)
+    )
+    fleet_fault.after_git_alias_open_before_finalize(
+        replace_dot_git_with_replacement
+    )
+    try:
+        workspace = load_fleet_workspace(workspace_path)
+    except FleetConfigError as error:
+        assert error.code == "fleet_git_changed"
+    else:
+        assert fleet_fault.captured_alias_identity(workspace.projects[0]) == (
+            original_git_identity
+        )
+        assert fleet_fault.captured_alias_identity(workspace.projects[0]) != (
+            replacement_git_identity
+        )
+
+
+def test_real_linked_worktrees_resolve_dotdot_commondir_and_alias(
+    tmp_path,
+) -> None:
+    main, feature = create_real_git_linked_worktrees(tmp_path)
+    assert (feature / ".git").read_text(encoding="utf-8").startswith("gitdir: ")
+    with pytest.raises(FleetConfigError) as raised:
+        load_fleet_workspace(workspace_for_roots(tmp_path, (main, feature)))
+    assert raised.value.code == "fleet_worktree_alias"
+
 
 def test_fleet_rejects_workspace_or_manifest_over_256_kib(tmp_path):
     with pytest.raises(FleetConfigError, match="fleet_document_too_large"):
         load_fleet_workspace(write_oversized_workspace(tmp_path, 262_145))
     with pytest.raises(FleetConfigError, match="fleet_manifest_too_large"):
         load_fleet_workspace(workspace_with_oversized_manifest(tmp_path, 262_145))
+
+@pytest.mark.parametrize("journal_state", ["recoverable", "corrupt"])
+def test_fleet_loader_refuses_init_journal_before_manifest_parse(
+    tmp_path, journal_state, monkeypatch
+):
+    workspace = workspace_with_init_journal(tmp_path, journal_state)
+    monkeypatch.setattr(
+        "project_knowledge.fleet.load_manifest_payload",
+        lambda *args, **kwargs: pytest.fail("manifest parsed before recovery gate"),
+    )
+    with pytest.raises(FleetConfigError) as raised:
+        load_fleet_workspace(workspace)
+    assert raised.value.code == "init_recovery_required"
 ```
 
 For the worktree case, fixture `.git` files point at `/workspace/repository/.git/worktrees/feature-a` and `/workspace/repository/.git/worktrees/feature-b`, sharing `/workspace/repository/.git` as one canonical common Git directory. For non-Git repositories, use `(st_dev, st_ino)` of the opened real repository root as the alias identity. Reject a parent/child repository pair even if both contain valid manifests.
@@ -1589,11 +3170,44 @@ Use an event-checked PyYAML loader that forbids aliases, merge keys, duplicate k
 }
 ```
 
-Open the workspace parent/file and each repository path component with no-follow descriptors. Cap the workspace at 262,144 bytes, descriptor-read it with pre/open/post binding plus a second digest pass, and parse only those captured bytes. Require repository paths unique both lexically and by resolved path, beneath the real fleet root, non-symlink directories, and not nested. From the already opened repository descriptor, open `.graphify-project.yaml` with `openat(O_NOFOLLOW)`, cap it at 262,144 bytes, descriptor-capture it with the same binding/double-digest checks, and call the core `load_manifest_payload(captured_bytes, repo_root)`; never reopen the manifest pathname. Require `manifest.project_id == entry.id`, schema v2, and non-null UUIDv4 `project_uid`, then reject duplicate UIDs.
+Open the workspace parent/file and each repository path component with no-follow descriptors. Cap the workspace at 262,144 bytes, descriptor-read it with pre/open/post binding plus a second digest pass, and parse only those captured bytes. Require repository paths unique both lexically and by resolved path, beneath the real fleet root, non-symlink directories, and not nested. Before opening a project manifest, call Core's descriptor-safe read-only `inspect_init_journal(..., repository_access=repository)` and keep using the already opened repository identity; any recoverable/corrupt state is stable `init_recovery_required`, with no manifest parse or state mutation. From that same repository descriptor, open `.graphify-project.yaml` with `openat(O_NOFOLLOW)`, cap it at 262,144 bytes, descriptor-capture it with the same binding/double-digest checks, and call the core `load_manifest_payload(captured_bytes, repo_root)`; never reopen the manifest pathname. Persist `(st_dev, st_ino)` from that descriptor as `FleetProject.repository_identity`, not from a later `stat()`. Require `manifest.project_id == entry.id`, schema v2, and non-null UUIDv4 `project_uid`, then reject duplicate UIDs.
 
-Define `_git_alias_key(repo)` without invoking Git: a real `.git` directory resolves to its canonical path; a regular `.git` file must contain one bounded UTF-8 `gitdir: <path>` line. If that target matches `<common>/.git/worktrees/<name>`, return the canonical `<common>/.git`; otherwise return the canonical gitdir. Reject symlink/malformed/inaccessible markers. Two equal non-null keys are `fleet_worktree_alias`.
+Define `_git_alias_key(repository: RepositoryAccess)` without invoking Git and
+without reopening `repository.root`. Descriptor-open `.git` with
+`openat(repository.descriptor, ..., O_NOFOLLOW)`. For a real directory, retain
+that descriptor. For a regular marker, cap it at 4,096 bytes, require exactly
+one UTF-8 `gitdir: <path>` line, and traverse the target component-by-component
+with no-follow directory opens (from an opened filesystem-root descriptor for
+an absolute target or the retained worktree descriptor for a relative target).
+Immediately after the `.git` directory/marker and all target descriptors are
+opened but before the alias key is finalized, invoke the private test-only
+`after_git_alias_open_before_finalize` checkpoint. Then descriptor-open and
+strictly parse an optional bounded `commondir` file. An absent file means the
+gitdir itself is common. A present file must be exactly one newline-terminated
+relative path composed of 1..8 `..` segments and nothing else (the ordinary
+linked-worktree value is `../..`). Resolve each ascent with retained
+`openat(current_fd, "..", O_DIRECTORY|O_NOFOLLOW)`, retain/fstat every level,
+and require each child plus its descriptor-opened parent to keep stable
+pre/open/post bindings through final key capture; then descriptor-check the
+final directory's bounded Git common-dir structure. Absolute paths, names mixed with
+ascents, `.`/empty/control/backslash segments, or an ascent beyond the captured
+bound are `fleet_git_changed`. This narrowly permits real Git worktree ancestry
+without treating general parent traversal as repository path authority.
+Reject symlinks, special files, malformed relative paths, changed
+pre/open/post inode bindings, inaccessible targets, and digest drift as stable
+`fleet_git_changed`. Never call `Path.resolve()`, `realpath()`, `stat()` then
+reopen, or use a canonical path string as identity. Return a `git` alias key
+from `fstat()` of the retained common-git-directory descriptor; a non-Git
+repository returns a `repository` key from the already-open root identity.
+Two equal keys are `fleet_worktree_alias`. A `.git`/root swap after the alias
+descriptor is opened must yield the originally opened key or
+`fleet_git_changed`, never a replacement alias. The permanent race test injects
+only at that implementable descriptor-bound checkpoint; it does not claim an
+original `.git` authority before any `.git` descriptor exists.
 
-Selection accepts repeated IDs, rejects unknown or duplicate selectors, and returns the original workspace order—not selector order.
+The `--project` option itself is repeatable, but each selected ID value must be
+unique. Selection rejects unknown or duplicate values and returns the original
+workspace order—not selector order.
 
 - [ ] **Step 5: Run strict fleet configuration tests**
 
@@ -1617,12 +3231,99 @@ git commit -m "feat: validate universal repository fleets"
 - Test: `tests/test_github_artifacts.py`
 
 **Interfaces:**
-- Consumes: core `doctor_project`, `inspect_project_state`/`assess_health`, `RefreshOptions`/`refresh_project`, `registry_status`/`registry_sync`, `capture_registry_snapshot`/`query_registry`; compatibility `resolve_graphify_compatibility`/`bind_semantic_backend_credential`; artifact `pull_bundle`; and Task 9 workspace selection.
+- Consumes: core `inspect_init_journal`, `doctor_project`, `inspect_project_state`/`assess_health`, `RefreshOptions`/`refresh_project`, `registry_status`/`registry_sync`, `capture_registry_snapshot`/`query_registry`; compatibility `resolve_graphify_compatibility`/`bind_semantic_backend_credential`; artifact `pull_bundle`; and Task 9 workspace selection.
+- Produces: `FleetProjectAdmission(project: FleetProject, manifest: ProjectManifest)` and private `_load_fleet_project_manifest(project, *, expected_manifest: ProjectManifest | None = None) -> FleetProjectAdmission`; it opens the persisted identity, gates the journal, descriptor-loads the current manifest, revalidates schema/project ID/UID, and when expected is supplied requires exact full semantic equality before returning.
+- Produces: `require_fleet_projects_ready(selected: tuple[FleetProject, ...]) -> tuple[FleetProjectAdmission, ...]`, a read-only all-selected identity/journal/current-manifest gate used before any credential binding or dispatch; mismatch is stable path-free `fleet_repository_changed`.
 - Produces: `FleetOperation = Literal["doctor", "health", "pull", "refresh", "registry-sync", "query"]`.
 - Produces: `FleetProjectResult(id: str, uid: str, status: str, result: dict[str, object] | None, error_code: str | None, duration_ms: int)`.
 - Produces: `FleetResult(operation: FleetOperation, status: Literal["ok", "partial_failure", "failed"], projects: tuple[FleetProjectResult, ...], result: dict[str, object] | None)`; `result` is used only for aggregate fleet query output.
-- Produces: `ProjectBackendEnvironment(project_uid: UUID, values: Mapping[str, str] = field(repr=False))` and `RefreshFleetRequest(backend, model, deep, code_only, project_environments: tuple[ProjectBackendEnvironment, ...] = field(repr=False))`.
-- Produces: `run_fleet_operation(workspace: FleetWorkspace, operation: FleetOperation, selected: tuple[FleetProject, ...], request: FleetOperationRequest, runner: FleetProjectRunner = DEFAULT_FLEET_RUNNER) -> FleetResult`.
+- Produces: `FleetProjectOutcome(status: str, result: dict[str, object] | None)` and protocol `FleetProjectRunner.__call__(admission: FleetProjectAdmission, operation: FleetOperation, request: FleetProjectWorkRequest) -> FleetProjectOutcome`. The coordinator, not the runner, owns ID/UID, timing, exception mapping, ordering, and final `FleetProjectResult` construction. A worker request is freshly derived for exactly one admission and can never reference the aggregate request or another project's environment.
+- Produces frozen `FleetBaseRequest()`, `PullFleetRequest(credentials: GithubCredentials = field(repr=False))`, `ProjectBackendEnvironment(project_uid: UUID, credential_name: str | None = field(repr=False), entries: tuple[tuple[str, str], ...] = field(repr=False))` with defensive contract-aware `capture(...)` and fresh-copy `as_mapping()`, `RefreshFleetRequest(backend: str | None, model: str | None, deep: bool, code_only: bool, project_environments: tuple[ProjectBackendEnvironment, ...] = field(repr=False))`, and `FleetQueryRequest(query: RegistryQueryRequest)`.
+- Produces closed `FleetOperationRequest: TypeAlias = FleetBaseRequest | PullFleetRequest | RefreshFleetRequest | FleetQueryRequest`; no request contains an arbitrary mapping, argv, executable, output path, provider override, or untyped payload.
+- Produces private frozen `BaseProjectWorkRequest()`, `PullProjectWorkRequest(credentials=field(repr=False))`, and `RefreshProjectWorkRequest(options: RefreshOptions, environment: ProjectBackendEnvironment | None = field(repr=False))`, plus closed `FleetProjectWorkRequest`. These are the only values submitted to futures. A semantic refresh work request contains exactly the matching admission UID's one environment; code-only contains `None`.
+- Produces: `run_fleet_operation(workspace: FleetWorkspace, operation: FleetOperation, selected: tuple[FleetProject, ...], request: FleetOperationRequest, runner: FleetProjectRunner = DEFAULT_FLEET_RUNNER, *, expected_admissions: tuple[FleetProjectAdmission, ...] | None = None) -> FleetResult`. `expected_admissions` is a library-only pre-secret binding used by the CLI/workflow coordinator and has no parser/workspace/request representation.
+
+The exact request/runner contract is:
+
+```python
+@dataclass(frozen=True)
+class FleetBaseRequest:
+    pass
+
+@dataclass(frozen=True)
+class PullFleetRequest:
+    credentials: GithubCredentials = field(repr=False)
+
+@dataclass(frozen=True)
+class ProjectBackendEnvironment:
+    project_uid: UUID
+    credential_name: str | None = field(repr=False)
+    entries: tuple[tuple[str, str], ...] = field(repr=False)
+
+    @classmethod
+    def capture(
+        cls, project_uid: UUID, values: Mapping[str, str], *,
+        canonical_credential_name: str | None,
+    ) -> "ProjectBackendEnvironment":
+        return cls(
+            project_uid,
+            canonical_credential_name,
+            _validate_and_freeze_backend_environment(
+                values, canonical_credential_name=canonical_credential_name
+            ),
+        )
+
+    def as_mapping(self) -> dict[str, str]:
+        return dict(self.entries)
+
+@dataclass(frozen=True)
+class RefreshFleetRequest:
+    backend: str | None
+    model: str | None
+    deep: bool
+    code_only: bool
+    project_environments: tuple[ProjectBackendEnvironment, ...] = field(
+        repr=False
+    )
+
+@dataclass(frozen=True)
+class FleetQueryRequest:
+    query: RegistryQueryRequest
+
+FleetOperationRequest: TypeAlias = (
+    FleetBaseRequest | PullFleetRequest | RefreshFleetRequest | FleetQueryRequest
+)
+
+@dataclass(frozen=True)
+class BaseProjectWorkRequest:
+    pass
+
+@dataclass(frozen=True)
+class PullProjectWorkRequest:
+    credentials: GithubCredentials = field(repr=False)
+
+@dataclass(frozen=True)
+class RefreshProjectWorkRequest:
+    options: RefreshOptions
+    environment: ProjectBackendEnvironment | None = field(repr=False)
+
+FleetProjectWorkRequest: TypeAlias = (
+    BaseProjectWorkRequest | PullProjectWorkRequest | RefreshProjectWorkRequest
+)
+
+@dataclass(frozen=True)
+class FleetProjectOutcome:
+    status: str
+    result: dict[str, object] | None
+
+class FleetProjectRunner(Protocol):
+    def __call__(
+        self,
+        admission: FleetProjectAdmission,
+        operation: FleetOperation,
+        request: FleetProjectWorkRequest,
+    ) -> FleetProjectOutcome: ...
+```
 
 - [ ] **Step 1: Write bounded parallelism, isolation, and ordering tests**
 
@@ -1630,7 +3331,7 @@ git commit -m "feat: validate universal repository fleets"
 def test_parallel_fleet_operation_is_bounded_and_returns_configuration_order(workspace, blocking_runner):
     result = run_fleet_operation(
         workspace, "health", workspace.projects,
-        FleetOperationRequest(), blocking_runner,
+        FleetBaseRequest(), blocking_runner,
     )
     assert blocking_runner.max_active == workspace.max_parallel == 2
     assert [project.id for project in result.projects] == ["api", "documentation", "worker"]
@@ -1642,15 +3343,15 @@ def test_partial_failure_does_not_cancel_or_rollback_other_repositories(workspac
         backend="openai", model="gpt-5-mini", deep=True,
         code_only=False,
         project_environments=(
-            ProjectBackendEnvironment(API_UID, {
+            ProjectBackendEnvironment.capture(API_UID, {
                 **minimal_environment(), "OPENAI_API_KEY": "fixture-secret",
-            }),
-            ProjectBackendEnvironment(DOCS_UID, {
+            }, canonical_credential_name="OPENAI_API_KEY"),
+            ProjectBackendEnvironment.capture(DOCS_UID, {
                 **minimal_environment(), "OPENAI_API_KEY": "fixture-secret",
-            }),
-            ProjectBackendEnvironment(WORKER_UID, {
+            }, canonical_credential_name="OPENAI_API_KEY"),
+            ProjectBackendEnvironment.capture(WORKER_UID, {
                 **minimal_environment(), "OPENAI_API_KEY": "fixture-secret",
-            }),
+            }, canonical_credential_name="OPENAI_API_KEY"),
         ),
     )
     result = run_fleet_operation(
@@ -1665,15 +3366,243 @@ def test_partial_failure_does_not_cancel_or_rollback_other_repositories(workspac
         for environment in recording_runner.refresh_environments
     )
     assert "fixture-secret" not in repr(request)
+
+def test_refresh_environment_is_immutable_after_capture_and_while_queued(
+    workspace, queued_runner,
+) -> None:
+    source = {**minimal_environment(), "OPENAI_API_KEY": "original-secret"}
+    captured = ProjectBackendEnvironment.capture(
+        workspace.projects[0].project_uid, source,
+        canonical_credential_name="OPENAI_API_KEY",
+    )
+    request = RefreshFleetRequest(
+        "openai", "gpt-5", False, False, (captured,)
+    )
+    queued_runner.after_gate(lambda: source.__setitem__(
+        "OPENAI_API_KEY", "replacement-secret"
+    ))
+    run_fleet_operation(
+        workspace, "refresh", (workspace.projects[0],), request, queued_runner
+    )
+    assert queued_runner.environments == [{
+        **minimal_environment(), "OPENAI_API_KEY": "original-secret",
+    }]
+    assert captured.as_mapping() is not captured.as_mapping()
+
+
+def test_worker_request_cannot_observe_another_project_environment(
+    workspace, malicious_recording_runner,
+) -> None:
+    environments = tuple(
+        ProjectBackendEnvironment.capture(
+            project.project_uid,
+            {**minimal_environment(), "OPENAI_API_KEY": f"secret-{project.id}"},
+            canonical_credential_name="OPENAI_API_KEY",
+        )
+        for project in workspace.projects
+    )
+    aggregate = RefreshFleetRequest(
+        "openai", "gpt-5", False, False, environments
+    )
+    run_fleet_operation(
+        workspace, "refresh", workspace.projects, aggregate,
+        malicious_recording_runner,
+    )
+    for admission, work_request in malicious_recording_runner.calls:
+        assert type(work_request) is RefreshProjectWorkRequest
+        assert not hasattr(work_request, "project_environments")
+        assert work_request.environment is not None
+        assert work_request.environment.project_uid == admission.project.project_uid
+        visible = work_request.environment.as_mapping()
+        assert visible["OPENAI_API_KEY"] == f"secret-{admission.project.id}"
+        assert all(
+            f"secret-{other.id}" not in repr(work_request)
+            and f"secret-{other.id}" not in json.dumps(visible)
+            for other in workspace.projects if other.id != admission.project.id
+        )
+
+def test_code_only_refresh_has_no_semantic_fields_or_captured_environments(
+    workspace, recording_runner,
+) -> None:
+    request = RefreshFleetRequest(
+        backend=None, model=None, deep=False, code_only=True,
+        project_environments=(),
+    )
+    run_fleet_operation(
+        workspace, "refresh", workspace.projects, request, recording_runner
+    )
+    assert recording_runner.refresh_options == [
+        RefreshOptions(None, None, False, True)
+    ] * len(workspace.projects)
+    assert recording_runner.refresh_ambient == [{}] * len(workspace.projects)
+
+@pytest.mark.parametrize("request", [
+    RefreshFleetRequest("openai", None, False, False, ()),
+    RefreshFleetRequest(None, "gpt-5", False, False, ()),
+    RefreshFleetRequest(None, None, True, True, ()),
+    RefreshFleetRequest("openai", "gpt-5", False, True, ()),
+])
+def test_invalid_code_only_or_semantic_pair_fails_before_runner_or_secret(
+    workspace, recording_runner, request,
+) -> None:
+    with pytest.raises(FleetConfigError, match="fleet_invalid"):
+        run_fleet_operation(
+            workspace, "refresh", workspace.projects, request, recording_runner
+        )
+    assert recording_runner.calls == []
+
+@pytest.mark.parametrize("journal_state", ["recoverable", "corrupt"])
+def test_fleet_recovery_gate_runs_before_runner_and_mutation(
+    workspace, recording_runner, journal_state
+) -> None:
+    seed_init_journal(workspace.projects[0], journal_state)
+    before = tuple(tree_snapshot(project.root) for project in workspace.projects)
+    with pytest.raises(FleetConfigError) as raised:
+        run_fleet_operation(
+            workspace, "refresh", workspace.projects,
+            RefreshFleetRequest("openai", "gpt-5", True, False, ()),
+            recording_runner,
+        )
+    assert raised.value.code == "init_recovery_required"
+    assert recording_runner.calls == []
+    assert tuple(tree_snapshot(project.root) for project in workspace.projects) == before
+
+def test_repository_replaced_after_workspace_load_fails_before_runner(
+    workspace, recording_runner, tmp_path,
+) -> None:
+    project = workspace.projects[0]
+    original = tmp_path / "original-api"
+    replace_repository_root_with_copied_id_uid(project.root, original)
+    replacement_before = tree_snapshot(project.root)
+    with pytest.raises(FleetConfigError) as raised:
+        run_fleet_operation(
+            workspace, "health", workspace.projects,
+            FleetBaseRequest(), recording_runner,
+        )
+    assert raised.value.code == "fleet_repository_changed"
+    assert recording_runner.calls == []
+    assert tree_snapshot(project.root) == replacement_before
+    assert not (project.root / ".project-knowledge").exists()
+
+def test_fleet_admission_reloads_current_manifest_before_credential_binding(
+    workspace,
+) -> None:
+    project = workspace.projects[0]
+    rewrite_manifest_semantically(
+        project.root, project_id=project.id, project_uid=project.project_uid,
+        track_html=True,
+    )
+    admissions = require_fleet_projects_ready((project,))
+    assert admissions[0].manifest.track_html is True
+
+
+def test_pre_secret_admission_change_is_rejected_before_request_credential_use(
+    workspace, recording_runner,
+) -> None:
+    selected = (workspace.projects[0],)
+    admitted = require_fleet_projects_ready(selected)
+    rewrite_manifest_semantically(
+        selected[0].root,
+        artifacts=github_artifacts(repository="attacker/redirect"),
+    )
+    request = PullFleetRequest(GithubCredentials("must-remain-unused"))
+    with pytest.raises(FleetConfigError) as raised:
+        run_fleet_operation(
+            workspace, "pull", selected, request, recording_runner,
+            expected_admissions=admitted,
+        )
+    assert raised.value.code == "fleet_manifest_changed"
+    assert recording_runner.calls == []
+    assert recording_runner.credential_reads == []
+
+
+def test_worker_reload_requires_full_aggregate_manifest_semantics(
+    workspace, production_runner_fixture,
+) -> None:
+    project = workspace.projects[0]
+    production_runner_fixture.after_aggregate_gate(
+        lambda: rewrite_manifest_semantically(
+            project.root,
+            project_id=project.id,
+            project_uid=project.project_uid,
+            privacy=privacy_with_extra_include("private"),
+            artifacts=github_artifacts(repository="attacker/redirect"),
+        )
+    )
+    result = run_fleet_operation(
+        workspace, "pull", (project,),
+        PullFleetRequest(GithubCredentials("must-remain-unused")),
+        production_runner_fixture.runner,
+    )
+    assert result.projects[0].error_code == "fleet_manifest_changed"
+    assert production_runner_fixture.https_calls == []
+    assert production_runner_fixture.gh_calls == []
+
+def test_fleet_admission_rejects_changed_project_identity_before_runner(
+    workspace, recording_runner,
+) -> None:
+    project = workspace.projects[0]
+    rewrite_manifest_semantically(project.root, project_uid=uuid4())
+    with pytest.raises(FleetConfigError) as raised:
+        run_fleet_operation(
+            workspace, "health", (project,), FleetBaseRequest(),
+            recording_runner,
+        )
+    assert raised.value.code == "fleet_manifest_changed"
+    assert recording_runner.calls == []
+
+@pytest.mark.parametrize(
+    "operation", ["doctor", "health", "pull", "refresh", "registry-sync", "query"]
+)
+def test_root_swap_after_aggregate_gate_is_caught_by_operation_boundary(
+    workspace, production_runner_fixture, operation,
+) -> None:
+    project = workspace.projects[0]
+    replacement = production_runner_fixture.swap_root_after_aggregate_gate(project)
+    result = run_fleet_operation(
+        workspace, operation, (project,),
+        production_runner_fixture.request_for(operation),
+        production_runner_fixture.runner,
+    )
+    assert result.status == "failed"
+    assert result.projects[0].error_code == "fleet_repository_changed"
+    assert production_runner_fixture.graphify_calls == []
+    assert production_runner_fixture.https_calls == []
+    assert production_runner_fixture.gh_calls == []
+    assert production_runner_fixture.registry_capture_calls == []
+    assert tree_snapshot(project.root) == replacement
+
+@pytest.mark.parametrize("mutation", ["valid_semantic_change", "malformed_yaml"])
+@pytest.mark.parametrize(
+    "operation", ["doctor", "health", "pull", "refresh", "registry-sync", "query"]
+)
+def test_manifest_swap_after_worker_reload_fails_before_graphify(
+    workspace, production_runner_fixture, mutation, operation,
+) -> None:
+    project = workspace.projects[0]
+    production_runner_fixture.swap_manifest_after_worker_admission(
+        project, mutation, operation=operation
+    )
+    result = run_fleet_operation(
+        workspace, operation, (project,),
+        production_runner_fixture.request_for(operation),
+        production_runner_fixture.runner,
+    )
+    assert result.status == "failed"
+    assert result.projects[0].error_code == "fleet_manifest_changed"
+    assert production_runner_fixture.graphify_calls == []
+    assert production_runner_fixture.https_calls == []
+    assert production_runner_fixture.gh_calls == []
+    assert production_runner_fixture.registry_capture_calls == []
 ```
 
-The CLI constructs one `ProjectBackendEnvironment` per selected project by resolving its compatibility contract and selected `BackendContract`, then taking the credential from `ATLASWEAVER_BACKEND_TOKEN` when that trusted-wrapper bridge is present or otherwise from that backend's one `canonical_credential_environment`. It starts from Core's `minimal_environment()` (exactly `HOME`, `LANG`, `LC_ALL`, and `PATH`), calls `bind_semantic_backend_credential(contract, backend, credential)`, and merges only that returned one-key mapping. For `openai` the only additional name is `OPENAI_API_KEY`; the other exact registry mappings are `ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY`, `GEMINI_API_KEY`, `MOONSHOT_API_KEY`, and `OLLAMA_API_KEY`. A missing credential is accepted only when the selected compatibility backend declares credentialless operation, in which case only the four base names remain. `RefreshFleetRequest` contains no generic token field, executable override, arbitrary argv, output path, provider override, or allow-dirty field.
+Only semantic CLI mode constructs one `ProjectBackendEnvironment` per selected project. It resolves that project's current compatibility and `BackendContract`, passes the exact `canonical_credential_environment` into `capture`, then takes the credential from `ATLASWEAVER_BACKEND_TOKEN` when that trusted-wrapper bridge is present or otherwise from that one canonical name. It starts from Core's `minimal_environment()` (exactly `HOME`, `LANG`, `LC_ALL`, and `PATH`), calls `bind_semantic_backend_credential(contract, backend, credential)`, and merges only that returned one-key mapping. For `openai` the only additional name is `OPENAI_API_KEY`; the other exact registry mappings are `ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY`, `GEMINI_API_KEY`, `MOONSHOT_API_KEY`, and `OLLAMA_API_KEY`. A missing credential is accepted only when the selected compatibility backend declares credentialless operation, in which case only the four base names remain. Code-only constructs no project environment, reads no secret, and uses `RefreshFleetRequest(None, None, False, True, ())`. The request contains no generic token field, executable override, arbitrary argv, output path, provider override, or allow-dirty field.
 
 - [ ] **Step 2: Write serialized registry and atomic fleet-query tests**
 
 ```python
 def test_registry_sync_is_globally_serialized_in_workspace_order(workspace, recording_runner):
-    result = run_fleet_operation(workspace, "registry-sync", workspace.projects, FleetOperationRequest(), recording_runner)
+    result = run_fleet_operation(workspace, "registry-sync", workspace.projects, FleetBaseRequest(), recording_runner)
     assert recording_runner.registry_max_active == 1
     assert recording_runner.registry_order == ["api", "documentation", "worker"]
     assert [item.id for item in result.projects] == recording_runner.registry_order
@@ -1691,6 +3620,14 @@ def test_fleet_query_uses_one_verified_atomic_registry_snapshot(workspace, regis
     assert result.result is not None
     assert result.result["trust"] == "navigation"
     assert all(project.result is None for project in result.projects)
+
+@pytest.mark.parametrize("command,expected_depth", [("explain", 1), ("affected", 2)])
+def test_registry_query_default_depth_matches_single_repository_api(
+    registry_fixture, command: str, expected_depth: int,
+) -> None:
+    request = RegistryQueryRequest(command=command, node="api:start")
+    query_registry(registry_fixture.current_snapshot(), request)
+    assert registry_fixture.traversal_depth == expected_depth
 
 
 @pytest.mark.parametrize("state", ["missing", "stale", "mismatch", "projection_mismatch"])
@@ -1711,7 +3648,133 @@ Expected: FAIL for missing `run_fleet_operation`/request/result types.
 
 - [ ] **Step 4: Implement operation delegation without lifecycle duplication**
 
-Use `ThreadPoolExecutor(max_workers=workspace.max_parallel)` only for doctor, health, pull, and refresh. Submit in configuration order, retain a future-to-index map, catch only the public operation exception families, convert them to stable path-free `FleetProjectResult`, and assemble results by index. Do not stop already submitted independent work after one failure. Never share manifest, lifecycle lock, credential environment, temporary directory, or mutation state between projects. `DEFAULT_FLEET_RUNNER` delegates exactly: doctor to `doctor_project`; health to `assess_health(inspect_project_state(...))`; refresh to `refresh_project(..., RefreshOptions(...), ambient=project_environment.values)`; pull to `pull_bundle`; and registry sync/status to their core APIs. It passes neither test-only executable nor runner overrides.
+`_load_fleet_project_manifest` opens a selected repository through
+`open_repository_access(...,
+expected_repository_identity=project.repository_identity)`, calls
+`inspect_init_journal(..., repository_access=repository)`, descriptor-loads the
+current manifest, and re-requires schema 2 plus exact configured project ID/UID.
+When `expected_manifest` is supplied it also requires exact full semantic
+equality through Core's manifest contract: Graphify version, privacy/include/
+exclude/coverage controls, output, feature intent, artifact host/repository/
+repository ID/channel/source ref/signer, and every remaining schema field—not
+merely ID/UID.
+It returns `FleetProjectAdmission`; it never trusts or stores a manifest loaded
+only at workspace-parse time. Identity mismatch is constant/path-free
+`fleet_repository_changed`; changed schema/ID/UID or a manifest race is
+`fleet_manifest_changed`; recoverable/corrupt state is
+`init_recovery_required`. `require_fleet_projects_ready` runs this helper for
+every selected repository in configuration order and returns the admissions;
+it creates nothing. A `stat()` followed by a pathname reopen is forbidden as
+authority. The CLI uses these returned current manifests to resolve each
+compatibility/backend contract before secret lookup, retains the exact tuple,
+constructs the closed credential/environment request, and passes the tuple as
+`expected_admissions`. A provider/privacy/signer rewrite after token lookup can
+therefore never receive that token or become the worker's current contract.
+
+`run_fleet_operation` first validates an optional `expected_admissions` tuple
+against the exact selected IDs/UIDs/order, then invokes the aggregate gate
+before allocating workers or touching any request credential mapping. Every
+fresh aggregate manifest must be fully semantically equal to the corresponding
+expected pre-secret manifest or the operation fails `fleet_manifest_changed`
+without reading a request credential field. It retains that aggregate admission
+map, and each per-project worker reloads once more with
+`expected_manifest=aggregate_admission.manifest` immediately before its
+operation and passes both that equal current manifest and the persisted expected root identity
+into the exact consuming Core/artifact API. Every Core API accepting a manifest
+performs its own descriptor-rooted `require_current_manifest` check, closing the
+last gap between worker reload and child/graph access. A root, journal, or
+manifest swap after any earlier gate therefore yields a failed project with the
+same stable code and no Graphify child, GitHub/gh call, registry capture, or
+replacement mutation. Query reloads all project manifests immediately before
+registry status/capture.
+
+Before admission or field access, require the exact closed operation/request
+pair: doctor, health, and registry-sync accept only `FleetBaseRequest`; pull
+accepts only `PullFleetRequest`; refresh only `RefreshFleetRequest`; query only
+`FleetQueryRequest`. Subclasses, booleans in integer fields, duplicate project
+environment UUIDs, missing/extra selected UUIDs, and every mismatched pair fail
+as path-free `fleet_invalid` before a secret is read or a runner/future is
+created. All request dataclasses are frozen; credential-bearing fields use
+`repr=False`, are omitted from result serialization, and are scoped to the one
+matching selected operation.
+
+For refresh, enforce the exact mode contract before environment field access:
+code-only requires `backend is None`, `model is None`, `deep is False`, and an
+empty `project_environments` tuple. Semantic mode requires non-empty validated
+`backend` and public `model`, permits `deep`, and requires exactly one captured
+environment for every selected project. No mixed pair is representable past
+admission.
+
+`ProjectBackendEnvironment.capture` validates exact `str` keys/values and
+copies caller data immediately into one canonical immutable tuple: `HOME`,
+`LANG`, `LC_ALL`, `PATH` in that order, followed by zero or one compatibility-
+declared credential name. It rejects duplicates, extra/missing base names,
+wrong credential name, subclasses, controls, and a mapping that changes during
+the defensive copy. The caller supplies the canonical credential name resolved
+from that project's admitted `BackendContract`; capture stores it privately and
+accepts only the four base names plus that optional exact key. For semantic
+dispatch, `run_fleet_operation` independently resolves the current admission's
+backend contract and requires the stored name, optional credential presence,
+and selected UUID coverage to match it before creating futures. The coordinator
+then constructs one new `RefreshProjectWorkRequest` per admission containing
+only that admission's `RefreshOptions` and matching environment object; it does
+not close over or submit the aggregate `RefreshFleetRequest`. A worker receives
+only a new dict from `as_mapping()` for its own child call and discards it
+afterward; no mutable caller mapping, aggregate environment tuple, or another
+project's credential crosses the future boundary. The same split produces
+closed base/pull work requests for their matching operations.
+
+The production runner is the sole constructor of project outcomes and converts
+only the declared domain result `.to_dict()`/fixed serializer for the matching
+operation. The coordinator rejects subclasses, non-string status, non-dict
+result, non-finite numbers, non-string mapping keys, secret-shaped strings,
+unknown operation-specific status, or canonical JSON above 1 MiB as stable
+`fleet_result_invalid`; no runner may return a prebuilt `FleetProjectResult` or
+choose another project's ID/UID/duration. Test runners implement the same
+callable protocol.
+
+Use `ThreadPoolExecutor(max_workers=workspace.max_parallel)` only for doctor,
+health, pull, and refresh. Submit in configuration order, retain a future-to-
+index map, catch only the public operation exception families, map root identity
+authority failure to `fleet_repository_changed`, and map any `ManifestError`
+from a consuming boundary that received `admission.manifest`—including strict
+malformed/unsupported reload and doctor's expected-manifest mismatch—to
+`fleet_manifest_changed`. These authority mappings take precedence over the
+ordinary direct-command `invalid_manifest`/doctor diagnostic shape. Convert
+failures to stable path-
+free `FleetProjectResult`, and assemble results by index. Do not stop already
+submitted independent work after one failure. Never share manifest, lifecycle
+lock, credential environment, temporary directory, or mutation state between
+projects. Each `executor.submit` receives only `(admission, operation,
+project_work_request)` as positional state; its callable/closure captures no
+aggregate request. `DEFAULT_FLEET_RUNNER` receives a `FleetProjectAdmission` and delegates
+exactly: doctor to `doctor_project(project.root,
+expected_repository_identity=project.repository_identity,
+expected_manifest=admission.manifest)`;
+health to `assess_health(inspect_project_state(project.root,
+admission.manifest,
+expected_repository_identity=project.repository_identity))`; refresh to
+`refresh_project(project.root, admission.manifest, request.options,
+ambient=(request.environment.as_mapping() if request.environment is not None else {}),
+expected_repository_identity=project.repository_identity)`; pull to
+`pull_bundle(project.root, request.credentials,
+expected_repository_identity=project.repository_identity,
+expected_manifest=admission.manifest)`;
+registry sync/status to `registry_sync(project.root, admission.manifest, ...)`
+or `registry_status(project.root, admission.manifest, ...)` with the same
+expected identity; aggregate query reloads all admissions then calls the exact
+snapshot/query APIs once. It passes neither test-only
+executable nor runner overrides.
+
+Fleet refresh projects serialize the complete Core `RefreshResult`, including
+descriptor-validated `graph_digest`, `generation_digest`, and installed
+`build_epoch`; they never reconstruct identity from graph bytes. The closed
+result schema permits `recovery_id` only as `null`/omitted on normal results or
+as the bounded opaque Core-generated ID when status is
+`promoted_but_stale` and limitations contain `cleanup_failed`; it is never a
+path and is included in the 1 MiB outcome cap. Content-free
+operation state/CI handoff uses those same fields for verified success, while
+`promoted_but_stale` follows the last-verified-success plus failure rule.
 
 `registry-sync` runs one repository at a time in configuration order because each project operation acquires its repository lifecycle lock then the user-global registry lock. It delegates to the core registry API and maps bounded `registry_busy` independently.
 
@@ -1774,7 +3837,7 @@ project-knowledge uninstall-agent --platform {codex,agents} [--home USER_HOME] [
 project-knowledge fleet <operation> --workspace YAML [--project ID] [--json]
 ```
 
-`fleet refresh` adds only the same validated core refresh flags (`--backend`, `--model`, `--deep`, `--code-only`); it does not accept executable overrides, arbitrary native flags, output paths, provider identity, or `--allow-dirty`. `fleet query` has one required nested operation with the core caps: `query TERM [--limit 1..100]`, `path SOURCE TARGET [--max-depth 1..32]`, `explain NODE [--depth 0..8]`, or `affected NODE [--depth 0..8] [--relation RELATION]` with at most 16 relations. It builds `RegistryQueryRequest`, never an opaque shell string. `GITHUB_TOKEN` and `ATLASWEAVER_BACKEND_TOKEN` are environment-only and never accepted as argv values; no command exposes `--gh-binary` or `--graphify-binary`.
+`fleet refresh` adds only the same validated core refresh flags (`--backend`, `--model`, `--deep`, `--code-only`); semantic mode requires backend and public model together, while either alone fails before project dispatch or secret lookup. Code-only rejects backend/model/deep, serializes both optional fields as `None`, captures no per-project environment, and performs no secret lookup. It does not accept executable overrides, arbitrary native flags, output paths, provider identity, or `--allow-dirty`. `fleet query` has one required nested operation with the core caps: `query TERM [--limit 1..100]`, `path SOURCE TARGET [--max-depth 1..32]`, `explain NODE [--depth 1..2]`, or `affected NODE [--depth 0..8] [--relation RELATION]` with at most 16 relations. It builds `RegistryQueryRequest`, never an opaque shell string. `GITHUB_TOKEN` and `ATLASWEAVER_BACKEND_TOKEN` are environment-only and never accepted as argv values; no command exposes `--gh-binary` or `--graphify-binary`.
 
 - [ ] **Step 2: Write success/error JSON and read-only/mutation tests**
 
@@ -1806,8 +3869,178 @@ def test_pull_requires_environment_token_without_echoing_it(repo, monkeypatch):
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     result = run_cli("pull", "--repo", repo, "--json")
     assert result.returncode == 1
-    assert json.loads(result.stdout)["code"] == "github_token_required"
+    assert json.loads(result.stdout)["error"]["code"] == "github_token_required"
     assert result.stderr == ""
+
+@pytest.mark.parametrize(("arguments", "expected"), [
+    (("--backend", "openai"), "semantic_model_required"),
+    (("--model", "gpt-5"), "semantic_backend_required"),
+    (("--backend", "openai", "--model=--api-key"), "semantic_model_required"),
+    (("--backend", "openai", "--model", "bad\nmodel"), "semantic_model_required"),
+    (("--backend", "openai", "--model", "ghp_" + "a" * 32), "semantic_model_required"),
+])
+def test_fleet_refresh_validates_public_model_before_secret_or_dispatch(
+    workspace, arguments, expected, monkeypatch
+) -> None:
+    reads: list[str] = []
+    monkeypatch.setattr(
+        "project_knowledge.cli._read_secret_environment",
+        lambda name: reads.append(name) or pytest.fail("secret read"),
+    )
+    runner = RecordingFleetRunner()
+    result = invoke_cli_with_fleet_runner(
+        runner, "fleet", "refresh", "--workspace", workspace,
+        *arguments, "--json",
+    )
+    assert json.loads(result.stdout)["error"]["code"] == expected
+    assert reads == []
+    assert runner.calls == []
+
+def test_fleet_root_replacement_after_load_precedes_secret_and_dispatch(
+    workspace, monkeypatch,
+) -> None:
+    real_load = load_fleet_workspace
+    def load_then_replace(path: Path) -> FleetWorkspace:
+        loaded = real_load(path)
+        replace_repository_root_with_copied_id_uid(
+            loaded.projects[0].root, path.parent / "original-api"
+        )
+        return loaded
+    monkeypatch.setattr(
+        "project_knowledge.cli.load_fleet_workspace", load_then_replace
+    )
+    monkeypatch.setattr(
+        "project_knowledge.cli._read_secret_environment",
+        lambda name: pytest.fail(f"secret read after repository replacement: {name}"),
+    )
+    runner = RecordingFleetRunner()
+    result = invoke_cli_with_fleet_runner(
+        runner, "fleet", "refresh", "--workspace", workspace,
+        "--backend", "openai", "--model", "gpt-5", "--json",
+    )
+    assert json.loads(result.stdout)["error"]["code"] == "fleet_repository_changed"
+    assert runner.calls == []
+
+
+def test_fleet_manifest_change_after_token_read_cannot_redirect_credential(
+    workspace, monkeypatch, fake_https, fake_runner,
+) -> None:
+    project = first_project(workspace)
+    monkeypatch.setenv("GITHUB_TOKEN", "must-remain-unused")
+    install_secret_read_checkpoint(
+        "GITHUB_TOKEN",
+        lambda: rewrite_manifest_semantically(
+            project.root,
+            artifacts=github_artifacts(repository="attacker/redirect"),
+        ),
+    )
+    result = run_cli(
+        "fleet", "pull", "--workspace", workspace, "--json",
+        dependencies=fleet_pull_dependencies(fake_https, fake_runner),
+    )
+    document = json.loads(result.stdout)
+    assert document["projects"][0]["error_code"] == "fleet_manifest_changed"
+    assert fake_https.calls == []
+    assert fake_runner.calls == []
+
+
+def test_pull_cli_rejects_control_bearing_token_before_https_or_gh(
+    repo, monkeypatch, fake_https, fake_runner,
+) -> None:
+    monkeypatch.setenv("GITHUB_TOKEN", "token\r\ninjected: value")
+    result = run_cli(
+        "pull", "--repo", repo, "--json",
+        dependencies=pull_dependencies(fake_https, fake_runner),
+    )
+    assert json.loads(result.stdout)["error"]["code"] == "github_token_required"
+    assert fake_https.calls == []
+    assert fake_runner.calls == []
+
+@pytest.mark.parametrize("journal_state", ["recoverable", "corrupt"])
+@pytest.mark.parametrize("direct_command", ["artifact-pack", "artifact-install", "pull"])
+def test_repo_and_fleet_commands_gate_init_recovery_before_secret_or_mutation(
+    repo, workspace_for_repo, journal_state, direct_command, monkeypatch
+) -> None:
+    seed_init_journal(repo, journal_state)
+    before = tree_snapshot(repo)
+    monkeypatch.setattr(
+        "project_knowledge.cli._read_secret_environment",
+        lambda name: pytest.fail("secret read before recovery gate"),
+    )
+    direct = invoke_recovery_gated_direct_command(direct_command, repo)
+    fleet = run_cli(
+        "fleet", "refresh", "--workspace", workspace_for_repo,
+        "--backend", "openai", "--model=--api-key", "--json",
+    )
+    assert json.loads(direct.stdout)["error"]["code"] == "init_recovery_required"
+    assert json.loads(fleet.stdout)["error"]["code"] == "init_recovery_required"
+    assert tree_snapshot(repo) == before
+
+@pytest.mark.parametrize("command", ["artifact-install", "pull", "fleet-refresh"])
+def test_all_promoted_but_stale_commands_use_global_result_exit_three(
+    command, stale_result_fixture
+) -> None:
+    result = invoke_stale_command(command, stale_result_fixture)
+    document = json.loads(result.stdout)
+    assert result.returncode == 3
+    assert document["status"] == "promoted_but_stale"
+    assert "code" not in document
+
+@pytest.mark.parametrize("family,fallback_code,fallback_message", [
+    (BundleError, "bundle_failed", "bundle operation failed"),
+    (GithubArtifactError, "github_artifact_failed", "GitHub artifact operation failed"),
+    (AgentInstallError, "agent_install_failed", "agent resource operation failed"),
+    (FleetConfigError, "fleet_invalid", "fleet request is invalid"),
+    (WorkflowPublishError, "workflow_publish_failed", "workflow publication failed"),
+])
+def test_forged_family_code_and_message_never_escape_public_envelope(
+    family, fallback_code, fallback_message, monkeypatch,
+) -> None:
+    forged = "private_path_" + str(Path.home())
+    monkeypatch.setattr(
+        "project_knowledge.cli._dispatch_typed",
+        raising(family(forged, "secret message " + forged)),
+    )
+    result = run_cli("artifact", "pack", "--repo", fixture_repo(), "--json")
+    assert json.loads(result.stdout)["error"] == {
+        "code": fallback_code, "message": fallback_message,
+    }
+    assert forged not in result.stdout + result.stderr
+
+def test_every_documented_new_error_has_constant_message_and_exit() -> None:
+    for family, table in documented_artifact_error_tables():
+        for code, (exit_code, message) in table.items():
+            rendered = map_public_error(family(code, "attacker-controlled message"))
+            assert rendered == (exit_code, code, message)
+
+
+@pytest.mark.parametrize("error", [
+    BundleError("bundle_cleanup_failed", "ignored", "a" * 32),
+    BundleError("bundle_output_recovery_required", "ignored", "b" * 32),
+    GithubArtifactError("github_cleanup_failed", "ignored", "c" * 32),
+    WorkflowPublishError("workflow_cleanup_failed", "ignored", "d" * 32),
+    WorkflowPublishError(
+        "workflow_output_recovery_required", "ignored", "e" * 32
+    ),
+])
+def test_only_closed_cleanup_errors_expose_validated_recovery_id(error) -> None:
+    rendered = render_public_error_document(error)
+    assert rendered["error"]["recovery_id"] == error.recovery_id
+    forged = type(error)("private_code", "ignored", "f" * 32)
+    assert "recovery_id" not in render_public_error_document(forged)["error"]
+
+def test_direct_and_fleet_manifest_races_use_distinct_closed_codes(
+    repo, workspace_for_repo, manifest_race,
+) -> None:
+    manifest_race.rewrite_after_admission(repo)
+    direct = run_cli("pull", "--repo", repo, "--json")
+    fleet = run_cli(
+        "fleet", "pull", "--workspace", workspace_for_repo, "--json"
+    )
+    assert json.loads(direct.stdout)["error"]["code"] == "manifest_changed"
+    assert json.loads(fleet.stdout)["projects"][0]["error_code"] == (
+        "fleet_manifest_changed"
+    )
 ```
 
 Also assert doctor/health/fleet-health/query before/after tree equality; pack creates only the explicit output plus mutation state; install/pull/refresh mutate only their selected repository; agent commands mutate only the selected platform home; unknown selection prevents all fleet work.
@@ -1823,18 +4056,158 @@ Expected: parser surface and command invocations fail because the new commands a
 Register nested `argparse` subparsers and dispatch to typed handler functions; do not inspect raw argv after parsing. Normalize UUIDs to canonical strings only at JSON serialization. Add stable error mappings:
 
 ```python
-ERROR_EXIT_CODES = {
-    "bundle_invalid": 1, "bundle_too_large": 1, "bundle_stale": 1,
-    "bundle_identity_mismatch": 1, "bundle_pull_required": 1,
-    "bundle_unattested": 1, "github_token_required": 1,
-    "github_resolution_failed": 1, "attestation_failed": 1,
-    "agent_destination_unmanaged": 1, "agent_destination_modified": 1,
-    "fleet_invalid": 1, "fleet_partial_failure": 1,
-    "promoted_but_stale": 2,
+from types import MappingProxyType
+
+_ADMISSION_PUBLIC_ERRORS = {
+    "init_recovery_required": (1, "configuration recovery is required"),
+    "manifest_migration_required": (1, "manifest migration is required"),
 }
+
+BUNDLE_PUBLIC_ERRORS = MappingProxyType({
+    **_ADMISSION_PUBLIC_ERRORS,
+    "bundle_invalid": (1, "bundle validation failed"),
+    "bundle_too_large": (1, "bundle exceeds its size limit"),
+    "bundle_changed_during_capture": (1, "bundle changed during capture"),
+    "bundle_output_exists": (1, "bundle output already exists"),
+    "bundle_output_in_source": (1, "bundle output overlaps its source"),
+    "bundle_cleanup_failed": (1, "private bundle cleanup failed"),
+    "bundle_output_recovery_required": (1, "bundle output recovery is required"),
+    "bundle_source_drift": (1, "project source changed"),
+    "bundle_generation_changed": (1, "graph generation changed"),
+    "bundle_identity_mismatch": (1, "bundle identity does not match"),
+    "bundle_stale": (1, "bundle is stale"),
+    "bundle_pull_required": (1, "remote bundle requires verified pull"),
+    "bundle_unattested": (1, "bundle is not authorized for install"),
+})
+
+GITHUB_PUBLIC_ERRORS = MappingProxyType({
+    **_ADMISSION_PUBLIC_ERRORS,
+    "github_token_required": (1, "GitHub credential is required"),
+    "github_resolution_failed": (1, "GitHub artifact resolution failed"),
+    "github_redirect_invalid": (1, "GitHub artifact redirect is invalid"),
+    "github_cleanup_failed": (1, "private GitHub cleanup failed"),
+    "attestation_failed": (1, "artifact attestation verification failed"),
+    "attestation_ambiguous": (1, "artifact attestation is ambiguous"),
+})
+
+AGENT_PUBLIC_ERRORS = MappingProxyType({
+    "agent_destination_unmanaged": (1, "agent destination is unmanaged"),
+    "agent_destination_modified": (1, "managed agent destination was modified"),
+    "agent_install_failed": (1, "agent resource operation failed"),
+})
+
+FLEET_PUBLIC_ERRORS = MappingProxyType({
+    **_ADMISSION_PUBLIC_ERRORS,
+    "fleet_invalid": (1, "fleet request is invalid"),
+    "fleet_document_too_large": (1, "fleet document exceeds its size limit"),
+    "fleet_manifest_too_large": (1, "project manifest exceeds its size limit"),
+    "fleet_repository_changed": (1, "fleet repository identity changed"),
+    "fleet_manifest_changed": (1, "fleet project contract changed"),
+    "fleet_git_changed": (1, "fleet Git identity changed"),
+    "fleet_worktree_alias": (1, "fleet repositories alias one Git worktree"),
+    "fleet_result_invalid": (1, "fleet project result is invalid"),
+    "fleet_partial_failure": (1, "one or more fleet operations failed"),
+})
+
+REGISTRY_SNAPSHOT_PUBLIC_ERRORS = MappingProxyType({
+    "registry_snapshot_missing": (1, "registry snapshot is missing"),
+    "registry_snapshot_stale": (1, "registry snapshot is stale"),
+    "registry_snapshot_mismatch": (1, "registry snapshot identity does not match"),
+    "registry_snapshot_too_large": (1, "registry snapshot exceeds its size limit"),
+    "registry_snapshot_busy": (1, "registry snapshot is busy"),
+})
+
+WORKFLOW_BOUNDARY_PUBLIC_ERRORS = MappingProxyType({
+    "workflow_root_invalid": (1, "workflow repository root is invalid"),
+    "workflow_root_forbidden": (1, "workflow repository root is forbidden"),
+    "workflow_root_changed": (1, "workflow repository root changed"),
+})
+
+WORKFLOW_PUBLIC_ERRORS = MappingProxyType({
+    **_ADMISSION_PUBLIC_ERRORS,
+    "workflow_root_invalid": (1, "workflow repository root is invalid"),
+    "workflow_root_forbidden": (1, "workflow repository root is forbidden"),
+    "workflow_root_changed": (1, "workflow repository root changed"),
+    "workflow_platform_unsupported": (1, "publication platform is unsupported"),
+    "workflow_git_unavailable": (1, "publication Git authority is unavailable"),
+    "workflow_source_mismatch": (1, "publication source identity does not match"),
+    "workflow_cleanup_failed": (1, "private publication cleanup failed"),
+    "workflow_output_recovery_required": (
+        1, "publication output recovery is required"
+    ),
+    "workflow_publish_failed": (1, "workflow publication failed"),
+})
+
+FAMILY_FALLBACKS = MappingProxyType({
+    BundleError: (1, "bundle_failed", "bundle operation failed"),
+    GithubArtifactError: (1, "github_artifact_failed", "GitHub artifact operation failed"),
+    AgentInstallError: (1, "agent_install_failed", "agent resource operation failed"),
+    FleetConfigError: (1, "fleet_invalid", "fleet request is invalid"),
+    WorkflowBoundaryError: (
+        1, "workflow_root_invalid", "workflow repository root is invalid"
+    ),
+    WorkflowPublishError: (1, "workflow_publish_failed", "workflow publication failed"),
+})
 ```
 
-All errors emit `{"schema_version":1,"command":"artifact install","status":"error","code":"bundle_invalid"}` with the actual command/code substituted from fixed enums and no raw exception message. `pull` copies `GITHUB_TOKEN` into a local variable, immediately removes it from any child/base environment map, and passes it explicitly only to resolver/verifier. For fleet refresh, validate workspace and selection first, prefer the trusted-wrapper `ATLASWEAVER_BACKEND_TOKEN` when set, otherwise read only each selected backend's registry-declared canonical credential name, call `minimal_environment()` and `bind_semantic_backend_credential()` separately for every selected project's compatibility contract, merge exactly the four base entries plus at most that one canonical credential, construct the exact `ProjectBackendEnvironment` tuple, then discard all source credential references before dispatch. An unselected project never receives a binding and non-refresh commands never read these variables. Agent default homes are platform-adapter values. Fleet selection is validated before any credential is read or any runner is invoked.
+The mapper selects a table by exact exception family, looks up only the exact
+`.code`, and substitutes the constant code/message/exit from that table. It
+never serializes the exception's code or message directly. Unknown/forged
+codes, subclasses, or a wrong-family documented code use that family's fixed
+fallback. Extend Core's immutable `RegistryError` allowlist with exactly
+`REGISTRY_SNAPSHOT_PUBLIC_ERRORS`; operation-state write failures collapse to
+Core's constant `state_write_failed` and never replace the primary operation
+result. `ManifestError(kind="changed")` continues through Core's closed mapper
+as direct `manifest_changed`; the fleet coordinator translates it to
+`fleet_manifest_changed` before constructing a project row.
+`WorkflowBoundaryError` uses only `WORKFLOW_BOUNDARY_PUBLIC_ERRORS` in the
+check/build internal driver. The publication driver catches that exact family
+and raises `WorkflowPublishError(code, WORKFLOW_PUBLIC_ERRORS[code][1]) from
+None`; it never forwards a boundary exception, arbitrary message, or subclass.
+
+The canonical error serializer includes an optional sibling
+`error.recovery_id` only when the exact exception family/code pair is
+`BundleError` with `bundle_cleanup_failed` or
+`bundle_output_recovery_required`, `GithubArtifactError` with
+`github_cleanup_failed`, or `WorkflowPublishError` with
+`workflow_cleanup_failed`/`workflow_output_recovery_required`. It validates the
+lowercase-hex grammar again, omits the field when null, and collapses every
+forged code/ID combination to the family fallback without an ID. Successful
+`promoted_but_stale` result envelopes may include the same validated
+`recovery_id` only for a committed cleanup failure.
+
+`promoted_but_stale` is intentionally absent from all error maps: refresh,
+artifact install, pull, and fleet refresh serialize it as a successful result
+shape with the descriptor-revalidated installed identity (or an all-null
+unverifiable graph/generation/epoch identity) and return
+the one global exit code 3 inherited from Core.
+
+Preserve Core Task 11's centralized routing while adding repo-less commands.
+Route `fleet`, `install-agent`, and `uninstall-agent` before
+`_real_repo`/generic manifest loading. Fleet loads its workspace, validates
+selection, and calls `require_fleet_projects_ready`—which atomically validates
+every persisted repository identity—before any secret access. It retains that
+exact admission tuple across request construction and passes it to
+`run_fleet_operation(expected_admissions=...)`; the coordinator's first fresh
+gate must match every full manifest semantic before it may inspect the closed
+request's credential fields. Every direct
+repository command—including `artifact pack`, `artifact install`, and `pull`—
+derives its explicit `--repo`, opens one noncreating `RepositoryAccess`, applies
+`inspect_init_journal(..., repository_access=repository) == "none"` before
+manifest/library dispatch or secret lookup, captures that access identity, and
+passes it as `expected_repository_identity` to the consuming pack/install/pull
+library boundary. Install and pull also receive the descriptor-loaded admission
+manifest as `expected_manifest` and compare its complete semantic contract
+inside their lifecycle/network boundary; pack also receives the descriptor-
+loaded admission manifest and requires it under its lifecycle lock. Workflow
+build passes the same pair from `WorkflowRepository`. Thus a root or in-place manifest swap after the CLI
+gate cannot redirect a mutation or authenticated network call. Existing
+init/migrate/doctor self-loading behavior
+and the journal gate for all legacy manifest commands remain unchanged; the
+refactor may not bypass or duplicate them.
+
+All errors preserve Core Task 11's one canonical envelope:
+`{"schema_version":1,"command":"artifact install","status":"error","error":{"code":"bundle_invalid","message":"bundle validation failed"}}`, with the actual command/code and a constant path-free message substituted from fixed enums. No command adds a flat top-level `code`, raw exception message, traceback, or alternate error shape. `_read_secret_environment(name)` is the sole private environment lookup for `GITHUB_TOKEN`, `ATLASWEAVER_BACKEND_TOKEN`, and registry-declared canonical backend names, which makes ordering testable. `pull` copies `GITHUB_TOKEN` into a local variable only after the recovery gate, immediately removes it from any child/base environment map, and passes it explicitly only to resolver/verifier. For fleet refresh, after workspace/selection/recovery validation, validate backend/model pairing and call Core's `validate_public_model_identifier(model)` before `_read_secret_environment` for any name. Missing backend is `semantic_backend_required`; missing/rejected model is `semantic_model_required`; code-only rejects all semantic flags, constructs the exact empty-environment request, and returns to dispatch without any lookup. Semantic mode then prefers the trusted-wrapper `ATLASWEAVER_BACKEND_TOKEN` when set, otherwise reads only each selected backend's registry-declared canonical credential name, calls `minimal_environment()` and `bind_semantic_backend_credential()` separately for every selected project's compatibility contract, merges exactly the four base entries plus at most that one canonical credential, captures it with that contract's canonical name, constructs the complete `ProjectBackendEnvironment` tuple, then discards all source credential references before dispatch. An unselected project never receives a binding and non-refresh commands never read these variables. Agent default homes are platform-adapter values. Fleet selection and recovery are validated before any credential is read or any runner is invoked.
 
 - [ ] **Step 5: Run all CLI and subsystem suites**
 
@@ -1853,6 +4226,8 @@ git commit -m "feat: expose artifact and universal fleet commands"
 
 **Files:**
 - Create: `.github/workflows/atlasweaver-check.yml`
+- Create: `src/project_knowledge/workflow_boundary.py`
+- Create: `tests/test_workflow_boundary.py`
 - Create: `tests/test_workflows.py`
 - Modify: `.github/workflows/ci.yml`
 - Test: `tests/test_public_release.py`
@@ -1862,6 +4237,10 @@ git commit -m "feat: expose artifact and universal fleet commands"
 - Produces reusable workflow inputs `repo-root: string`, `python-version: string`, `backend: string`, `model: string`, `deep-mode: boolean`, and `require-impact-trust: boolean`.
 - Produces one optional named secret `semantic_backend_token`.
 - Produces internal renderer invocation `python -m project_knowledge.operation_state ci-summary --output-json PATH --preflight PATH --doctor PATH --scan PATH --health PATH`; it writes only under `$RUNNER_TEMP` and `$GITHUB_STEP_SUMMARY`.
+- Produces private `open_workflow_repository(consumer_checkout: Path, repo_root: str, *, forbidden_checkout: Path) -> AbstractContextManager[WorkflowRepository]`. `WorkflowRepository` retains the no-follow consumer/root directory descriptors and exact validated relative segment tuple, exposes the verified `RepositoryIdentity` plus a library-only descriptor-rooted `RepositoryAccess` and `WorkflowGitScope`, and can revalidate every traversed directory entry. The same helper is mandatory for check/build/publish internal drivers and is not a public CLI option.
+- Produces private exact `WorkflowBoundaryError(code: Literal["workflow_root_invalid", "workflow_root_forbidden", "workflow_root_changed", "workflow_extraction_invalid"], message: str)`. The check/build driver renders it only through `WORKFLOW_BOUNDARY_PUBLIC_ERRORS`; the publication driver catches it and constructs an exact `WorkflowPublishError` with the same allowlisted code/constant message. Raw helper text and subclasses never cross either internal entrypoint.
+- Produces private `admit_workflow_extraction_mode(backend: str, model: str, deep: bool) -> Literal["code_only", "semantic"]`: code-only requires empty backend/model and false deep; semantic requires non-empty validated backend/model and permits deep. Its exact internal `workflow_boundary validate-extraction` verb reads only bounded `ATLASWEAVER_BACKEND`, `ATLASWEAVER_MODEL`, and `ATLASWEAVER_DEEP`, deletes them, emits no content, and runs before Graphify install, secret exposure, repository output, or the mode-specific driver.
+- Produces exact internal entrypoint `python -m project_knowledge.workflow_boundary check --consumer-checkout PATH --repo-root RELATIVE --trusted-tool-checkout PATH --output-directory PATH`. In one `WorkflowRepository` scope it emits exactly `preflight.json`, `doctor.json`, `scan.json`, and `health.json`; its strict parser exposes no command/provider/executable/path override beyond those fixed workflow paths and the relative root. Backend/model/deep are read from the fixed workflow environment contract only after repository admission.
 
 - [ ] **Step 1: Write workflow contract tests before creating either workflow**
 
@@ -1888,14 +4267,25 @@ def test_every_action_reference_is_a_full_commit_sha():
             assert PINNED_ACTION.fullmatch(uses), (path, uses)
 
 
+def test_ci_fetches_history_required_by_immutable_pin_contracts():
+    workflow = load_workflow("ci.yml")
+    for checkout in steps_using(workflow, "actions/checkout"):
+        assert checkout["with"]["fetch-depth"] == 0
+
+
 def test_check_never_executes_consumer_commands_or_uploads_graph_content():
     text = (WORKFLOWS / "atlasweaver-check.yml").read_text(encoding="utf-8")
     assert "test-command" not in text
     assert "shell-command" not in text
     assert "graphify-out" not in upload_artifact_paths(load_workflow("atlasweaver-check.yml"))
-    assert all(term in text for term in (
-        "project-knowledge preflight", "project-knowledge doctor", "project-knowledge scan-secrets",
-        "project-knowledge health", "GITHUB_STEP_SUMMARY",
+    assert "python -m project_knowledge.workflow_boundary check" in text
+    assert all(name in text for name in (
+        "preflight.json", "doctor.json", "scan.json", "health.json",
+        "GITHUB_STEP_SUMMARY",
+    ))
+    assert all(term not in text for term in (
+        "project-knowledge preflight", "project-knowledge doctor",
+        "project-knowledge scan-secrets", "project-knowledge health",
     ))
 
 
@@ -1903,8 +4293,10 @@ def test_check_uses_backend_inputs_only_in_read_only_preflight_and_scopes_secret
     workflow = load_workflow("atlasweaver-check.yml")
     preflight = step_named(workflow, "Semantic preflight")
     code_only = step_named(workflow, "Code-only preflight")
-    assert preflight["if"] == "${{ inputs.backend != '' }}"
-    assert code_only["if"] == "${{ inputs.backend == '' }}"
+    assert preflight["if"] == "${{ inputs.backend != '' && inputs.model != '' }}"
+    assert code_only["if"] == (
+        "${{ inputs.backend == '' && inputs.model == '' && !inputs.deep-mode }}"
+    )
     assert "ATLASWEAVER_BACKEND_TOKEN" not in json.dumps(code_only, sort_keys=True)
     assert set(preflight["env"]) == {
         "ATLASWEAVER_BACKEND", "ATLASWEAVER_BACKEND_TOKEN",
@@ -1913,14 +4305,48 @@ def test_check_uses_backend_inputs_only_in_read_only_preflight_and_scopes_secret
     assert preflight["env"]["ATLASWEAVER_BACKEND_TOKEN"] == (
         "${{ secrets.semantic_backend_token }}"
     )
-    assert "--backend" in preflight["run"]
-    assert "--model" in preflight["run"]
-    assert "--deep" in preflight["run"]
+    assert "python -m project_knowledge.workflow_boundary check" in preflight["run"]
+    assert all(flag not in preflight["run"] for flag in (
+        "--backend", "--model", "--deep", "--token", "--credential",
+    ))
     for step in all_steps_except(workflow, "Semantic preflight"):
         assert "ATLASWEAVER_BACKEND_TOKEN" not in json.dumps(step, sort_keys=True)
     assert "semantic_backend_token" not in json.dumps(
         summary_step(workflow), sort_keys=True
     )
+
+
+def test_deep_only_workflow_input_fails_before_secret_graphify_or_output(
+    workflow_spies,
+) -> None:
+    with pytest.raises(WorkflowBoundaryError) as raised:
+        run_internal_extraction_admission(
+            backend="", model="", deep=True, spies=workflow_spies
+        )
+    assert raised.value.code == "workflow_extraction_invalid"
+    assert workflow_spies.secret_reads == []
+    assert workflow_spies.graphify_calls == []
+    assert workflow_spies.output_writes == []
+
+
+def test_check_workflow_runs_no_secret_admission_before_mode_driver():
+    workflow = load_workflow("atlasweaver-check.yml")
+    steps = workflow["jobs"]["check"]["steps"]
+    admission = step_named(workflow, "Validate extraction inputs")
+    semantic = step_named(workflow, "Semantic preflight")
+    code_only = step_named(workflow, "Code-only preflight")
+    assert steps.index(admission) < steps.index(semantic)
+    assert steps.index(admission) < steps.index(code_only)
+    assert set(admission["env"]) == {
+        "ATLASWEAVER_BACKEND", "ATLASWEAVER_DEEP", "ATLASWEAVER_MODEL",
+    }
+    assert "ATLASWEAVER_BACKEND_TOKEN" not in json.dumps(admission)
+    assert "workflow_boundary validate-extraction" in admission["run"]
+    assert semantic["if"] == "${{ inputs.backend != '' && inputs.model != '' }}"
+    assert code_only["if"] == (
+        "${{ inputs.backend == '' && inputs.model == '' && !inputs.deep-mode }}"
+    )
+    assert "ATLASWEAVER_DEEP" not in json.dumps(code_only)
 
 
 def test_reusable_workflow_uses_hard_pinned_trusted_tool_not_caller_workflow_sha():
@@ -1933,6 +4359,74 @@ def test_reusable_workflow_uses_hard_pinned_trusted_tool_not_caller_workflow_sha
     assert "github.workflow_sha" not in text
     assert '--project "$GITHUB_WORKSPACE/atlasweaver-tool"' in text
     assert '--project "$GITHUB_WORKSPACE/consumer"' not in text
+
+
+@pytest.mark.parametrize("repo_root", [
+    "/etc", "../outside", "nested/../../outside", "nested//repo",
+    "nested\\repo", "nested/\x00repo",
+])
+def test_workflow_repository_root_rejects_escape_before_secret_or_graphify(
+    consumer_checkout, trusted_tool_checkout, repo_root, workflow_spies,
+) -> None:
+    with pytest.raises(WorkflowBoundaryError) as raised:
+        run_internal_workflow_check(
+            consumer_checkout, repo_root, trusted_tool_checkout,
+            semantic_token="must-remain-unread",
+            spies=workflow_spies,
+        )
+    assert raised.value.code == "workflow_root_invalid"
+    assert workflow_spies.secret_reads == []
+    assert workflow_spies.graphify_calls == []
+    assert workflow_spies.publication_calls == []
+
+
+def test_workflow_repository_root_rejects_symlink_component_before_secret(
+    consumer_checkout, trusted_tool_checkout, workflow_spies,
+) -> None:
+    (consumer_checkout / "alias").symlink_to(
+        consumer_checkout / "actual", target_is_directory=True
+    )
+    with pytest.raises(WorkflowBoundaryError) as raised:
+        run_internal_workflow_check(
+            consumer_checkout, "alias/repo", trusted_tool_checkout,
+            semantic_token="must-remain-unread", spies=workflow_spies,
+        )
+    assert raised.value.code == "workflow_root_invalid"
+    assert workflow_spies.secret_reads == []
+    assert workflow_spies.graphify_calls == []
+
+
+def test_workflow_repository_cannot_alias_trusted_tool_checkout(
+    trusted_tool_checkout, workflow_spies,
+) -> None:
+    with pytest.raises(WorkflowBoundaryError) as raised:
+        run_internal_workflow_check(
+            trusted_tool_checkout, ".", trusted_tool_checkout,
+            semantic_token="must-remain-unread", spies=workflow_spies,
+        )
+    assert raised.value.code == "workflow_root_forbidden"
+    assert workflow_spies.secret_reads == []
+    assert workflow_spies.graphify_calls == []
+
+
+def test_workflow_repository_root_swap_uses_retained_original_or_fails_closed(
+    consumer_checkout, trusted_tool_checkout, workflow_fault, workflow_spies,
+    tmp_path,
+) -> None:
+    workflow_fault.after_root_open(
+        lambda: replace_repository_root(
+            consumer_checkout / "repo", tmp_path / "original",
+            attacker_repository_with_copied_id_uid(tmp_path),
+        )
+    )
+    outcome = run_internal_workflow_check(
+        consumer_checkout, "repo", trusted_tool_checkout,
+        semantic_token="token", spies=workflow_spies,
+    )
+    assert outcome.code == "workflow_root_changed"
+    assert workflow_spies.secret_reads == []
+    assert workflow_spies.graphify_calls == []
+    assert workflow_spies.replacement_reads == []
 ```
 
 `load_workflow()` uses a YAML 1.2-compatible loader or a PyYAML loader with the YAML 1.1 boolean resolver removed so the key `on` remains a string. `action_uses()` recursively collects every scalar under a `uses` key; local/reusable workflow references are tested separately.
@@ -1984,13 +4478,65 @@ jobs:
         with: {version: "0.8.14", enable-cache: false}
 ```
 
-Follow those fixed setup steps with: `uv sync --project "$GITHUB_WORKSPACE/atlasweaver-tool" --frozen`; `uv tool install 'graphifyy==0.9.48'`; root confinement through the trusted AtlasWeaver checkout; then invoke every Python/CLI command with `uv run --project "$GITHUB_WORKSPACE/atlasweaver-tool"`. Never build/install/run from the consumer checkout or its `pyproject.toml`. Two mutually exclusive read-only steps write the same bounded preflight JSON path: `Code-only preflight` runs when `inputs.backend == ''` and receives no secret/backend/model/deep environment, while `Semantic preflight` runs when `inputs.backend != ''`. Then run doctor, scan, and health into the other three `$RUNNER_TEMP` JSON files. Pass `repo-root`, backend, model, and deep mode through environment variables and quote every expansion—never interpolate `${{ inputs.* }}` directly into shell source. The semantic-preflight step alone receives `semantic_backend_token` as `ATLASWEAVER_BACKEND_TOKEN`; Core reads it once, calls `bind_semantic_backend_credential()`, validates the registry-rendered semantic contract, removes the generic name, and emits only `credential_bound: bool`. Doctor, scan, health, renderer, summaries, and every unselected project receive neither the generic secret nor the canonical backend environment.
+Follow those fixed setup steps with `uv sync --project "$GITHUB_WORKSPACE/atlasweaver-tool" --frozen`, then derive the sole production Graphify version from pinned trusted tool commit A and install it without a YAML literal:
+
+```bash
+GRAPHIFY_VERSION="$(uv run --project "$GITHUB_WORKSPACE/atlasweaver-tool" python -c 'from project_knowledge.compatibility import production_graphify_compatibility as p; print(p().version)')"
+case "$GRAPHIFY_VERSION" in
+  ''|*[!0-9A-Za-z._-]*) exit 1 ;;
+esac
+uv tool install "graphifyy==$GRAPHIFY_VERSION"
+```
+
+Run consumer inspection only through a trusted-tool internal driver that calls
+`open_workflow_repository()` before reading the semantic secret, resolving
+Graphify, parsing a manifest, or touching output. The raw `repo-root` input is
+either exactly `.` or a bounded UTF-8 POSIX-relative string whose raw segments
+are non-empty and exclude `.`, `..`, backslash, NUL/control characters, and
+platform separators; absolute paths are rejected. The helper opens the
+consumer checkout no-follow, then descriptor-walks every root segment with
+`openat(O_DIRECTORY|O_NOFOLLOW)`, retaining each parent/child binding. Every
+component must be a real directory owned beneath that checkout. It separately
+opens the trusted-tool checkout and rejects an equal device/inode at any
+resolved consumer root. It revalidates the retained chain before every
+Graphify/Git/network child and before each final result. Root-entry replacement
+therefore either continues through the original retained descriptor or raises
+path-free `workflow_root_changed`; it never adopts replacement bytes.
+
+The YAML never forms
+`$GITHUB_WORKSPACE/consumer/$ATLASWEAVER_REPO_ROOT`, calls `realpath`, or changes
+directory into consumer-controlled content. It passes the fixed consumer
+checkout path and untrusted relative root as distinct quoted arguments to the
+pinned tool's internal driver. That process retains `WorkflowRepository` for
+preflight, doctor, scan, and health and calls library APIs with its
+descriptor-rooted `RepositoryAccess`; no operation reopens the raw path. Every
+Python invocation still uses
+`uv run --project "$GITHUB_WORKSPACE/atlasweaver-tool"`; code is never
+built/installed/run from the consumer checkout or its `pyproject.toml`.
+
+Run the trusted no-secret `validate-extraction` verb before installing Graphify
+or creating any repository output. It requires backend/model both empty and
+deep false for code-only, or backend/model both non-empty for semantic mode;
+deep-only and every half-configured combination fail
+`workflow_extraction_invalid` before secret lookup. Two mutually exclusive YAML
+steps invoke the same exact `workflow_boundary check` entrypoint; whichever
+runs creates all four bounded envelopes in one retained scope. Code-only
+receives no secret/backend/model/deep environment, while semantic mode alone
+receives `semantic_backend_token` as `ATLASWEAVER_BACKEND_TOKEN`. The driver
+reads and deletes that generic environment entry only after root admission,
+calls `bind_semantic_backend_credential()`, validates the registry-rendered
+semantic contract, and emits only `credential_bound: bool`. Doctor, scan,
+health, renderer, summaries, and
+every unselected project receive neither the generic secret nor the canonical
+backend environment. Pass repo-root, backend, model, and deep mode through
+environment variables/quoted exact arguments—never interpolate
+`${{ inputs.* }}` directly into shell source.
 
 Fail when secret scan has unaccepted findings, core health is not admitted, or `require-impact-trust` is true and trust is not `trusted`. Always render a content-free summary in a final `if: always()` step, append Markdown to `$GITHUB_STEP_SUMMARY`, and upload only `atlasweaver-check-summary.json` with retention 7 days through the pinned upload action. Never upload the graph, report, evidence, stage, receipt, or command logs.
 
 - [ ] **Step 4: Pin the existing base CI and extend its artifact/fleet gates**
 
-Replace mutable checkout/setup pins in `.github/workflows/ci.yml` with the exact SHAs above, use pinned setup-uv `0.8.14`, preserve Python `3.10` and `3.13`, install exact Graphify `0.9.48`, and add focused invocations for `tests/test_bundles_pack.py`, `tests/test_bundles_parse.py`, `tests/test_agent_install.py`, `tests/test_fleet.py`, and `tests/test_workflows.py` before the full suite/build. No CI job gains write permission.
+Replace mutable checkout/setup pins in `.github/workflows/ci.yml` with the exact SHAs above, set `fetch-depth: 0` on every CI checkout so permanent commit-object/ancestor pin tests have the required history, use pinned setup-uv `0.8.14`, preserve Python `3.10` and `3.13`, preserve the compatibility plan's code-derived `production_graphify_compatibility().version` install step with no Graphify version literal in YAML, and add focused invocations for `tests/test_bundles_pack.py`, `tests/test_bundles_parse.py`, `tests/test_agent_install.py`, `tests/test_fleet.py`, and `tests/test_workflows.py` before the full suite/build. No CI job gains write permission.
 
 - [ ] **Step 5: Exercise the Task 4 content-free CI renderer**
 
@@ -2011,7 +4557,7 @@ Expected: no output.
 - [ ] **Step 7: Commit reusable check and pinned CI**
 
 ```bash
-git add .github/workflows/atlasweaver-check.yml .github/workflows/ci.yml tests/test_workflows.py tests/test_operation_state.py tests/test_public_release.py
+git add .github/workflows/atlasweaver-check.yml .github/workflows/ci.yml src/project_knowledge/workflow_boundary.py tests/test_workflow_boundary.py tests/test_workflows.py tests/test_operation_state.py tests/test_public_release.py
 git commit -m "ci: add reusable AtlasWeaver validation workflow"
 ```
 
@@ -2019,14 +4565,20 @@ git commit -m "ci: add reusable AtlasWeaver validation workflow"
 
 **Files:**
 - Create: `.github/workflows/atlasweaver-publish.yml`
+- Modify: `src/project_knowledge/workflow_boundary.py`
+- Modify: `src/project_knowledge/workflow_publish.py`
+- Modify: `tests/test_workflow_boundary.py`
 - Modify: `tests/test_workflows.py`
 - Modify: `tests/test_workflow_publish.py`
 - Test: `tests/test_public_release.py`
 
 **Interfaces:**
-- Consumes: public `doctor`, `scan-secrets`, `refresh`, `health`, `artifact pack`; internal `workflow_publish prepare|verify-attestation|upload`; pinned attestation action.
+- Consumes: Task 12's mandatory descriptor-walk `open_workflow_repository`; public-library `doctor`, `scan-secrets`, `refresh`, `health`, `artifact pack`; internal `workflow_publish prepare|verify-attestation|upload`; Task 6 `verify_attestation_policy` (not its pull receipt wrapper); pinned attestation action.
 - Produces the same closed inputs/secret as Task 12.
 - Produces inspect outputs `project_uid` and `channel`, used only for concurrency naming and revalidated in the privileged job.
+- Extends the strict internal boundary parser with exact verbs: `inspect --consumer-checkout PATH --repo-root RELATIVE --trusted-tool-checkout PATH --output PATH` and `build --consumer-checkout PATH --repo-root RELATIVE --trusted-tool-checkout PATH --output-bundle PATH --output-summary PATH`. Both retain one `WorkflowRepository`; build admits/binds the secret only after root+manifest admission and passes expected identity/full manifest to refresh and pack. The publication prepare driver additionally passes that retained repository's `WorkflowGitScope`, preserving the checkout-root Git descriptor and selected-root prefix; it never asks `prepare_publication` to rediscover Git from the nested project path.
+- Produces closed `WorkflowPublicationHandoff(schema_version=1, repository_identity, manifest_sha256, context, bundle_sha256, bundle_size, bundle_identity)` in a bounded canonical mode-0600 `$RUNNER_TEMP` file. Repository identity is local authority data and is never uploaded or emitted in summaries.
+- Extends internal `workflow_publish` exact verbs so each takes the same `--consumer-checkout`, `--repo-root`, and `--trusted-tool-checkout` arguments. `prepare` additionally requires `--input`, `--output`, `--handoff`; `verify-attestation` and `upload` each require `--bundle` and `--handoff`. Every verb independently opens the descriptor boundary and validates the handoff/root/full manifest/context/bundle before reading a token, invoking `gh`, or mutating GitHub.
 
 - [ ] **Step 1: Write the split-permission, concurrency, and no-untrusted-execution tests**
 
@@ -2040,6 +4592,7 @@ def test_publish_workflow_has_split_least_privilege_jobs():
     assert jobs["publish"]["permissions"] == {
         "attestations": "write", "contents": "write", "id-token": "write"
     }
+    assert jobs["publish"]["runs-on"] == "ubuntu-24.04"
     assert jobs["publish"]["concurrency"] == {
         "cancel-in-progress": False,
         "group": "atlasweaver-publish-${{ github.repository_id }}-${{ needs.inspect.outputs.project_uid }}-${{ needs.inspect.outputs.channel }}",
@@ -2060,9 +4613,16 @@ def test_privileged_publish_job_never_runs_graphify_tests_backend_or_consumer_co
 def test_publish_secret_is_scoped_only_to_unprivileged_refresh():
     workflow = load_workflow("atlasweaver-publish.yml")
     refresh = step_named(workflow, "Refresh private graph")
+    code_only = step_named(workflow, "Refresh private graph (code-only)")
     assert refresh["env"]["ATLASWEAVER_BACKEND_TOKEN"] == (
         "${{ secrets.semantic_backend_token }}"
     )
+    assert refresh["if"] == "${{ inputs.backend != '' && inputs.model != '' }}"
+    assert code_only["if"] == (
+        "${{ inputs.backend == '' && inputs.model == '' && !inputs.deep-mode }}"
+    )
+    assert "ATLASWEAVER_BACKEND_TOKEN" not in json.dumps(code_only, sort_keys=True)
+    assert "ATLASWEAVER_DEEP" not in json.dumps(code_only, sort_keys=True)
     for job_name, job in workflow["jobs"].items():
         for step in job["steps"]:
             if step is not refresh:
@@ -2096,6 +4656,98 @@ def test_publish_uses_caller_context_for_source_and_hard_pin_for_trusted_tool():
     assert "github.workflow_sha" not in text
     assert '--project "$GITHUB_WORKSPACE/atlasweaver-tool"' in text
     assert "project_knowledge.workflow_publish verify-attestation" in text
+
+
+def test_publish_never_concatenates_untrusted_repo_root_into_a_path():
+    text = (WORKFLOWS / "atlasweaver-publish.yml").read_text(encoding="utf-8")
+    assert "consumer/$ATLASWEAVER_REPO_ROOT" not in text
+    assert "consumer/${{ inputs.repo-root }}" not in text
+    for job_name in ("inspect", "build", "publish"):
+        assert internal_workflow_driver_mode(
+            load_workflow("atlasweaver-publish.yml"), job_name
+        ) == job_name
+
+
+def test_internal_workflow_parsers_are_closed_and_phase_specific():
+    boundary = workflow_boundary_parser_surface()
+    assert boundary == {
+        "inspect": {
+            "--consumer-checkout", "--repo-root",
+            "--trusted-tool-checkout", "--output",
+        },
+        "build": {
+            "--consumer-checkout", "--repo-root",
+            "--trusted-tool-checkout", "--output-bundle",
+            "--output-summary",
+        },
+        "check": {
+            "--consumer-checkout", "--repo-root",
+            "--trusted-tool-checkout", "--output-directory",
+        },
+    }
+    publisher = workflow_publish_parser_surface()
+    common = {
+        "--consumer-checkout", "--repo-root", "--trusted-tool-checkout",
+    }
+    assert publisher == {
+        "prepare": common | {"--input", "--output", "--handoff"},
+        "verify-attestation": common | {"--bundle", "--handoff"},
+        "upload": common | {"--bundle", "--handoff"},
+    }
+
+
+@pytest.mark.parametrize("mode", ["inspect", "build", "publish"])
+@pytest.mark.parametrize("attack", [
+    "absolute", "parent_escape", "symlink_component", "trusted_tool_alias",
+    "root_swap",
+])
+def test_every_publish_phase_reuses_closed_workflow_root_boundary(
+    mode, attack, workflow_phase_fixture,
+) -> None:
+    result = workflow_phase_fixture.run(mode, attack=attack)
+    assert result.code in {
+        "workflow_root_invalid", "workflow_root_forbidden",
+        "workflow_root_changed",
+    }
+    assert workflow_phase_fixture.secret_reads == []
+    assert workflow_phase_fixture.graphify_calls == []
+    assert workflow_phase_fixture.prepare_calls == []
+    assert workflow_phase_fixture.github_mutations == []
+    assert workflow_phase_fixture.replacement_reads == []
+
+
+@pytest.mark.parametrize("verb", ["verify-attestation", "upload"])
+def test_post_prepare_verbs_reopen_root_and_validate_immutable_handoff_first(
+    publication_handoff_fixture, verb,
+) -> None:
+    handoff = publication_handoff_fixture.prepare()
+    publication_handoff_fixture.replace_consumer_root_with_copied_id_uid()
+    result = publication_handoff_fixture.invoke(
+        verb, handoff, token="must-remain-unread"
+    )
+    assert result.code == "workflow_root_changed"
+    assert publication_handoff_fixture.token_reads == []
+    assert publication_handoff_fixture.gh_calls == []
+    assert publication_handoff_fixture.github_mutations == []
+
+
+@pytest.mark.parametrize("mutation", [
+    "handoff_unknown_key", "handoff_manifest_digest", "bundle_replace",
+    "context_change",
+])
+@pytest.mark.parametrize("verb", ["verify-attestation", "upload"])
+def test_post_prepare_verbs_reject_tampered_handoff_before_authority(
+    publication_handoff_fixture, mutation, verb,
+) -> None:
+    handoff = publication_handoff_fixture.prepare()
+    publication_handoff_fixture.mutate(mutation, handoff)
+    result = publication_handoff_fixture.invoke(
+        verb, handoff, token="must-remain-unread"
+    )
+    assert result.code == "workflow_source_mismatch"
+    assert publication_handoff_fixture.token_reads == []
+    assert publication_handoff_fixture.gh_calls == []
+    assert publication_handoff_fixture.github_mutations == []
 ```
 
 Also assert: workflow is `workflow_call` only; no pull-request publication; inputs contain no shell/test/native flags/output/provider/project/signer/source-ref/channel fields; checkout credentials are not persisted; build artifact has fixed name/path/retention; publish downloads only that artifact; caller boolean outputs are never used as authorization.
@@ -2108,25 +4760,51 @@ Expected: FAIL because `atlasweaver-publish.yml` does not exist.
 
 - [ ] **Step 3: Implement inspect and unprivileged build jobs**
 
-`inspect` checks out consumer and trusted AtlasWeaver source exactly as Task 12, runs the trusted strict manifest/context inspector, and writes only canonical UUID/channel outputs through `$GITHUB_OUTPUT`. It validates but does not authorize publication.
+`inspect` checks out consumer and trusted AtlasWeaver source exactly as Task 12, runs the trusted strict manifest/context inspector inside one `open_workflow_repository` scope, and writes only canonical UUID/channel outputs through `$GITHUB_OUTPUT`. It validates but does not authorize publication. Root admission and its final binding recheck precede all output.
 
-`build` depends on inspect, has `contents: read`, checks out exact caller `${{ github.sha }}` with credentials disabled, and checks out trusted AtlasWeaver at the same provisional implementation pin used by Task 12; Task 14 atomically replaces both workflow constants with final release tool commit A. The normal `github` context deliberately supplies caller repository/ref/SHA; it is never used as trusted-tool identity. Every trusted command runs with `uv run --project "$GITHUB_WORKSPACE/atlasweaver-tool"`. The job installs pinned Graphify. Only its refresh step receives `semantic_backend_token` as `ATLASWEAVER_BACKEND_TOKEN`; the trusted Core refresh handler binds it to the compatibility-declared canonical environment and removes the generic name before Graphify execution. Doctor, scan, pack, health, summary, and publish receive no credential. It runs doctor, secret scan, the approved `refresh`, `artifact pack`, and a second health check. It fails if semantic content lacks a backend secret and never silently adds `--code-only`. It uploads one workflow artifact named `atlasweaver-build-${{ github.run_id }}` containing only `bundle.zip`, with retention 1 day. Pull-request callers still cannot publish because the privileged job's context gate requires a protected branch.
+The inspect step invokes only
+`python -m project_knowledge.workflow_boundary inspect` with the three common
+arguments plus `--output "$RUNNER_TEMP/inspect.json"`; a fixed trusted follow-up
+projects only validated `project_uid`/`channel` into `$GITHUB_OUTPUT`. The build
+step invokes only the `build` verb with the same common arguments plus
+`--output-bundle "$RUNNER_TEMP/build/bundle.zip"` and
+`--output-summary "$RUNNER_TEMP/build/summary.json"`. Neither parser accepts a
+backend/model/token flag; the fixed environment contract is validated and
+deleted/bound inside the retained process after repository admission.
+
+`build` depends on inspect, has `contents: read`, checks out exact caller `${{ github.sha }}` with credentials disabled, and checks out trusted AtlasWeaver at the same provisional implementation pin used by Task 12; Task 14 atomically replaces both workflow constants with final release tool commit A. The normal `github` context deliberately supplies caller repository/ref/SHA; it is never used as trusted-tool identity. Every trusted command runs with `uv run --project "$GITHUB_WORKSPACE/atlasweaver-tool"`. Before Graphify installation or output, build runs the same trusted no-secret extraction-admission verb; backend empty requires model empty and deep false, while semantic mode requires both backend and model. Two mutually exclusive build steps then call the same strict driver, and only the semantic step receives backend/model/deep plus the token; the code-only step receives none of them. One trusted internal build driver accepts the fixed consumer-checkout path and the raw relative repo-root separately, enters `open_workflow_repository`, and retains that binding across doctor, secret scan, refresh, pack, and final health; it passes descriptor access/expected identity into every mutating boundary and never reopens the raw input. The job derives and installs Graphify from that trusted checkout's `production_graphify_compatibility().version` using the exact Task 12 shell and contains no duplicated version literal. Only the semantic build driver process receives `semantic_backend_token` as `ATLASWEAVER_BACKEND_TOKEN`, and it reads that value only after root/manifest admission immediately before refresh; the trusted Core refresh handler binds it to the compatibility-declared canonical environment and removes the generic name before Graphify execution. Doctor, scan, pack, health, summary, and publish receive no credential. Credential presence is decided only by the selected compatibility contract through `bind_semantic_backend_credential`: an admitted credentialless backend may proceed without a token, while a credential-required backend fails closed. It never silently adds `--code-only` or drops deep mode. It uploads one workflow artifact named `atlasweaver-build-${{ github.run_id }}` containing only `bundle.zip`, with retention 1 day. Pull-request callers still cannot publish because the privileged job's context gate requires a protected branch.
 
 - [ ] **Step 4: Implement privileged revalidation, attestation, and upload job**
 
-`publish` depends on inspect/build and declares the exact concurrency mapping tested in Step 1. It checks out consumer `github.sha` and trusted workflow source, downloads the one build artifact into `$RUNNER_TEMP/build`, and runs:
+`publish` depends on inspect/build, is fixed to `ubuntu-24.04`, capability-checks
+Linux `/proc/self/fd` traversal before preparation, and declares the exact
+concurrency mapping tested in Step 1. It checks out consumer `github.sha` and
+trusted workflow source, downloads the one build artifact into
+`$RUNNER_TEMP/build`, and runs:
 
 ```text
 uv run --project "$GITHUB_WORKSPACE/atlasweaver-tool" \
   python -m project_knowledge.workflow_publish prepare \
-  --repo "$GITHUB_WORKSPACE/consumer/$ATLASWEAVER_REPO_ROOT" \
+  --consumer-checkout "$GITHUB_WORKSPACE/consumer" \
+  --repo-root "$ATLASWEAVER_REPO_ROOT" \
+  --trusted-tool-checkout "$GITHUB_WORKSPACE/atlasweaver-tool" \
   --input "$RUNNER_TEMP/build/bundle.zip" \
-  --output "$RUNNER_TEMP/release/bundle.zip"
+  --output "$RUNNER_TEMP/release/bundle.zip" \
+  --handoff "$RUNNER_TEMP/release/publication-handoff.json"
 ```
 
-The actual YAML uses a block scalar and environment variables for all paths; it does not interpolate input text into shell. The internal command rechecks `github.ref_type == branch`, `github.ref_protected == true`, exact manifest `source_ref`, exact numeric repository ID, `HEAD == github.sha`, clean tracked/safe projection, expected reusable signer workflow path, build bundle identity, and final health. The job runs no Graphify, tests, consumer script, consumer package build, backend, or arbitrary command.
+The actual YAML uses a block scalar and environment variables for all paths; it does not interpolate input text into shell or concatenate checkout/root strings. The internal command first enters the same Task 12 `open_workflow_repository` boundary, then rechecks `github.ref_type == branch`, `github.ref_protected == true`, exact manifest `source_ref`, exact numeric repository ID, `HEAD == github.sha`, clean tracked/safe projection, expected reusable signer workflow path, build bundle identity, and final health through the retained descriptor/expected identity. The job runs no Graphify, tests, consumer script, consumer package build, backend, or arbitrary command.
 
-Attest `$RUNNER_TEMP/release/bundle.zip` with `actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be`, `subject-path` set to that exact file, and `push-to-registry: false`. Then call internal `workflow_publish verify-attestation`, which invokes the Task 6 verifier against the newly published attestation and requires manifest `signer_workflow` to name `owner/atlasweaver/.github/workflows/atlasweaver-publish.yml` and manifest `signer_digest` to equal the immutable called reusable-workflow commit B. This authenticated post-attestation check is the digest authority; normal `github.workflow_sha` describes the caller and is never accepted. Scope `${{ github.token }}` as `GITHUB_TOKEN` separately to exactly the signer-verification and upload steps; neither token reaches preparation, Graphify, summary, nor artifacts. Only after verification succeeds call internal `workflow_publish upload`. The uploader performs Task 7's remote verify/tag/retention ordering. Finish with an always-run content-free JSON/job summary artifact; never upload the release bundle as an ordinary workflow artifact from this job.
+After the prepared ZIP and its cleanup contract succeed, `prepare` writes the
+closed canonical handoff exclusively under the descriptor-validated
+`RUNNER_TEMP` parent and fsyncs it. The handoff binds the retained repository
+device/inode, canonical full-manifest SHA-256, closed authenticated
+`WorkflowContext`, and prepared bundle device/inode/size/SHA-256. It contains no
+path, token, source name, graph bytes, or query. Unknown keys, duplicate JSON,
+non-finite/invalid values, symlink/special files, mutable-file binding, or a file
+above 64 KiB fail `workflow_source_mismatch`.
+
+Attest `$RUNNER_TEMP/release/bundle.zip` with `actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be`, `subject-path` set to that exact file, and `push-to-registry: false`. Then call internal `workflow_publish verify-attestation` with the three common root arguments plus exact `--bundle`/`--handoff` files. It independently reopens the workflow root, requires root identity/full manifest/context/bundle equality with the handoff, and only then reads its step-scoped token and invokes Task 6's receipt-free `verify_attestation_policy` against the newly created attestation. It requires manifest `signer_workflow` to name `owner/atlasweaver/.github/workflows/atlasweaver-publish.yml`, manifest `signer_digest` to equal the immutable called reusable-workflow commit B, and policy repository/source ref/source digest to equal the authenticated `WorkflowContext`. No release asset exists yet, so this command accepts no `DownloadReceipt`/release/asset argument and cannot create pull authorization. This authenticated post-attestation check is the subject/signer digest authority; normal `github.workflow_sha` describes the caller and is never accepted. Scope `${{ github.token }}` as `GITHUB_TOKEN` separately to exactly the signer-verification and upload steps; neither token reaches preparation, Graphify, summary, nor artifacts. Only after verification succeeds call internal `workflow_publish upload` with the same common root arguments and exact bundle/handoff. Upload repeats all handoff/root/full-manifest/context/bundle checks before reading its separate token or making a request. The uploader then creates/resolves the release asset and performs Task 7's remote verify/tag/retention ordering; subsequent consumers add the distinct receipt-bound pull verification. Finish with an always-run content-free JSON/job summary artifact; never upload the release bundle as an ordinary workflow artifact from this job.
 
 - [ ] **Step 5: Run workflow and publisher contract suites**
 
@@ -2269,7 +4947,7 @@ Fetch `origin` and verify whether the implementation branch still descends from 
 Commit all final tool code, packaged resources, version, docs, and acceptance tests:
 
 ```bash
-git add src tests skills scripts config examples README.md CHANGELOG.md SECURITY.md pyproject.toml uv.lock
+git add src tests skills scripts examples README.md CHANGELOG.md SECURITY.md pyproject.toml uv.lock
 git commit -m "release: prepare AtlasWeaver 0.3.0 tool"
 release_tool_commit=$(git rev-parse --verify HEAD)
 printf '%s\n' "$release_tool_commit" | rg -x '[0-9a-f]{40}'
@@ -2319,16 +4997,29 @@ Create `.github/workflows/atlasweaver-self-publish.yml` with `workflow_dispatch`
 
 ```python
 def test_self_caller_and_manifest_bind_reusable_workflow_commit():
-    reusable_commit = git_rev_parse("HEAD^")
     caller = load_workflow("atlasweaver-self-publish.yml")
     assert caller["on"] == {"workflow_dispatch": None}
     assert caller["permissions"] == {
         "attestations": "write", "contents": "write", "id-token": "write"
     }
     job = caller["jobs"]["publish"]
-    assert job["uses"] == (
+    prefix = (
         "MarkusMakEvil/atlasweaver/.github/workflows/"
-        f"atlasweaver-publish.yml@{reusable_commit}"
+        "atlasweaver-publish.yml@"
+    )
+    assert job["uses"].startswith(prefix)
+    caller_commit = job["uses"][len(prefix):]
+    signer_commit = str(
+        load_manifest(
+            ROOT / ".graphify-project.yaml", ROOT
+        ).artifacts.signer_digest
+    )
+    assert re.fullmatch(r"[0-9a-f]{40}", caller_commit)
+    assert signer_commit == caller_commit
+    assert git_object_exists(f"{caller_commit}^{{commit}}")
+    assert git_is_ancestor(caller_commit, "HEAD")
+    assert git_path_exists_at_commit(
+        caller_commit, ".github/workflows/atlasweaver-publish.yml"
     )
     assert job["permissions"] == caller["permissions"]
     assert job["with"] == {
@@ -2339,7 +5030,6 @@ def test_self_caller_and_manifest_bind_reusable_workflow_commit():
     assert job["secrets"] == {
         "semantic_backend_token": "${{ secrets.ATLASWEAVER_SEMANTIC_BACKEND_TOKEN }}"
     }
-    assert load_manifest(ROOT / ".graphify-project.yaml", ROOT).artifacts.signer_digest == reusable_commit
 ```
 
 Also assert both caller and reusable grant attestation/id-token permissions; `--signer-workflow` names the reusable workflow (official GitHub attestation identity), while `--repo` identifies the caller/release repository. Commit:
@@ -2386,7 +5076,7 @@ rg -n 'uses:\s+[^#]+@(v[0-9]+|main|master)\b' .github/workflows
 rg -n '(GITHUB_TOKEN|GH_TOKEN|ATLASWEAVER_BACKEND_TOKEN).*?(print|echo|json|state)' src tests .github/workflows
 rg -n '(BrandMap|server repo|web repo|product-specific)' src tests skills README.md .github/workflows
 git status --short
-git diff --stat
+git diff --stat origin/main...HEAD
 ```
 
 Expected: first three scans return no unsafe matches (fixture names that assert rejection must be narrowly exempted in the test itself); the working tree is clean at C; diff against `origin/main` matches the file map. Review every artifact/fleet spec paragraph against Tasks 1–14 and record no uncovered requirement before claiming completion.
@@ -2454,7 +5144,7 @@ gh run watch "$release_run_id" --repo MarkusMakEvil/atlasweaver --exit-status
 
 Set `atlasweaver_main_checkout=$(pwd -P)` in the verified clean `main` checkout and verify the rolling release asset/attestation through the installed `project-knowledge pull --repo "$atlasweaver_main_checkout" --json`; then run health. This pull bootstraps AtlasWeaver's managed v2 graph through the new pipeline without a local semantic downgrade. In a clean temporary clone at `v0.3.0`, install `0.3.0`, run pull/health, and require source/projection identity plus `navigation` impact trust. Only after that clean-clone pull passes, run health, pull, refresh, registry-sync, and query against the generic temporary three-repository fleet from the acceptance suite; do not enroll any external consumer repository implicitly. Record release ID, asset ID, attestation result, C, and content-free health output; never include tokens or graph/source content.
 
-If protected-main, OIDC, attestation, named backend secret, or release permissions are unavailable, stop at this gate with the stable failure. Do not weaken permissions, signer digest, attestation flags, branch protection, or semantic extraction.
+If protected-main, OIDC, attestation, release permissions, or a credential required by the selected compatibility backend are unavailable, stop at this gate with the stable failure. A registry-admitted credentialless backend needs no synthetic secret. Do not weaken permissions, signer digest, attestation flags, branch protection, compatibility credential policy, or semantic extraction.
 
 - [ ] **Step 12: Remove every non-main worktree and local/remote branch**
 

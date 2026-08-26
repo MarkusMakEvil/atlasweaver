@@ -80,6 +80,13 @@ as `{path, sha256, byte_length}`. Secret values and ambient environment are neve
 included. Evidence and ownership bind this digest so a result cannot be
 separated from the orchestrator contract that produced it.
 
+Environment names are bound per command. Extract receives the four fixed base
+names plus only the selected backend's non-empty registry-admitted credential,
+alias, and endpoint subset; diagnose and cluster receive exactly the four base
+names. Code-only extract also receives only the base names. The strict parser
+validates those names against the selected `BackendContract`, including its
+credential requirement, but never records their values.
+
 ## Evidence capture
 
 Refresh runs official `graphify extract --no-cluster`, captures its native
@@ -111,7 +118,11 @@ Context strings, source fragments, symbols containing literals, and all fields
 outside the adapter allowlist are excluded. Internal Graphify imports or
 monkeypatch hooks are not an accepted production capture boundary.
 
-`GRAPH_EVIDENCE.json` contains:
+The following is an intentionally abridged, non-wire illustration of
+`GRAPH_EVIDENCE.json`. Ellipses are placeholders and the mandatory
+`normalization`, `final_integrity`, and `final_edges` sections are omitted for
+readability, so this object must not be accepted by the strict parser. The
+complete closed key set and schemas are normative in Compatibility Task 4.
 
 ```json
 {
@@ -137,16 +148,30 @@ monkeypatch hooks are not an accepted production capture boundary.
     "configuration_sha256": "...",
     "source_digest": "...",
     "projection_digest": "...",
-    "environment_names": ["HOME", "LANG", "LC_ALL", "OPENAI_API_KEY", "PATH"],
+    "environments": [
+      {"operation": "extract", "names": ["HOME", "LANG", "LC_ALL", "OPENAI_API_KEY", "PATH"]},
+      {"operation": "diagnose", "names": ["HOME", "LANG", "LC_ALL", "PATH"]},
+      {"operation": "cluster", "names": ["HOME", "LANG", "LC_ALL", "PATH"]}
+    ],
     "artifacts": [
-      {"path": "raw/graph.json", "sha256": "...", "byte_length": 123}
+      {"path": "raw/graph.json", "sha256": "...", "byte_length": 123},
+      {"path": "raw/diagnose.json", "sha256": "...", "byte_length": 456},
+      {"path": "cluster-input/graph.json", "sha256": "...", "byte_length": 789},
+      {"path": "clustered/graph.json", "sha256": "...", "byte_length": 321},
+      {"path": "clustered/GRAPH_REPORT.md", "sha256": "...", "byte_length": 654}
     ]
   },
   "observed_post_dedup": {
+    "schema_version": 2,
     "node_count": 969,
     "edge_count": 3290,
-    "missing_endpoint_edges": 159,
-    "self_loop_edges": 0
+    "missing_endpoint_edges": 0,
+    "dangling_endpoint_edges": 159,
+    "invalid_self_loop_edges": 0,
+    "exact_duplicate_edges": 0,
+    "conflicting_relation_edges": 0,
+    "collapsed_edges": 406,
+    "structurally_valid": false
   },
   "pre_dedup": null,
   "evidence_complete": false,
@@ -170,6 +195,12 @@ the binding. Evidence code never invokes Graphify, and the adapter cannot omit
 the document. `GRAPH_EVIDENCE.json` is required for every schema-v2 adapter and
 is bound into ownership and bundles even when incomplete. Unknown evidence is
 represented as `null` plus a limitation, never as zero.
+
+Parsing schema-v2 evidence requires an external expected SHA-256 from the
+in-process builder descriptor or a descriptor-captured ownership/bundle/
+registry binding. Hashing caller-controlled evidence at the parser/validator
+call site cannot authorize those same bytes; low-level input without that
+anchor is refused.
 
 A complete future `pre_dedup` section assigns every occurrence a stable
 sidecar-provided ID, or an adapter-defined ordinal over a documented canonical
@@ -208,6 +239,8 @@ Impact is `trusted` only when all conditions hold:
 
 - evidence capture is complete for the selected adapter;
 - current source digest matches the graph and evidence;
+- current projection digest matches the graph and evidence, including the
+  privacy/policy/control-file decision boundary;
 - staged extraction coverage has no skip, including repository-approved
   navigation omissions;
 - final graph has no missing/dangling endpoints, invalid self-loop, duplicate,
@@ -228,8 +261,11 @@ improve transparency without inferring missing history.
 
 Ownership is non-circular: its canonical payload lists SHA-256 and byte length
 for graph, report, evidence, and other approved artifacts, but never a digest of
-the ownership file itself. Schema v2 also requires the generation's immutable
-integer `build_epoch`. Validation recomputes artifact digests and then validates
+the ownership file itself. A domain-separated `generation_digest` hashes that
+sorted non-ownership artifact descriptor set, so promotion cannot treat a
+report/evidence-only change as a graph no-op. Schema v2 also requires the
+generation's immutable integer `build_epoch`. Validation recomputes artifact
+and generation digests and then validates
 the ownership payload. Adapters must preserve evidence and invocation bindings
 while normalizing; promotion and packing reject a candidate that drops or
 rewrites them without a declared transform.

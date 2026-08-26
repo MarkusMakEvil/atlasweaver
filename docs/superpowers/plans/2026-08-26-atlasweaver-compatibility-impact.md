@@ -241,11 +241,14 @@ def run_checked(
     *,
     env: Mapping[str, str] | None = None,
     timeout: float = COMMAND_TIMEOUT,
+    before_exec: Callable[[], None] = _noop,
 ) -> CompletedProcess[str]: ...
 def probe_graphify(
     executable: ResolvedGraphifyExecutable,
     contract: GraphifyCompatibility,
     runner: CommandRunner,
+    *,
+    before_exec: Callable[[], None] = _noop,
 ) -> GraphifyCapabilities: ...
 ```
 
@@ -311,6 +314,11 @@ class ArtifactBinding:
     byte_length: int
 
 @dataclass(frozen=True)
+class CommandEnvironmentBinding:
+    operation: Literal["extract", "diagnose", "cluster"]
+    names: tuple[str, ...]
+
+@dataclass(frozen=True)
 class ExtractionInvocation:
     adapter_id: str
     graphify_version: str
@@ -322,7 +330,7 @@ class ExtractionInvocation:
     configuration_sha256: str
     source_digest: str
     projection_digest: str
-    environment_names: tuple[str, ...]
+    environments: tuple[CommandEnvironmentBinding, ...]
     artifacts: tuple[ArtifactBinding, ...]
     payload: bytes
     digest: str
@@ -387,7 +395,7 @@ def build_extraction_invocation(
     configuration_sha256: str,
     source_digest: str,
     projection_digest: str,
-    environment_names: tuple[str, ...],
+    environments: tuple[CommandEnvironmentBinding, ...],
     artifacts: tuple[CapturedArtifact, ...],
 ) -> ExtractionInvocation: ...
 def build_graph_evidence(
@@ -473,6 +481,7 @@ class AdaptedCandidate:
     projection_digest: str | None
     evidence_digest: str | None
     extraction_invocation_digest: str | None
+    generation_digest: str
     node_count: int
     edge_count: int
     skipped_count: int
@@ -488,6 +497,7 @@ class ValidatedGraph:
     graph_digest: str
     evidence_digest: str | None
     extraction_invocation_digest: str | None
+    generation_digest: str
     node_count: int
     edge_count: int
     skipped_count: int
@@ -496,6 +506,15 @@ class ValidatedGraph:
     impact_limitations: tuple[str, ...]
     build_epoch: int | None
     git_identity: GitIdentity | None
+
+@dataclass(frozen=True)
+class PromotionResult:
+    target: Path
+    backup: Path
+    digest: str
+    generation_digest: str
+    build_epoch: int | None
+    changed: bool = True
 
 def adapt_candidate(
     raw_candidate: Path,
@@ -513,6 +532,7 @@ def validate_candidate(
     manifest: ProjectManifest,
     *,
     expected_projection_digest: str | None = None,
+    expected_evidence_digest: str | None = None,
     build_epoch: int | None = None,
     git_identity: GitIdentity | None = None,
 ) -> ValidatedGraph: ...
@@ -523,10 +543,11 @@ def validate_owned_graph(
     *,
     expected_source_digest: str | None = None,
     expected_projection_digest: str | None = None,
+    repository_access: RepositoryAccess | None = None,
 ) -> ValidatedGraph: ...
 ```
 
-`adapt_candidate()` keeps generated graph bytes independent from clocks and Git state. Evidence absent means legacy artifact schema 1; evidence present means artifact schema 2. `validate_candidate()` requires `build_epoch` (a non-boolean integer at least 1) for schema 2, accepts optional validated Git identity for ownership, and requires both to be absent for schema 1. Core manifest-v2 refresh passes evidence into adaptation, then passes its staged projection digest and lifecycle-allocated epoch into validation. Legacy schema-1 output remains readable but is always navigation-only.
+`adapt_candidate()` keeps generated graph bytes independent from clocks and Git state. It also computes `generation_digest` as a domain-separated canonical hash of the exact approved non-ownership artifact path/SHA-256/byte-length set; this binds report/evidence/optional HTML changes that `graph_digest` alone cannot see. Evidence absent means legacy artifact schema 1; evidence present means artifact schema 2. `validate_candidate()` recomputes that generation digest, requires `build_epoch` (a non-boolean integer at least 1) and an externally anchored `expected_evidence_digest` for schema 2, accepts optional validated Git identity for ownership, and requires all three to be absent for schema 1. The anchor comes from the in-process `AdaptedCandidate.evidence_digest` or a descriptor-captured bundle binding, never by hashing the untrusted candidate at the validation call site. `promote_graph()` returns the descriptor-validated installed graph/generation digests and installed epoch; exact no-op therefore reports the pre-existing epoch, never the proposed candidate epoch. Core manifest-v2 refresh passes evidence into adaptation, compares the generation digest to the currently validated live generation, then passes the adapted evidence digest, staged projection digest, and the installed epoch for an exact no-op or the next epoch for a changed generation. Legacy schema-1 output remains readable but is always navigation-only.
 
 ---
 
@@ -893,7 +914,12 @@ Read outputs with a private no-follow, identity-checked, size-capped helper in `
 
 `resolve_graphify_executable(None)` finds only the literal `graphify` name through `shutil.which`; the optional explicit argument is a named library-test/maintainer seam and is never read from CLI or ambient configuration. Canonicalize with `Path.resolve(strict=True)`, `lstat` the resolved path, require a regular file with an execute bit, open with `O_RDONLY | O_NOFOLLOW | O_CLOEXEC`, compare path stat/open `fstat`/final `fstat` device and inode, cap reads at 16 MiB, and return `ResolvedGraphifyExecutable(path, st_dev, st_ino, launcher_sha256)`. The digest identifies the Python launcher file only; capability-smoke digest plus exact package-reported version provide the operational binding and no code describes the launcher hash as package authentication.
 
-`revalidate_graphify_executable()` repeats the same no-follow open, regular/execute/cap/stable-stat checks against the frozen canonical path and recomputes the complete launcher digest. Any missing/unreadable path, symlink, device/inode change, in-place byte change, execute-bit change, oversize, or unstable stat is normalized to exactly `GraphifyContractError("graphify_executable_changed")` with no path/cause detail. `run_checked()` first requires non-empty argv with `argv[0] == str(executable.path)`, calls revalidation as its final action before `runner.run`, and never retries or re-resolves. Every `probe_graphify()` subprocess—version, help, two extracts, diagnosis, clustering, global-add, and both installs—uses that function, so a launcher mutation between any pair fails before the next spawn. Core Task 6 may factor execution/error redaction into `run_graphify_operation()` but must preserve this final revalidation point and immutable argument.
+`revalidate_graphify_executable()` repeats the same no-follow open, regular/execute/cap/stable-stat checks against the frozen canonical path and recomputes the complete launcher digest. Any missing/unreadable path, symlink, device/inode change, in-place byte change, execute-bit change, oversize, or unstable stat is normalized to exactly `GraphifyContractError("graphify_executable_changed")` with no path/cause detail. `run_checked()` first requires non-empty argv with `argv[0] == str(executable.path)`, invokes its private `before_exec` binding callback, then calls executable revalidation as its final action before `runner.run`; it never retries or re-resolves. Every `probe_graphify()` subprocess—version, help, two extracts, diagnosis, clustering, global-add, and both installs—passes the probe callback through that function, so a retained manifest/root binding can be checked before every child and a launcher mutation between any pair fails before the next spawn. Callback failure propagates before executable revalidation/spawn and no later smoke child runs. Core Task 6 may factor execution/error redaction into `run_graphify_operation()` but must preserve this callback/revalidation ordering and immutable argument.
+
+Add a callback-count regression requiring one callback immediately before every
+recorded probe child. Parameterize failure after each completed child; the next
+callback raises `ManifestError(kind="changed")`, runner call count does not
+advance, no later smoke operation occurs, and all private roots are cleaned.
 
 - [ ] **Step 7: Run focused and full regressions**
 
@@ -1213,8 +1239,21 @@ def test_invocation_digest_binds_contract_without_private_paths() -> None:
         configuration_sha256="b" * 64,
         source_digest="c" * 64,
         projection_digest="d" * 64,
-        environment_names=("HOME", "LANG", "LC_ALL", "OPENAI_API_KEY", "PATH"),
-        artifacts=(native_graph(), diagnosis(), cluster_input(), final_graph()),
+        environments=(
+            CommandEnvironmentBinding(
+                "extract", ("HOME", "LANG", "LC_ALL", "OPENAI_API_KEY", "PATH")
+            ),
+            CommandEnvironmentBinding(
+                "diagnose", ("HOME", "LANG", "LC_ALL", "PATH")
+            ),
+            CommandEnvironmentBinding(
+                "cluster", ("HOME", "LANG", "LC_ALL", "PATH")
+            ),
+        ),
+        artifacts=(
+            native_graph(), diagnosis(), cluster_input(),
+            clustered_graph(), clustered_report(),
+        ),
     )
     assert len(invocation.digest) == 64
     serialized = invocation.payload
@@ -1232,7 +1271,11 @@ def test_invocation_digest_binds_contract_without_private_paths() -> None:
         ("configuration_sha256", "f" * 64),
         ("source_digest", "1" * 64),
         ("projection_digest", "2" * 64),
-        ("environment_names", ("HOME", "PATH")),
+        ("environments", (
+            CommandEnvironmentBinding("extract", ("HOME", "PATH")),
+            CommandEnvironmentBinding("diagnose", ("HOME", "PATH")),
+            CommandEnvironmentBinding("cluster", ("HOME", "PATH")),
+        )),
     ],
 )
 def test_invocation_mutation_changes_digest(field: str, replacement: object) -> None:
@@ -1243,7 +1286,7 @@ def test_invocation_mutation_changes_digest(field: str, replacement: object) -> 
 
 Define `invocation_factory(**overrides)` in the test module as a complete call to `build_extraction_invocation()` with the exact base arguments shown in the first test, replacing only named keyword values; it must not use `dataclasses.replace()` because the digest must be recomputed.
 
-Also test duplicate logical artifact paths, unsorted environment names, non-registry environment names, duplicate commands, wrong command order, a non-canonical argv path, digest/length mismatch, booleans as lengths, and a command rendered for another adapter.
+Also test duplicate logical artifact paths, missing/duplicate/reordered command-environment bindings, unsorted environment names, a selected-backend name admitted to diagnose/cluster, names from another backend, non-registry environment names, duplicate commands, wrong command order, a non-canonical argv path, digest/length mismatch, booleans as lengths, and a command rendered for another adapter. Positive regressions cover OpenAI's endpoint name, Ollama's host/base-url names, and either/both Gemini credential aliases on extract; each admitted name changes the invocation digest while no value is serialized.
 
 - [ ] **Step 2: Run invocation tests and verify the missing module failure**
 
@@ -1273,7 +1316,10 @@ payload = {
     "configuration_sha256": configuration_sha256,
     "source_digest": source_digest,
     "projection_digest": projection_digest,
-    "environment_names": list(environment_names),
+    "environments": [
+        {"operation": item.operation, "names": list(item.names)}
+        for item in environments
+    ],
     "artifacts": [
         {"path": item.logical_path.as_posix(), "sha256": item.sha256, "byte_length": item.byte_length}
         for item in artifacts
@@ -1282,7 +1328,19 @@ payload = {
 digest = hashlib.sha256(_INVOCATION_DOMAIN + _canonical_json(payload)).hexdigest()
 ```
 
-Require commands in exact `(extract, diagnose, cluster)` order and compare each canonical argv with a fresh registry render using logical placeholders. Artifact bindings are sorted by logical path and must include exactly `raw/graph.json`, `raw/diagnose.json`, `cluster-input/graph.json`, `clustered/graph.json`, `clustered/GRAPH_REPORT.md`, plus `clustered/graph.html` only when requested. Never serialize actual argv.
+Require commands and environment bindings in exact `(extract, diagnose,
+cluster)` order and compare each canonical argv with a fresh registry render
+using logical placeholders. Each name tuple is sorted/unique. Extract contains
+the fixed base names plus exactly the non-empty subset of the selected
+`BackendContract.admitted_environment` that the orchestrator passed (including
+registry-declared endpoint/alias names); code-only contains only the base
+names. A semantic backend that is not credentialless must include at least one
+name from its `credential_environment`; credentialless backends may omit it.
+Diagnose and no-label cluster must have exactly the base names. Artifact
+bindings are sorted by logical path and must include exactly `raw/graph.json`,
+`raw/diagnose.json`, `cluster-input/graph.json`, `clustered/graph.json`,
+`clustered/GRAPH_REPORT.md`, plus `clustered/graph.html` only when requested.
+Never serialize actual argv or environment values.
 
 - [ ] **Step 4: Write failing evidence capture, strict-parser, and sanitization tests**
 
@@ -1357,7 +1415,7 @@ The parser must enforce `GRAPH_EVIDENCE_MAX_BYTES` while reading, then exact key
 
 `parse_graph_evidence(payload, contract, *, expected_digest)` requires an external lowercase SHA-256 anchor. Enforce the byte cap, validate `expected_digest`, and compare it with SHA-256 of the exact payload before JSON parsing or semantic admission. Tests pass `built.digest` for a builder-produced descriptor; semantic-malformation tests independently hash their controlled fixture bytes only to reach post-anchor validation; and a canonical relation/source-path mutation must fail when paired with the original trusted digest. Production callers must pass the SHA-256 already bound by their captured payload descriptor or bundle artifact metadata, never hash an untrusted payload and present that result as trust.
 
-`build_graph_evidence(..., staged_files=frozenset(...))` requires the exact staged projection path set. Both this evidence boundary and `Graphify0948Adapter.adapt_clustered_graph()` reapply `GLOBAL_DENY_PATTERNS` through `is_denied`, even when a denied path appears in the caller's set. The final descriptor is recomputed at `adapted/graph.json` from invocation-bound clustered bytes plus that deny-clean staged set.
+`build_graph_evidence(..., staged_files=frozenset(...))` requires the exact staged projection path set. At this prerequisite phase, schema-v1 callers retain the unchanged legacy `GLOBAL_DENY_PATTERNS`/`is_denied` admission boundary. That rule is not the final schema-v2 boundary: Core Task 4 updates both evidence admission and `Graphify0948Adapter.adapt_clustered_graph()` to call the shared structured `classify_path(..., sensitive_source_suffixes=contract.sensitive_source_suffixes)` policy, reject only `deny`, and admit `scan` only for bytes already scanned upstream. Add the cross-phase regression that `src/credentials.py` survives evidence and final adaptation while `src/credentials/app.py`, `src/database-creds.json`, and every legacy private/runtime/data rule fail closed. The final descriptor is recomputed at `adapted/graph.json` from invocation-bound clustered bytes plus the policy-version-correct admitted staged set; v2 never reapplies the legacy sensitive leaf-name deny list.
 
 - [ ] **Step 8: Run evidence and full regressions**
 
@@ -1379,8 +1437,10 @@ git commit -m "feat: bind Graphify extraction evidence"
 ### Task 5: Integrate evidence into candidate adaptation and non-circular ownership
 
 **Files:**
+- Modify: `src/project_knowledge/evidence.py`
 - Modify: `src/project_knowledge/adapter.py`
 - Modify: `src/project_knowledge/artifacts.py`
+- Modify: `tests/test_evidence.py`
 - Modify: `tests/test_adapter.py`
 - Modify: `tests/test_artifacts.py`
 - Modify: `tests/test_health.py`
@@ -1388,6 +1448,11 @@ git commit -m "feat: bind Graphify extraction evidence"
 **Interfaces:**
 - Consumes: Tasks 1–4 plus Core Tasks 1–5 exports: `ProjectManifest.project_uid: UUID | None`; `ProjectionFile`; `ProjectionSnapshot`; `StagedInput.projection_digest: str | None`, `reason_counts`, `projection_files`, and `coverage_approvals`; and `CoverageApproval`. Artifact schema 2 requires non-null project UID/projection digest. The later Core Task 7 computes previous valid ownership epoch + 1 (or 1) and passes it to this plan's validator; this task does not own an epoch allocator.
 - Produces: evidence-aware `adapt_candidate()`, `GitIdentity`, evidence-aware `validate_candidate()`, and `validate_owned_graph()` exactly as declared in the stable interface ledger.
+- Amends the already landed Task 4 invocation schema before Core Task 7: replace the former pipeline-wide environment-name tuple with the exact three `CommandEnvironmentBinding` entries declared above. Extract contains the four fixed base names plus only the selected backend's non-empty `admitted_environment` subset (credential aliases and endpoint names included); diagnose and cluster contain exactly the four base names. The parser rejects the legacy shape, duplicate/reordered operations, any selected-backend name on either local operation, a name from another backend, or any unknown name. No environment value is serialized.
+
+- [ ] **Step 0: Migrate the landed invocation schema to per-command environments**
+
+Update `src/project_knowledge/evidence.py` and `tests/test_evidence.py` first. Add a regression that the same semantic extraction credential reaches only extract, that diagnose/cluster remain base-only, and that changing any one command binding changes the digest. Run: `uv run pytest -q tests/test_evidence.py -k 'invocation or environment'`. Expected: PASS before adaptation work starts.
 
 - [ ] **Step 1: Write failing schema-2 adaptation tests**
 
@@ -1406,6 +1471,7 @@ def test_evidenced_adapter_writes_schema2_graph_evidence_and_report(tmp_path: Pa
     assert result.projection_digest == graph_evidence().projection_digest
     assert result.evidence_digest == graph_evidence().digest
     assert result.extraction_invocation_digest == graph_evidence().extraction_invocation_digest
+    assert len(result.generation_digest) == 64
     assert (result.root / "GRAPH_EVIDENCE.json").read_bytes() == graph_evidence().payload
     document = json.loads((result.root / "graph.json").read_text())
     assert document["artifact_schema_version"] == 2
@@ -1463,6 +1529,7 @@ def test_validation_injects_epoch_only_into_non_circular_ownership(
         staged,
         manifest,
         expected_projection_digest="2" * 64,
+        expected_evidence_digest=graph_evidence().digest,
         build_epoch=7,
         git_identity=GitIdentity(commit_oid="a" * 40, algorithm="sha1"),
     )
@@ -1473,6 +1540,7 @@ def test_validation_injects_epoch_only_into_non_circular_ownership(
     assert ownership["project_uid"] == str(manifest.project_uid)
     assert ownership["adapter_id"] == "graphify-0.9.48"
     assert ownership["graph_digest"] == validated.graph_digest
+    assert ownership["generation_digest"] == validated.generation_digest
     assert ownership["git_commit_oid"] == "a" * 40
     assert ownership["git_commit_algorithm"] == "sha1"
     assert OWNERSHIP_MANIFEST not in ownership["artifacts"]
@@ -1507,7 +1575,7 @@ Expected: FAIL because ownership is schema 1 and `validate_owned_graph()`/`GitId
 
 - [ ] **Step 6: Implement evidence-aware candidate validation**
 
-Detect artifact schema from graph metadata. For schema 2 require `GRAPH_EVIDENCE.json`, parse it through the registry adapter, validate exact graph/evidence/source/projection/invocation bindings, recompute final integrity, compare the safe final-edge evidence index against graph IDs, and call:
+Detect artifact schema from graph metadata. For schema 2 require `GRAPH_EVIDENCE.json` and a non-null lowercase `expected_evidence_digest`, parse it through the registry adapter using exactly that external anchor, validate exact graph/evidence/source/projection/invocation bindings, recompute final integrity, compare the safe final-edge evidence index against graph IDs, and call:
 
 ```python
 trust = decide_impact_trust(
@@ -1524,7 +1592,11 @@ Reject schema-2 graph documents containing `impact_trust`, `impact_limitations`,
 
 - [ ] **Step 7: Write ownership schema 2 without a self-hash**
 
-Use this wire shape, omitting Git fields together when unavailable:
+Compute `generation_digest` from canonical UTF-8 JSON of the sorted approved
+owned-root artifact documents `{path, sha256, byte_length}` (`graph.json`,
+`GRAPH_REPORT.md`, `GRAPH_EVIDENCE.json`, optional `graph.html`), prefixed by
+`b"atlasweaver-generation-v1\0"`; ownership is excluded. Use this wire shape,
+omitting Git fields together when unavailable:
 
 ```python
 ownership = {
@@ -1539,6 +1611,7 @@ ownership = {
     "extraction_invocation_digest": evidence.extraction_invocation_digest,
     "evidence_digest": evidence.digest,
     "graph_digest": graph_digest,
+    "generation_digest": generation_digest,
     "build_epoch": build_epoch,
     "impact_trust": trust.level,
     "impact_limitations": list(trust.limitations),
@@ -1560,6 +1633,20 @@ Do not include `generated_at`, ownership filename in `artifacts`, or an ownershi
 - [ ] **Step 8: Implement strict owned-live-graph validation**
 
 `validate_owned_graph()` opens/captures the complete approved tree without following links, parses ownership first only to obtain the closed expected artifact set, verifies every digest and length, then performs the same graph/evidence/integrity/trust checks as candidate validation without writing anything. First recompute generation-time trust with the ownership-bound source/projection values and compare it to the stored ownership claim. Then compute returned current trust: an omitted expected source or projection digest is unverified and returns navigation with `source_digest_unverified` or `projection_digest_unverified`; an unequal value is stale; only supplied equal values can preserve trusted status. Absence therefore permits structural/ownership validation but never an affirmative current-impact claim. Reuse private validation helpers so candidate and live paths cannot drift.
+
+Recompute `generation_digest` from the strict ownership-listed artifact set and
+require equality with schema-2 ownership. Change schema-2 promotion no-op
+identity from `graph_digest` to `generation_digest`; schema-1 compatibility may
+derive the same value in memory from its closed artifact list. Add a regression
+where graph bytes are unchanged but report/evidence bytes differ and promotion
+must replace the generation, plus an exact-generation no-op regression that
+leaves the installed ownership bytes and epoch untouched. On both paths,
+construct `PromotionResult` from the descriptor-validated installed ownership,
+not merely from the proposed candidate: `digest`, `generation_digest`, and
+`build_epoch` describe what is durably installed when the function returns.
+For schema 2, `build_epoch` is an exact non-boolean positive integer; schema 1
+keeps it `None`. Assert these result fields in changed and no-op tests, including
+a no-op candidate whose proposed epoch differs from the installed epoch.
 
 Update health's existing owned-output inspection to call this validator for integrity/evidence facts while retaining health's own status classification. Legacy ownership stays accepted as navigation-only during the compatibility window.
 
@@ -1876,8 +1963,11 @@ Extend the real test to run the exact sequence independent of the later lifecycl
 5. render/run cluster/no-label/no-viz;
 6. capture final graph/report and build invocation/evidence;
 7. adapt with evidence;
-8. validate with `expected_projection_digest="2" * 64`, `build_epoch=1`;
-9. promote and validate the owned live graph.
+8. validate with `expected_projection_digest=staged.projection_digest`, `expected_evidence_digest=evidence.digest`, `build_epoch=1`;
+9. acquire `repository_lifecycle_lock(repo)`, capture its
+   `RepositoryAccess` with `capture_lifecycle_repository(repo)`, promote through
+   `promote_graph(..., repository_access=repository)`, and validate the owned
+   live graph through that same descriptor authority.
 
 The assertions are exact:
 
@@ -1889,12 +1979,17 @@ if evidence.normalization_quarantines:
     assert "raw_endpoint_unresolved" in validated.impact_limitations
 assert validated.build_epoch == 1
 assert (candidate / "GRAPH_EVIDENCE.json").is_file()
-owned = validate_owned_graph(
-    repo / "graphify-out",
-    manifest,
-    expected_source_digest=staged.source_digest,
-    expected_projection_digest="2" * 64,
-)
+with repository_lifecycle_lock(repo), capture_lifecycle_repository(
+    repo
+) as repository:
+    promote_graph(validated, repo, repository_access=repository)
+    owned = validate_owned_graph(
+        repo / "graphify-out",
+        manifest,
+        expected_source_digest=staged.source_digest,
+        expected_projection_digest=staged.projection_digest,
+        repository_access=repository,
+    )
 assert owned.evidence_digest == validated.evidence_digest
 ```
 
