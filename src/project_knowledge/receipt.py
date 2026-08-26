@@ -12,7 +12,7 @@ import re
 import stat
 from typing import Any
 
-from .models import ProjectManifest
+from .models import ProjectionFile, ProjectManifest
 from .staging import StagedInput
 
 
@@ -235,10 +235,18 @@ def verify_staged_input(root: Path, receipt: StagingReceipt) -> StagedInput:
     paths = tuple(path for path, _ in files)
     if paths != receipt.files:
         raise ReceiptError("staged input does not match receipt")
-    digest = hashlib.sha256()
-    for path, payload in files:
-        digest.update(path.as_posix().encode("utf-8") + b"\0" + payload + b"\0")
-    value = digest.hexdigest()
+    if receipt.schema_version == 2:
+        from .staging import _source_digest
+
+        value = _source_digest(tuple(
+            ProjectionFile(path, hashlib.sha256(payload).hexdigest(), len(payload))
+            for path, payload in files
+        ))
+    else:
+        digest = hashlib.sha256()
+        for path, payload in files:
+            digest.update(path.as_posix().encode("utf-8") + b"\0" + payload + b"\0")
+        value = digest.hexdigest()
     if value != receipt.source_digest:
         raise ReceiptError("staged input does not match receipt")
     return StagedInput(

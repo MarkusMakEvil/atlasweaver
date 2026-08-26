@@ -2,15 +2,30 @@
 
 from __future__ import annotations
 
+from collections import Counter
+from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
+import json
 import os
 from pathlib import Path, PurePosixPath
 import shutil
 import stat
 
-from .models import ProjectManifest
-from .privacy import effective_excludes, is_denied, repository_ignores
+from .compatibility import resolve_graphify_compatibility
+from .locking import RepositoryAccess, open_repository_access
+from .models import (
+    PrivacyDecision,
+    ProjectionFile,
+    ProjectionSnapshot,
+    ProjectManifest,
+)
+from .privacy import (
+    classify_path,
+    effective_excludes,
+    is_denied,
+    repository_ignores,
+)
 
 
 class StagingError(ValueError):
@@ -41,8 +56,17 @@ class StagedInput:
     coverage_approvals: tuple[str, ...] = ()
 
 
+SOURCE_DIGEST_DOMAIN = b"atlasweaver-source-v2\0"
+PROJECTION_DIGEST_DOMAIN = b"atlasweaver-projection-v2\0"
+POLICY_VERSION = 2
+
+
 def stage_input(
-    repo_root: Path, manifest: ProjectManifest, destination: Path
+    repo_root: Path,
+    manifest: ProjectManifest,
+    destination: Path,
+    *,
+    repository_access: RepositoryAccess | None = None,
 ) -> StagedInput:
     """Copy the manifest's safe, regular source files into a private directory.
 
@@ -50,6 +74,11 @@ def stage_input(
     source.  A failure removes it, preventing a later process from using a
     partial projection.
     """
+    if manifest.schema_version == 2:
+        return _stage_input_v2(
+            repo_root, manifest, destination,
+            repository_access=repository_access,
+        )
     root = repo_root.absolute()
     _require_directory(root, "repository root")
     staged_root = _resolved_destination(destination)
@@ -110,6 +139,8 @@ def stage_input_with_receipt(
     manifest: ProjectManifest,
     destination: Path,
     receipt_path: Path,
+    *,
+    repository_access: RepositoryAccess | None = None,
 ) -> StagedInput:
     """Create one staged snapshot and its out-of-tree provenance receipt."""
     from .receipt import (
@@ -141,7 +172,10 @@ def stage_input_with_receipt(
     staged_identity: tuple[int, int] | None = None
     receipt_identity: tuple[int, int] | None = None
     try:
-        staged = stage_input(repo_root, manifest, destination)
+        staged = stage_input(
+            repo_root, manifest, destination,
+            repository_access=repository_access,
+        )
         staged_path, staged_fd, staged_identity = _open_receipt_directory(
             staged.root, "staged input"
         )
@@ -208,6 +242,334 @@ def iter_safe_files(repo_root: Path, manifest: ProjectManifest):
             )
     finally:
         os.close(root_descriptor)
+
+
+def inspect_projection(
+    repo_root: Path,
+    manifest: ProjectManifest,
+    *,
+    repository_access: RepositoryAccess | None = None,
+) -> ProjectionSnapshot:
+    """Capture the complete v2 privacy decision and safe-byte projection."""
+    if manifest.schema_version != 2 or manifest.project_uid is None:
+        raise StagingError("projection v2 requires manifest schema 2")
+    contract = resolve_graphify_compatibility(manifest.graphify_version)
+    with _repository_access(repo_root, repository_access) as repository:
+        ignores = repository_ignores(
+            repo_root, repository_descriptor=repository.descriptor
+        )
+        decisions: list[PrivacyDecision] = []
+        captured: list[tuple[ProjectionFile, bytes]] = []
+        findings = []
+        for include_root in manifest.include_roots:
+            _walk_projection(
+                repository.descriptor,
+                include_root.parts,
+                PurePosixPath(),
+                manifest,
+                contract.sensitive_source_suffixes,
+                ignores,
+                decisions,
+                captured,
+                findings,
+            )
+        from .secrets_scan import SecretExceptionError, load_secret_exceptions
+
+        try:
+            accepted = load_secret_exceptions(
+                repo_root, tuple(findings), manifest=manifest,
+                repository_descriptor=repository.descriptor,
+            )
+        except SecretExceptionError as error:
+            raise SecretShapeError("secret exception policy is invalid") from error
+        if any(item.fingerprint not in accepted for item in findings):
+            raise SecretShapeError("safe input contains secret-shaped material")
+        files = tuple(
+            item for item, _ in sorted(
+                captured, key=lambda pair: pair[0].path.as_posix().encode("utf-8")
+            )
+        )
+        ordered_decisions = tuple(sorted(
+            decisions, key=lambda item: item.path.as_posix().encode("utf-8")
+        ))
+        counts = Counter(
+            f"{item.action}:{item.rule_id}" for item in ordered_decisions
+        )
+        reason_counts = tuple(sorted(counts.items()))
+        source_digest = _source_digest(files)
+        secret_exception_digest = _control_digest(
+            repository.descriptor, ".graphify-secret-exceptions.yaml"
+        )
+        coverage_digest = _control_digest(
+            repository.descriptor, ".atlasweaver-coverage.yaml"
+        )
+        return ProjectionSnapshot(
+            source_digest=source_digest,
+            projection_digest=_projection_digest(
+                manifest,
+                source_digest=source_digest,
+                decisions=ordered_decisions,
+                ignore_digests=ignores.digests(),
+                reason_counts=reason_counts,
+                secret_exception_digest=secret_exception_digest,
+                coverage_digest=coverage_digest,
+            ),
+            files=files,
+            decisions=ordered_decisions,
+            reason_counts=reason_counts,
+            ignore_digests=ignores.digests(),
+            secret_exception_digest=secret_exception_digest,
+            coverage_digest=coverage_digest,
+        )
+
+
+def _stage_input_v2(
+    repo_root: Path,
+    manifest: ProjectManifest,
+    destination: Path,
+    *,
+    repository_access: RepositoryAccess | None,
+) -> StagedInput:
+    staged_root = _resolved_destination(destination)
+    _reject_destination_in_inputs(repo_root.absolute(), manifest, staged_root)
+    with _repository_access(repo_root, repository_access) as repository:
+        projection = inspect_projection(
+            repo_root, manifest, repository_access=repository
+        )
+        staged_root.mkdir(mode=0o700, parents=True, exist_ok=False)
+        os.chmod(staged_root, 0o700)
+        try:
+            for item in projection.files:
+                before = _stat_relative(repository.descriptor, item.path)
+                payload = _read_regular_file(
+                    item.path, repository.descriptor, before
+                )
+                after = _stat_relative(repository.descriptor, item.path)
+                if (
+                    _identity(before) != _identity(after)
+                    or len(payload) != item.byte_length
+                    or hashlib.sha256(payload).hexdigest() != item.sha256
+                ):
+                    raise SourceChangedError(item.path.as_posix())
+                _write_private_file(staged_root, item.path, payload)
+            return StagedInput(
+                staged_root,
+                projection.source_digest,
+                tuple(item.path for item in projection.files),
+                projection.projection_digest,
+                projection.reason_counts,
+                (),
+            )
+        except BaseException:
+            try:
+                _remove_incomplete_staging(staged_root)
+            except OSError as cleanup_error:
+                raise StagingCleanupError(
+                    "safe input staging cleanup failed; destination requires manual recovery"
+                ) from cleanup_error
+            raise
+
+
+@contextmanager
+def _repository_access(
+    repo_root: Path,
+    repository_access: RepositoryAccess | None,
+):
+    if repository_access is not None:
+        if repository_access.descriptor < 0:
+            raise StagingError("repository access is unavailable")
+        yield repository_access
+        return
+    with open_repository_access(repo_root) as opened:
+        yield opened
+
+
+def _walk_projection(
+    parent_descriptor: int,
+    parts: tuple[str, ...],
+    parent_relative: PurePosixPath,
+    manifest: ProjectManifest,
+    sensitive_suffixes: frozenset[str],
+    ignores,
+    decisions: list[PrivacyDecision],
+    captured: list[tuple[ProjectionFile, bytes]],
+    findings: list[object],
+) -> None:
+    if not parts:
+        return
+    name, *remaining = parts
+    relative = parent_relative / name
+    try:
+        info = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    decision = classify_path(
+        relative,
+        project_excludes=manifest.excludes,
+        sensitive_source_suffixes=sensitive_suffixes,
+    )
+    if decision.action == "deny":
+        decisions.append(decision)
+        return
+    if stat.S_ISLNK(info.st_mode):
+        decisions.append(PrivacyDecision(relative, "deny", "symlink"))
+        return
+    if ignores(relative, is_directory=stat.S_ISDIR(info.st_mode)):
+        decisions.append(PrivacyDecision(relative, "deny", "repository_ignore"))
+        return
+    if remaining:
+        if not stat.S_ISDIR(info.st_mode):
+            decisions.append(PrivacyDecision(relative, "deny", "non_regular"))
+            return
+        directory = _open_directory_at(parent_descriptor, name)
+        try:
+            if _is_nested_git_repository(directory):
+                decisions.append(
+                    PrivacyDecision(relative, "deny", "nested_repository")
+                )
+                return
+            _walk_projection(
+                directory, tuple(remaining), relative, manifest,
+                sensitive_suffixes, ignores, decisions, captured, findings,
+            )
+        finally:
+            os.close(directory)
+        return
+    if stat.S_ISDIR(info.st_mode):
+        directory = _open_directory_at(parent_descriptor, name)
+        try:
+            if _is_nested_git_repository(directory):
+                decisions.append(
+                    PrivacyDecision(relative, "deny", "nested_repository")
+                )
+                return
+            with os.scandir(os.dup(directory)) as entries:
+                children = sorted(entry.name for entry in entries)
+            for child in children:
+                _walk_projection(
+                    directory, (child,), relative, manifest,
+                    sensitive_suffixes, ignores, decisions, captured, findings,
+                )
+        finally:
+            os.close(directory)
+        return
+    if not stat.S_ISREG(info.st_mode):
+        decisions.append(PrivacyDecision(relative, "deny", "non_regular"))
+        return
+    payload = _read_regular_file(relative, parent_descriptor, info) if not parent_relative.parts else None
+    if payload is None:
+        # `parent_descriptor` is already the relative file's parent here.
+        descriptor = os.open(
+            name, os.O_RDONLY | _nofollow_flag(), dir_fd=parent_descriptor
+        )
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode) or _identity(info) != _identity(opened):
+                raise SourceChangedError(relative.as_posix())
+            chunks: list[bytes] = []
+            while chunk := os.read(descriptor, 1024 * 1024):
+                chunks.append(chunk)
+            payload = b"".join(chunks)
+        finally:
+            os.close(descriptor)
+    try:
+        if b"\0" in payload:
+            raise UnicodeError
+        payload.decode("utf-8")
+    except UnicodeError:
+        decisions.append(PrivacyDecision(relative, "deny", "binary_payload"))
+        return
+    from .secrets_scan import scan_payload
+
+    findings.extend(scan_payload(relative, payload))
+    decisions.append(decision)
+    captured.append((
+        ProjectionFile(
+            relative, hashlib.sha256(payload).hexdigest(), len(payload)
+        ),
+        payload,
+    ))
+
+
+def _canonical_json(value: object) -> bytes:
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+
+
+def _source_digest(files: tuple[ProjectionFile, ...]) -> str:
+    payload = [
+        {
+            "path": item.path.as_posix(),
+            "sha256": item.sha256,
+            "byte_length": item.byte_length,
+        }
+        for item in files
+    ]
+    return hashlib.sha256(
+        SOURCE_DIGEST_DOMAIN + _canonical_json(payload)
+    ).hexdigest()
+
+
+def _projection_digest(
+    manifest: ProjectManifest,
+    *,
+    source_digest: str,
+    decisions: tuple[PrivacyDecision, ...],
+    ignore_digests: tuple[str, ...],
+    reason_counts: tuple[tuple[str, int], ...],
+    secret_exception_digest: str | None,
+    coverage_digest: str | None,
+) -> str:
+    payload = {
+        "policy_version": POLICY_VERSION,
+        "manifest": {
+            "project_id": manifest.project_id,
+            "project_uid": str(manifest.project_uid),
+            "include_roots": [path.as_posix() for path in manifest.include_roots],
+            "excludes": list(manifest.excludes),
+            "graphify_version": manifest.graphify_version,
+            "track_html": manifest.track_html,
+        },
+        "decisions": [
+            {
+                "path": item.path.as_posix(),
+                "action": item.action,
+                "rule_id": item.rule_id,
+            }
+            for item in decisions
+        ],
+        "ignore_digests": list(ignore_digests),
+        "secret_exception_digest": secret_exception_digest,
+        "reason_counts": dict(reason_counts),
+        "coverage_digest": coverage_digest,
+        "source_digest": source_digest,
+    }
+    return hashlib.sha256(
+        PROJECTION_DIGEST_DOMAIN + _canonical_json(payload)
+    ).hexdigest()
+
+
+def _control_digest(root_descriptor: int, name: str) -> str | None:
+    try:
+        info = os.stat(name, dir_fd=root_descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(info.st_mode):
+        raise StagingError("projection control file is invalid")
+    descriptor = os.open(
+        name, os.O_RDONLY | _nofollow_flag(), dir_fd=root_descriptor
+    )
+    try:
+        opened = os.fstat(descriptor)
+        if _identity(info) != _identity(opened):
+            raise SourceChangedError(name)
+        chunks: list[bytes] = []
+        while chunk := os.read(descriptor, 1024 * 1024):
+            chunks.append(chunk)
+        return hashlib.sha256(b"".join(chunks)).hexdigest()
+    finally:
+        os.close(descriptor)
 
 
 def _walk_safe_files(

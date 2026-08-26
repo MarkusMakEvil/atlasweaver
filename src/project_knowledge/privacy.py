@@ -7,6 +7,7 @@ from fnmatch import fnmatchcase
 from pathlib import PurePosixPath
 from pathlib import Path
 import hashlib
+import os
 import stat
 
 from pathspec import GitIgnoreSpec
@@ -165,8 +166,9 @@ def is_denied(path: PurePosixPath, excludes: Sequence[str]) -> bool:
 class RepositoryIgnores:
     """Evaluate repository ignore files with Git's ordered pattern semantics."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, *, repository_descriptor: int | None = None) -> None:
         self.root = root.absolute()
+        self._repository_descriptor = repository_descriptor
         self._git_specs: dict[PurePosixPath, GitIgnoreSpec | None] = {}
         self._digest_entries: dict[PurePosixPath, str] = {}
         self._graphify = self._load(PurePosixPath(), ".graphifyignore")
@@ -193,16 +195,22 @@ class RepositoryIgnores:
         return self._graphify.match_file(candidate)
 
     def _load(self, base: PurePosixPath, name: str) -> GitIgnoreSpec | None:
-        path = self.root.joinpath(*base.parts, name)
         try:
-            info = path.stat(follow_symlinks=False)
+            if self._repository_descriptor is None:
+                path = self.root.joinpath(*base.parts, name)
+                info = path.stat(follow_symlinks=False)
+                if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                    raise PrivacyError(f"{name} must be a regular file")
+                payload = path.read_bytes()
+            else:
+                payload = _read_ignore_at(
+                    self._repository_descriptor, base, name
+                )
+            lines = payload.decode("utf-8").splitlines()
         except FileNotFoundError:
             return None
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-            raise PrivacyError(f"{name} must be a regular file")
-        try:
-            payload = path.read_bytes()
-            lines = payload.decode("utf-8").splitlines()
+        except PrivacyError:
+            raise
         except (OSError, UnicodeError) as error:
             raise PrivacyError(f"unable to read {name}") from error
         relative = base / name
@@ -221,9 +229,60 @@ class RepositoryIgnores:
         )
 
 
-def repository_ignores(repo_root: Path) -> RepositoryIgnores:
+def repository_ignores(
+    repo_root: Path, *, repository_descriptor: int | None = None
+) -> RepositoryIgnores:
     """Load `.gitignore` and `.graphifyignore` without invoking Git."""
-    return RepositoryIgnores(repo_root)
+    return RepositoryIgnores(
+        repo_root, repository_descriptor=repository_descriptor
+    )
+
+
+def _read_ignore_at(
+    repository_descriptor: int,
+    base: PurePosixPath,
+    name: str,
+) -> bytes:
+    descriptor = os.dup(repository_descriptor)
+    try:
+        for component in base.parts:
+            child = os.open(
+                component,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = child
+        before = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        if not stat.S_ISREG(before.st_mode):
+            raise PrivacyError(f"{name} must be a regular file")
+        file_descriptor = os.open(
+            name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=descriptor,
+        )
+        try:
+            opened = os.fstat(file_descriptor)
+            if (
+                opened.st_dev != before.st_dev
+                or opened.st_ino != before.st_ino
+                or not stat.S_ISREG(opened.st_mode)
+            ):
+                raise PrivacyError(f"{name} changed during read")
+            chunks: list[bytes] = []
+            while chunk := os.read(file_descriptor, 65_536):
+                chunks.append(chunk)
+            after = os.fstat(file_descriptor)
+            if (
+                after.st_size != opened.st_size
+                or after.st_mtime_ns != opened.st_mtime_ns
+                or sum(map(len, chunks)) != opened.st_size
+            ):
+                raise PrivacyError(f"{name} changed during read")
+            return b"".join(chunks)
+        finally:
+            os.close(file_descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _matches(parts: tuple[str, ...], pattern: tuple[str, ...]) -> bool:

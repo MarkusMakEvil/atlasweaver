@@ -13,7 +13,7 @@ from typing import Any
 import yaml
 
 from .models import ProjectManifest
-from .privacy import GLOBAL_DENY_PATTERNS, is_denied
+from .privacy import GLOBAL_DENY_PATTERNS, classify_path, is_denied
 
 
 _TOKEN_START = rb"(?<![A-Za-z0-9])"
@@ -127,6 +127,20 @@ def has_secret_shape(payload: bytes) -> bool:
     )
 
 
+def redact_literals(value: str) -> str:
+    """Redact detected credential-shaped literals without retaining matches."""
+    if type(value) is not str:
+        return "[REDACTED]"
+    payload = value.encode("utf-8", errors="replace")
+    spans: list[tuple[int, int]] = []
+    for _, pattern in _STRUCTURED_RULES:
+        spans.extend(match.span() for match in pattern.finditer(payload))
+    spans.extend(match.span("value") for match in _ASSIGNMENT.finditer(payload))
+    for start, end in sorted(spans, reverse=True):
+        payload = payload[:start] + b"[REDACTED]" + payload[end:]
+    return payload.decode("utf-8", errors="replace")
+
+
 def scan_payload(path: PurePosixPath, payload: bytes) -> tuple[SecretFinding, ...]:
     """Return redacted findings for one safe source payload."""
     findings: list[SecretFinding] = []
@@ -179,11 +193,19 @@ def scan_repository(
 
 
 def load_secret_exceptions(
-    repo_root: Path, findings: tuple[SecretFinding, ...]
+    repo_root: Path,
+    findings: tuple[SecretFinding, ...],
+    *,
+    manifest: ProjectManifest | None = None,
+    repository_descriptor: int | None = None,
 ) -> frozenset[str]:
     """Load exact reviewed exceptions for contextual findings only."""
     try:
-        payload = _read_optional_regular(repo_root.absolute(), _EXCEPTION_NAME)
+        payload = (
+            _read_optional_regular_at(repository_descriptor, _EXCEPTION_NAME)
+            if repository_descriptor is not None
+            else _read_optional_regular(repo_root.absolute(), _EXCEPTION_NAME)
+        )
     except OSError as error:
         raise SecretExceptionError("secret exception file is invalid") from error
     if payload is None:
@@ -236,7 +258,19 @@ def load_secret_exceptions(
             raise SecretExceptionError("secret exception does not match a current finding")
         if detector != "generic_secret_assignment" or not finding.bypassable:
             raise SecretExceptionError("structured secret findings cannot be excepted")
-        if is_denied(relative, GLOBAL_DENY_PATTERNS):
+        if manifest is None:
+            denied = is_denied(relative, GLOBAL_DENY_PATTERNS)
+        else:
+            from .compatibility import resolve_graphify_compatibility
+
+            denied = classify_path(
+                relative,
+                project_excludes=manifest.excludes,
+                sensitive_source_suffixes=resolve_graphify_compatibility(
+                    manifest.graphify_version
+                ).sensitive_source_suffixes,
+            ).action == "deny"
+        if denied:
             raise SecretExceptionError("denied source paths cannot be excepted")
         accepted.add(fingerprint)
     return frozenset(accepted)
@@ -370,6 +404,29 @@ def _read_optional_regular(root: Path, name: str) -> bytes | None:
             os.close(descriptor)
     finally:
         os.close(root_fd)
+
+
+def _read_optional_regular_at(root_fd: int, name: str) -> bytes | None:
+    try:
+        before = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(before.st_mode):
+        raise SecretExceptionError("secret exception file must be a regular file")
+    descriptor = os.open(name, os.O_RDONLY | _nofollow_flag(), dir_fd=root_fd)
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or _identity(before) != _identity(opened):
+            raise SecretExceptionError("secret exception file changed during read")
+        chunks: list[bytes] = []
+        while chunk := os.read(descriptor, 1024 * 1024):
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        if _identity(opened) != _identity(after):
+            raise SecretExceptionError("secret exception file changed during read")
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
 
 
 def _open_directory(path: Path) -> int:

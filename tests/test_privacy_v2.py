@@ -1,11 +1,15 @@
 from __future__ import annotations
 
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 
 import pytest
 
 from project_knowledge.compatibility import resolve_graphify_compatibility
 from project_knowledge.privacy import PrivacyError, classify_path
+from project_knowledge.locking import open_repository_access
+from project_knowledge.receipt import load_staging_receipt, verify_staged_input
+from project_knowledge.staging import inspect_projection, stage_input_with_receipt
+from tests.support import manifest_v2
 
 
 @pytest.mark.parametrize(("relative", "action", "rule_id"), [
@@ -78,3 +82,71 @@ def test_project_excludes_reject_noncanonical_patterns(pattern: str) -> None:
                 "0.9.48"
             ).sensitive_source_suffixes,
         )
+
+
+def test_sensitive_source_is_scanned_but_sensitive_data_is_not_staged(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "src/credentials.py").write_text(
+        "TOKEN_NAME = getenv('TOKEN_NAME')\n", encoding="utf-8"
+    )
+    (repo / "src/database-creds.json").write_text(
+        '{"url":"postgres://u:long-password@db"}\n', encoding="utf-8"
+    )
+    staged = stage_input_with_receipt(
+        repo, manifest_v2(), tmp_path / "stage", tmp_path / "receipt.json"
+    )
+    assert staged.files == (PurePosixPath("src/credentials.py"),)
+    assert staged.projection_digest is not None
+    assert not (staged.root / "src/database-creds.json").exists()
+    receipt = load_staging_receipt(tmp_path / "receipt.json", manifest_v2())
+    assert receipt.projection_digest == staged.projection_digest
+    assert verify_staged_input(staged.root, receipt).source_digest == staged.source_digest
+
+
+def test_projection_binds_ignore_policy_but_not_denied_payload(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "src/app.py").write_text("safe\n", encoding="utf-8")
+    denied = repo / "src/private-token.json"
+    denied.write_text("first denied bytes\n", encoding="utf-8")
+    first = inspect_projection(repo, manifest_v2())
+    denied.write_text("second denied bytes\n", encoding="utf-8")
+    second = inspect_projection(repo, manifest_v2())
+    assert first.source_digest == second.source_digest
+    assert first.projection_digest == second.projection_digest
+    (repo / ".graphifyignore").write_text(
+        "src/generated.py\n", encoding="utf-8"
+    )
+    third = inspect_projection(repo, manifest_v2())
+    assert third.source_digest == second.source_digest
+    assert third.projection_digest != second.projection_digest
+
+
+def test_projection_and_stage_stay_on_open_root_after_path_swap(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "src/app.py").write_text("ORIGINAL = True\n", encoding="utf-8")
+    with open_repository_access(repo) as repository:
+        expected = inspect_projection(
+            repo, manifest_v2(), repository_access=repository
+        )
+        repo.rename(tmp_path / "original")
+        (repo / "src").mkdir(parents=True)
+        (repo / "src/app.py").write_text(
+            "TOKEN = 'replacement-secret'\n", encoding="utf-8"
+        )
+        staged = stage_input_with_receipt(
+            repo, manifest_v2(), tmp_path / "stage", tmp_path / "receipt.json",
+            repository_access=repository,
+        )
+    assert staged.source_digest == expected.source_digest
+    assert (staged.root / "src/app.py").read_text(encoding="utf-8") == (
+        "ORIGINAL = True\n"
+    )
