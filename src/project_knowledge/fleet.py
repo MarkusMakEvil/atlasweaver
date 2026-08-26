@@ -560,9 +560,13 @@ class ProjectBackendEnvironment:
         allowed = {*_BASE_ENVIRONMENT}
         if canonical_credential_name is not None:
             allowed.add(canonical_credential_name)
-        if set(copied) != allowed or any(
+        if (
+            not set(_BASE_ENVIRONMENT) <= set(copied)
+            or not set(copied) <= allowed
+            or any(
             not copied[name] or any(ord(char) < 32 for char in copied[name])
-            for name in allowed
+            for name in copied
+            )
         ):
             raise FleetConfigError("fleet_invalid")
         ordered = tuple(
@@ -570,7 +574,7 @@ class ProjectBackendEnvironment:
             for name in (*_BASE_ENVIRONMENT,)
             if name in copied
         )
-        if canonical_credential_name is not None:
+        if canonical_credential_name is not None and canonical_credential_name in copied:
             ordered += ((canonical_credential_name, copied[canonical_credential_name]),)
         return cls(project_uid, canonical_credential_name, ordered)
 
