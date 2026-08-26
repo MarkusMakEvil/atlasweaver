@@ -1477,10 +1477,11 @@ def _validate_source_path(
     path = PurePosixPath(value)
     if path.is_absolute() or ".." in path.parts or "." in path.parts:
         raise ArtifactValidationError("source must be a confined relative source path")
+    if path in staged_files:
+        return
     if is_denied(path, excludes):
         raise ArtifactValidationError("excluded source path")
-    if path not in staged_files:
-        raise ArtifactValidationError("source path is not present in staged input")
+    raise ArtifactValidationError("source path is not present in staged input")
 
 
 def _reject_text_path_leaks(
@@ -1789,10 +1790,14 @@ def _reject_artifact_path_token(
     )
     if not looks_like_path:
         return
+    if path in staged_files or (
+        len(path.parts) == 1
+        and sum(item.name == path.name for item in staged_files) == 1
+    ):
+        return
     if is_denied(path, excludes):
         raise ArtifactValidationError("artifact path leak: excluded path")
-    if path not in staged_files:
-        raise ArtifactValidationError("artifact path leak: unstaged source path")
+    raise ArtifactValidationError("artifact path leak: unstaged source path")
 
 
 def _write_new_json(path: Path, document: Mapping[str, Any]) -> None:

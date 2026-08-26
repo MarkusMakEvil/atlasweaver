@@ -42,6 +42,8 @@ from .evidence import (
 from .graphify import (
     CommandRunner,
     SubprocessCommandRunner,
+    _load_bounded_json_text,
+    _sanitize_diagnosis,
     probe_graphify,
     resolve_graphify_executable,
     run_graphify_operation,
@@ -469,10 +471,18 @@ def refresh_project(
                 local_environment,
                 DIAGNOSE_TIMEOUT_SECONDS,
             )
+            diagnosis_document = _sanitize_diagnosis(
+                _load_bounded_json_text(diagnosis_result.stdout)
+            )
             diagnosis = fs.write_private_artifact(
                 run,
                 PurePosixPath("raw/diagnose.json"),
-                diagnosis_result.stdout.encode("utf-8"),
+                json.dumps(
+                    diagnosis_document,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8"),
                 max_bytes=4_194_304,
             )
 

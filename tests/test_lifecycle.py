@@ -121,8 +121,9 @@ def test_operation_refuses_mismatched_argv_zero(tmp_path: Path) -> None:
 class Official0948FixtureRunner(ProbeRunner):
     """Materialize the official fixture for probe and refresh commands."""
 
-    def __init__(self, executable: Path) -> None:
+    def __init__(self, executable: Path, *, raw_diagnosis: bool = False) -> None:
         super().__init__()
+        self.raw_diagnosis = raw_diagnosis
         self.answer((str(executable), "--version"), stdout="graphify 0.9.48\n")
         self.answer((str(executable), "--help"), stdout=_REQUIRED_HELP)
         self.refresh_operations: list[str] = []
@@ -154,7 +155,20 @@ class Official0948FixtureRunner(ProbeRunner):
                     json.dumps(fixture["native_graph"]), encoding="utf-8"
                 )
             elif operation == "diagnose":
-                return CompletedProcess(call, 0, json.dumps(fixture["diagnosis"]), "")
+                diagnosis = fixture["diagnosis"]
+                if self.raw_diagnosis:
+                    diagnosis = {
+                        **diagnosis,
+                        "examples": [{"source": "private"}],
+                        "producer_suppression": {"path": "/private/source.py"},
+                        "notes": ["untrusted diagnostic prose"],
+                    }
+                    diagnosis["summary"] = {
+                        **diagnosis["summary"],
+                        "input_path": "/private/graph.json",
+                        "post_build_error": "",
+                    }
+                return CompletedProcess(call, 0, json.dumps(diagnosis), "")
             else:
                 graph_path = Path(call[call.index("--graph") + 1])
                 assert normalized_before_cluster is not None
@@ -303,6 +317,29 @@ def test_refresh_runs_official_pipeline_and_promotes_owned_v2_graph(
     assert runner.refresh_operations == ["extract", "diagnose", "cluster"]
     assert "CUSTOMER_SECRET" not in runner.refresh_environments[0]
     assert fs.live_run_roots == ()
+
+
+def test_refresh_sanitizes_real_diagnostic_superset_before_evidence(
+    tmp_path: Path,
+) -> None:
+    repo, selected = _source_repository(tmp_path)
+    executable = _fixture_graphify(tmp_path)
+
+    result = refresh_project(
+        repo,
+        selected,
+        RefreshOptions(None, None, False, True),
+        runner=Official0948FixtureRunner(
+            executable.resolve(), raw_diagnosis=True
+        ),
+        ambient={},
+        graphify_binary=executable,
+    )
+
+    assert result.status == "refreshed"
+    assert "/private/" not in (
+        repo / "graphify-out/GRAPH_EVIDENCE.json"
+    ).read_text(encoding="utf-8")
 
 
 def test_exact_generation_refresh_is_noop_and_reuses_installed_epoch(

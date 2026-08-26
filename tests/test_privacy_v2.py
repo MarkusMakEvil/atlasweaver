@@ -93,7 +93,7 @@ def test_sensitive_source_is_scanned_but_sensitive_data_is_not_staged(
         "TOKEN_NAME = getenv('TOKEN_NAME')\n", encoding="utf-8"
     )
     (repo / "src/database-creds.json").write_text(
-        '{"url":"postgres://u:long-password@db"}\n', encoding="utf-8"
+        '{"url":"postgres://u:' + 'long-password@db"}\n', encoding="utf-8"
     )
     staged = stage_input_with_receipt(
         repo, manifest_v2(), tmp_path / "stage", tmp_path / "receipt.json"

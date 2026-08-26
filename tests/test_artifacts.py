@@ -475,6 +475,28 @@ def test_candidate_rejects_excluded_source(
         validate_candidate(candidate, staged, manifest)
 
 
+def test_candidate_accepts_scanned_sensitive_source_in_staged_snapshot(
+    candidate: Path, staged: StagedInput, manifest: ProjectManifest
+) -> None:
+    sensitive = replace(
+        staged,
+        files=(*staged.files, PurePosixPath("src/project_knowledge/secrets_scan.py")),
+    )
+    write_graph(
+        candidate,
+        sensitive,
+        manifest,
+        nodes=[{
+            "id": "secrets_scan",
+            "source_file": "src/project_knowledge/secrets_scan.py",
+        }],
+        edges=[],
+    )
+    write(candidate / "GRAPH_REPORT.md", "# Graph Report\n\nModule: `secrets_scan.py`.\n")
+
+    assert validate_candidate(candidate, sensitive, manifest).node_count == 1
+
+
 @pytest.mark.parametrize(
     "leak",
     [

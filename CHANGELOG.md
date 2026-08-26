@@ -2,6 +2,13 @@
 
 All notable changes to AtlasWeaver are documented here.
 
+## 0.3.1 - 2026-08-26
+
+- Canonicalized Graphify 0.9.48 diagnostic supersets before evidence binding.
+- Accepted privacy-scanned sensitive filenames only when they are exact members
+  of the authorized staged snapshot.
+- Completed AtlasWeaver's code-only self-hosting scope and coverage policy.
+
 ## 0.3.0 - 2026-08-26
 
 - Added manifest schema v2 with recoverable initialization and explicit v1
