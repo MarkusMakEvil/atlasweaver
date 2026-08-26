@@ -64,7 +64,7 @@ def test_manifest_rejects_escaping_paths(tmp_path: Path, value: str) -> None:
 @pytest.mark.parametrize(
     ("field", "value"),
     [
-        ("schema_version", 2),
+        ("schema_version", 3),
         ("project_id", "Threads_Content_Stack"),
         ("include_roots", []),
         ("include_roots", ["src", "src"]),
