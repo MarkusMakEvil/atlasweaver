@@ -8,8 +8,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from pathlib import PurePosixPath
 import re
-import shutil
 import stat
 import sys
 import tempfile
@@ -32,6 +32,10 @@ from project_knowledge.graphify import (
 
 
 _WINDOWS_ABSOLUTE = re.compile(r"^[A-Za-z]:[\\/]|^\\\\")
+_SOURCE_MANIFEST = ".atlasweaver-fixture-source.json"
+_MANIFEST_MAX_BYTES = 64 * 1024
+_SOURCE_FILE_MAX_BYTES = 16 * 1024 * 1024
+_SOURCE_TOTAL_MAX_BYTES = 16 * 1024 * 1024
 
 
 def main() -> int:
@@ -52,19 +56,7 @@ def main() -> int:
         root.chmod(0o700)
         source_root = root / "source"
         source_root.mkdir(mode=0o700)
-        fixture_source = arguments.source.resolve(strict=True)
-        if not fixture_source.is_dir():
-            raise GraphifyContractError("fixture source must be a directory")
-        source_files = tuple(path for path in fixture_source.rglob("*") if path.is_file())
-        if not source_files:
-            raise GraphifyContractError("fixture source must not be empty")
-        for path in source_files:
-            relative = path.relative_to(fixture_source)
-            if path.is_symlink() or ".." in relative.parts:
-                raise GraphifyContractError("fixture source is invalid")
-            target = source_root / relative
-            target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            shutil.copyfile(path, target)
+        source_digest = _stage_manifest_source(arguments.source, source_root)
 
         environment = admitted_graphify_environment(
             contract,
@@ -107,7 +99,7 @@ def main() -> int:
         document = {
             "schema_version": 1,
             "graphify_version": expected_version,
-            "source_digest": _source_digest(source_root),
+            "source_digest": source_digest,
             "native_graph": normalized_graph,
             "diagnosis": sanitized_diagnosis,
         }
@@ -163,16 +155,188 @@ def _load_json(path: Path) -> object:
             os.close(descriptor)
 
 
-def _source_digest(root: Path) -> str:
-    digest = hashlib.sha256()
-    for path in sorted(item for item in root.rglob("*") if item.is_file()):
-        relative = path.relative_to(root).as_posix().encode("utf-8")
-        payload = path.read_bytes()
-        digest.update(len(relative).to_bytes(8, "big"))
-        digest.update(relative)
-        digest.update(len(payload).to_bytes(8, "big"))
-        digest.update(payload)
-    return digest.hexdigest()
+def _stage_manifest_source(source: Path, target_root: Path) -> str:
+    root_descriptor = -1
+    try:
+        before = source.lstat()
+        if not stat.S_ISDIR(before.st_mode):
+            raise OSError("source is not a directory")
+        root_descriptor = os.open(source, _directory_open_flags())
+        opened = os.fstat(root_descriptor)
+        if not stat.S_ISDIR(opened.st_mode) or _object_identity(before) != _object_identity(opened):
+            raise OSError("source directory identity changed")
+
+        manifest_payload = _read_regular_at(
+            root_descriptor,
+            PurePosixPath(_SOURCE_MANIFEST),
+            max_bytes=_MANIFEST_MAX_BYTES,
+        )
+        entries = _parse_source_manifest(manifest_payload)
+        digest = hashlib.sha256()
+        total = 0
+        for relative in entries:
+            remaining = _SOURCE_TOTAL_MAX_BYTES - total
+            if remaining < 0:
+                raise OSError("source is oversized")
+            payload = _read_regular_at(
+                root_descriptor,
+                relative,
+                max_bytes=min(_SOURCE_FILE_MAX_BYTES, remaining),
+            )
+            total += len(payload)
+            encoded_relative = relative.as_posix().encode("utf-8")
+            digest.update(len(encoded_relative).to_bytes(8, "big"))
+            digest.update(encoded_relative)
+            digest.update(len(payload).to_bytes(8, "big"))
+            digest.update(payload)
+            _write_staged_source(target_root, relative, payload)
+        return digest.hexdigest()
+    except (OSError, TypeError, ValueError, UnicodeError):
+        raise GraphifyContractError(
+            "Graphify fixture source manifest is invalid"
+        ) from None
+    finally:
+        if root_descriptor >= 0:
+            os.close(root_descriptor)
+
+
+def _parse_source_manifest(payload: bytes) -> tuple[PurePosixPath, ...]:
+    def reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        document: dict[str, object] = {}
+        for key, value in pairs:
+            if key in document:
+                raise ValueError("duplicate manifest key")
+            document[key] = value
+        return document
+
+    document = json.loads(
+        payload.decode("utf-8"), object_pairs_hook=reject_duplicate_keys
+    )
+    if not isinstance(document, dict) or set(document) != {"files", "schema_version"}:
+        raise ValueError("invalid manifest shape")
+    values = document["files"]
+    if type(document["schema_version"]) is not int or document["schema_version"] != 1:
+        raise ValueError("invalid manifest version")
+    if not isinstance(values, list) or not values:
+        raise ValueError("empty manifest inventory")
+    if any(not isinstance(value, str) for value in values):
+        raise ValueError("invalid manifest entry")
+    if values != sorted(values) or len(values) != len(set(values)):
+        raise ValueError("manifest inventory is not unique and sorted")
+
+    entries: list[PurePosixPath] = []
+    for value in values:
+        components = value.split("/")
+        if (
+            not value
+            or value.startswith("/")
+            or "\\" in value
+            or "\x00" in value
+            or any(component in {"", ".", ".."} for component in components)
+            or _WINDOWS_ABSOLUTE.match(value)
+        ):
+            raise ValueError("unconfined manifest entry")
+        relative = PurePosixPath(value)
+        if relative.name == _SOURCE_MANIFEST:
+            raise ValueError("manifest cannot list itself")
+        entries.append(relative)
+
+    canonical = (
+        json.dumps(document, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    ).encode("utf-8")
+    if payload != canonical:
+        raise ValueError("manifest is not canonical JSON")
+    return tuple(entries)
+
+
+def _read_regular_at(
+    root_descriptor: int, relative: PurePosixPath, *, max_bytes: int
+) -> bytes:
+    parent_descriptor = _open_parent_at(root_descriptor, relative)
+    descriptor = -1
+    try:
+        before = os.stat(relative.name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > max_bytes:
+            raise OSError("invalid source file")
+        descriptor = os.open(
+            relative.name,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | _nofollow_flag(),
+            dir_fd=parent_descriptor,
+        )
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or _file_identity(before) != _file_identity(opened):
+            raise OSError("source file identity changed")
+        chunks: list[bytes] = []
+        total = 0
+        while chunk := os.read(descriptor, min(65_536, max_bytes + 1 - total)):
+            total += len(chunk)
+            if total > max_bytes:
+                raise OSError("source file is oversized")
+            chunks.append(chunk)
+        final = os.fstat(descriptor)
+        if _file_identity(opened) != _file_identity(final) or total != opened.st_size:
+            raise OSError("source file changed during capture")
+        return b"".join(chunks)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(parent_descriptor)
+
+
+def _open_parent_at(root_descriptor: int, relative: PurePosixPath) -> int:
+    descriptor = os.dup(root_descriptor)
+    try:
+        for component in relative.parts[:-1]:
+            child = os.open(component, _directory_open_flags(), dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _directory_open_flags() -> int:
+    try:
+        return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    except AttributeError as error:
+        raise OSError("no-follow directory opens unavailable") from error
+
+
+def _nofollow_flag() -> int:
+    try:
+        return os.O_NOFOLLOW
+    except AttributeError as error:
+        raise OSError("no-follow file opens unavailable") from error
+
+
+def _object_identity(info: os.stat_result) -> tuple[int, int]:
+    return (info.st_dev, info.st_ino)
+
+
+def _file_identity(info: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def _write_staged_source(root: Path, relative: PurePosixPath, payload: bytes) -> None:
+    parent = root
+    for component in relative.parts[:-1]:
+        parent = parent / component
+        parent.mkdir(mode=0o700, exist_ok=True)
+        os.chmod(parent, 0o700)
+    target = root.joinpath(*relative.parts)
+    descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("short staged source write")
+            view = view[written:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _normalize_paths(value: object, source_root: Path) -> object:

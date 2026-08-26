@@ -49,6 +49,36 @@ _capture_load_json = _CAPTURE_TOOL["_load_json"]
 _capture_reject_absolute_paths = _CAPTURE_TOOL["_reject_absolute_paths"]
 _capture_write_output = _CAPTURE_TOOL["_write_output"]
 
+_CAPTURE_SOURCE_MANIFEST = ".atlasweaver-fixture-source.json"
+
+
+def _write_capture_source_manifest(
+    source: Path, entries: list[object] | None = None
+) -> None:
+    document = {
+        "files": ["fixture.py"] if entries is None else entries,
+        "schema_version": 1,
+    }
+    (source / _CAPTURE_SOURCE_MANIFEST).write_bytes(
+        (json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    )
+
+
+def _run_capture_tool(
+    launcher: Path, source: Path, output: Path
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            str(Path("scripts/capture-graphify-compatibility-fixture").resolve()),
+            "--binary", str(launcher),
+            "--source", str(source),
+            "--output", str(output),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
 
 _SOURCE_SUFFIXES = frozenset(
     {
@@ -323,6 +353,7 @@ def test_capture_tool_strips_ambient_secrets_and_writes_only_sanitized_output(
     source = tmp_path / "source"
     source.mkdir()
     (source / "fixture.py").write_text("def fixture():\n    return 1\n", encoding="utf-8")
+    _write_capture_source_manifest(source)
     output = tmp_path / "fixture.json"
     sentinel = "ambient-capture-secret;$()"
     environment = {
@@ -356,6 +387,101 @@ def test_capture_tool_strips_ambient_secrets_and_writes_only_sanitized_output(
     assert all(sentinel not in item["env"].values() for item in captured_calls)
     assert sentinel not in output.read_text(encoding="utf-8")
     assert sentinel not in result.stdout
+
+
+def test_capture_tool_manifest_excludes_ignored_and_unlisted_files(
+    tmp_path: Path,
+) -> None:
+    """Walking the directory instead would let local junk alter reviewed bytes."""
+    launcher, _ = _capture_graphify_launcher(tmp_path)
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "fixture.py").write_text("def fixture():\n    return 1\n", encoding="utf-8")
+    _write_capture_source_manifest(source)
+    baseline = tmp_path / "baseline.json"
+    first = _run_capture_tool(launcher, source, baseline)
+    assert first.returncode == 0, first.stderr
+
+    cache = source / "__pycache__"
+    cache.mkdir()
+    (cache / "fixture.pyc").write_bytes(b"ignored bytecode")
+    (source / "unreviewed.txt").write_text("unlisted\n", encoding="utf-8")
+    contaminated = tmp_path / "contaminated.json"
+    second = _run_capture_tool(launcher, source, contaminated)
+
+    assert second.returncode == 0, second.stderr
+    assert contaminated.read_bytes() == baseline.read_bytes()
+    assert hashlib.sha256(contaminated.read_bytes()).digest() == hashlib.sha256(
+        baseline.read_bytes()
+    ).digest()
+
+
+@pytest.mark.parametrize(
+    ("case", "entries"),
+    [
+        ("empty", []),
+        ("duplicate", ["fixture.py", "fixture.py"]),
+        ("unsorted", ["z.py", "fixture.py"]),
+        ("absolute", ["/fixture.py"]),
+        ("backslash", [r"nested\fixture.py"]),
+        ("nul", ["fixture\x00.py"]),
+        ("empty-entry", [""]),
+        ("non-string", [7]),
+        ("dot", ["."]),
+        ("dot-component", ["./fixture.py"]),
+        ("dotdot", ["nested/../fixture.py"]),
+        ("escaping", ["../fixture.py"]),
+    ],
+)
+def test_capture_tool_rejects_invalid_manifest_entries_without_path_leaks(
+    tmp_path: Path, case: str, entries: list[object]
+) -> None:
+    """Permissive manifest parsing would admit unreviewed or escaping inputs."""
+    launcher, _ = _capture_graphify_launcher(tmp_path)
+    source = tmp_path / case
+    source.mkdir()
+    (source / "fixture.py").write_text("safe\n", encoding="utf-8")
+    (source / "z.py").write_text("safe\n", encoding="utf-8")
+    _write_capture_source_manifest(source, entries)
+
+    result = _run_capture_tool(launcher, source, tmp_path / f"{case}.json")
+
+    assert result.returncode != 0
+    assert "GraphifyContractError: Graphify fixture source manifest is invalid" in result.stderr
+    assert str(source) not in result.stderr
+    assert "The above exception was the direct cause" not in result.stderr
+
+
+@pytest.mark.parametrize(
+    "case", ["missing-manifest", "malformed", "missing-file", "symlink", "non-regular"]
+)
+def test_capture_tool_fails_closed_for_invalid_manifest_inventory(
+    tmp_path: Path, case: str
+) -> None:
+    """Missing or non-regular reviewed inputs must fail before Graphify runs."""
+    launcher, _ = _capture_graphify_launcher(tmp_path)
+    source = tmp_path / case
+    source.mkdir()
+    if case != "missing-manifest":
+        if case == "malformed":
+            (source / _CAPTURE_SOURCE_MANIFEST).write_text("{", encoding="utf-8")
+        elif case == "missing-file":
+            _write_capture_source_manifest(source)
+        elif case == "symlink":
+            target = source / "target.py"
+            target.write_text("safe\n", encoding="utf-8")
+            (source / "fixture.py").symlink_to(target)
+            _write_capture_source_manifest(source)
+        else:
+            (source / "fixture.py").mkdir()
+            _write_capture_source_manifest(source)
+
+    result = _run_capture_tool(launcher, source, tmp_path / f"{case}.json")
+
+    assert result.returncode != 0
+    assert "GraphifyContractError: Graphify fixture source manifest is invalid" in result.stderr
+    assert str(source) not in result.stderr
+    assert "The above exception was the direct cause" not in result.stderr
 
 
 def test_render_pipeline_argv_is_exact_and_canonical(tmp_path: Path) -> None:

@@ -141,6 +141,9 @@ def test_fixture_source_remains_the_reviewed_code_only_corpus() -> None:
         b"def dispatch(request: Request) -> str:\n"
         b"    return normalize(request)\n"
     )
+    assert Path(
+        "tests/fixtures/graphify/0.9.48/source/.atlasweaver-fixture-source.json"
+    ).read_bytes() == b'{"files":["fixture.py"],"schema_version":1}\n'
 
 
 def test_adapter_factories_exactly_cover_registry_adapter_ids() -> None:
