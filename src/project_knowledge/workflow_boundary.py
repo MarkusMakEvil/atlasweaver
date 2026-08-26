@@ -399,10 +399,7 @@ def run_workflow_check(
                     "credential_bound": credential_bound,
                 },
             ),
-            (
-                "doctor.json",
-                doctor.to_dict(),
-            ),
+            ("doctor.json", doctor.to_dict()),
             (
                 "scan.json",
                 {
@@ -420,6 +417,91 @@ def run_workflow_check(
         workflow.revalidate()
 
 
+def _write_inspect_document(path: Path, document: dict[str, object]) -> None:
+    parent = path.absolute().parent
+    try:
+        info = parent.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise OSError
+        payload = json.dumps(
+            document, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode("utf-8") + b"\n"
+        descriptor = os.open(
+            path.absolute(),
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+        )
+        try:
+            os.write(descriptor, payload)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError:
+        raise WorkflowBoundaryError("workflow_root_invalid") from None
+
+
+def _emit_github_inspect_outputs(document: dict[str, object]) -> None:
+    raw = os.environ.get("GITHUB_OUTPUT")
+    if raw is None:
+        return
+    if type(raw) is not str or not raw or len(raw.encode("utf-8")) > 4096:
+        raise WorkflowBoundaryError("workflow_root_invalid")
+    payload = (
+        f"project_uid={document['project_uid']}\n"
+        f"channel={document['channel']}\n"
+    ).encode("utf-8")
+    try:
+        descriptor = os.open(
+            Path(raw).absolute(),
+            os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+        try:
+            os.write(descriptor, payload)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError:
+        raise WorkflowBoundaryError("workflow_root_invalid") from None
+
+
+def run_workflow_inspect(
+    consumer_checkout: Path,
+    repo_root: str,
+    trusted_tool_checkout: Path,
+    output: Path,
+) -> None:
+    """Project only the validated portable identity needed for job wiring."""
+    with open_workflow_repository(
+        consumer_checkout,
+        repo_root,
+        forbidden_checkout=trusted_tool_checkout,
+    ) as workflow:
+        repository_path = consumer_checkout.absolute().joinpath(*workflow.segments)
+        manifest = load_manifest(
+            repository_path / ".graphify-project.yaml",
+            repository_path,
+            repository_access=workflow.repository_access,
+        )
+        artifact = manifest.artifacts
+        if (
+            manifest.schema_version != 2
+            or manifest.project_uid is None
+            or artifact.provider != "github-release"
+            or artifact.channel is None
+        ):
+            raise WorkflowBoundaryError("workflow_root_invalid")
+        workflow.revalidate()
+        document = {
+            "schema_version": 1,
+            "project_uid": str(manifest.project_uid),
+            "channel": artifact.channel,
+        }
+        _write_inspect_document(output, document)
+        workflow.revalidate()
+        _emit_github_inspect_outputs(document)
+        workflow.revalidate()
+
+
 def _main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m project_knowledge.workflow_boundary")
     subparsers = parser.add_subparsers(dest="verb", required=True)
@@ -429,6 +511,11 @@ def _main(argv: Sequence[str] | None = None) -> int:
     check.add_argument("--repo-root", required=True)
     check.add_argument("--trusted-tool-checkout", type=Path, required=True)
     check.add_argument("--output-directory", type=Path, required=True)
+    inspect = subparsers.add_parser("inspect")
+    inspect.add_argument("--consumer-checkout", type=Path, required=True)
+    inspect.add_argument("--repo-root", required=True)
+    inspect.add_argument("--trusted-tool-checkout", type=Path, required=True)
+    inspect.add_argument("--output", type=Path, required=True)
     arguments = parser.parse_args(argv)
     if arguments.verb == "validate-extraction":
         try:
@@ -448,6 +535,17 @@ def _main(argv: Sequence[str] | None = None) -> int:
                 arguments.repo_root,
                 arguments.trusted_tool_checkout,
                 arguments.output_directory,
+            )
+            return 0
+        except (WorkflowBoundaryError, OSError, ValueError, TypeError):
+            return 1
+    if arguments.verb == "inspect":
+        try:
+            run_workflow_inspect(
+                arguments.consumer_checkout,
+                arguments.repo_root,
+                arguments.trusted_tool_checkout,
+                arguments.output,
             )
             return 0
         except (WorkflowBoundaryError, OSError, ValueError, TypeError):

@@ -77,9 +77,6 @@ jobs:
             --repo-root "$ATLASWEAVER_REPO_ROOT" \
             --trusted-tool-checkout "$GITHUB_WORKSPACE/atlasweaver-tool" \
             --output "$RUNNER_TEMP/inspect.json"
-          uv run --project "$GITHUB_WORKSPACE/atlasweaver-tool" \
-            python -m project_knowledge.workflow_boundary emit-inspect-outputs \
-            --input "$RUNNER_TEMP/inspect.json" --output "$GITHUB_OUTPUT"
 
   build:
     needs: inspect
