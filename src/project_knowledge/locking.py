@@ -263,6 +263,7 @@ class ExclusiveDescriptorLock(AbstractContextManager["ExclusiveDescriptorLock"])
         timeout: float = 5.0,
         *,
         create: bool = True,
+        shared: bool = False,
     ) -> None:
         if not _valid_lock_name(name):
             raise TransactionLockError(
@@ -277,6 +278,7 @@ class ExclusiveDescriptorLock(AbstractContextManager["ExclusiveDescriptorLock"])
         self.name = name
         self.timeout = timeout
         self.create = create
+        self.shared = shared
         self.fd: int | None = None
 
     def __enter__(self) -> "ExclusiveDescriptorLock":
@@ -312,9 +314,10 @@ class ExclusiveDescriptorLock(AbstractContextManager["ExclusiveDescriptorLock"])
                     "transaction lock file is unsafe", kind="unavailable"
                 )
             deadline = time.monotonic() + self.timeout
+            operation = fcntl.LOCK_SH if self.shared else fcntl.LOCK_EX
             while True:
                 try:
-                    fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(self.fd, operation | fcntl.LOCK_NB)
                     return self
                 except BlockingIOError:
                     if time.monotonic() >= deadline:
