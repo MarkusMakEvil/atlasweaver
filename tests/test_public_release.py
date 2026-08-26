@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 import subprocess
 import zipfile
 
@@ -32,6 +33,7 @@ def test_public_product_metadata_and_docs_are_complete() -> None:
         ".graphifyignore",
         ".graphify-secret-exceptions.yaml",
         ".github/workflows/ci.yml",
+        ".github/workflows/graphify-compatibility.yml",
     ):
         assert (ROOT / relative).is_file(), relative
 
@@ -80,10 +82,66 @@ def test_built_wheel_contains_managed_agent_skill_resources(tmp_path: Path) -> N
     with zipfile.ZipFile(wheels[0]) as archive:
         names = set(archive.namelist())
     assert {
+        "project_knowledge/compatibility_fixtures/graphify_0_9_48.json",
+        "project_knowledge/compatibility_fixtures/runtime_probe.py",
         "project_knowledge/resources/skills/using-project-knowledge-graphs/SKILL.md",
         "project_knowledge/resources/skills/using-project-knowledge-graphs/agents/openai.yaml",
         "project_knowledge/resources/skills/using-project-knowledge-graphs/references/workflow.md",
     } <= names
+
+
+def test_compatibility_workflow_is_read_only_and_digest_pinned() -> None:
+    text = (ROOT / ".github/workflows/graphify-compatibility.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "contents: read" in text
+    assert "pull-requests: write" not in text
+    assert "actions/checkout@11d5960a326750d5838078e36cf38b85af677262" in text
+    assert "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065" in text
+    assert "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02" in text
+    assert "uv==0.8.14" in text
+    assert "project_knowledge.compat_probe" in text
+    assert "pull_request_target" not in text
+    assert "gh pr" not in text
+    assert "git push" not in text
+
+
+def test_compatibility_workflow_separates_supported_and_scheduled_checks() -> None:
+    text = (ROOT / ".github/workflows/graphify-compatibility.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "push:" in text and "pull_request:" in text
+    assert "23 3 * * 2" in text
+    assert "if: github.event_name == 'schedule'" in text
+    assert "if: always()" in text
+    assert "name: graphify-upstream-compatibility" in text
+    assert "path: graphify-compatibility-report.json" in text
+    assert "retention-days: 14" in text
+    assert "tests/test_compatibility.py" in text
+    assert "tests/test_graphify_0_9_48_adapter.py" in text
+    assert "0.9.48" not in text
+
+
+def test_workflows_have_no_floating_official_actions_or_write_permissions() -> None:
+    workflows = tuple(sorted((ROOT / ".github/workflows").glob("*.y*ml")))
+    assert workflows
+    for path in workflows:
+        text = path.read_text(encoding="utf-8")
+        assert re.search(r"actions/[^@\s]+@v[0-9]+", text) is None, path
+        assert re.search(r"(?m)^\s+[a-z-]+:\s*write\s*$", text) is None, path
+
+
+def test_primary_ci_resolves_graphify_from_registry_and_keeps_adoption_gates() -> None:
+    text = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+
+    assert "production_graphify_compatibility as p" in text
+    assert 'uv tool install "graphifyy==$GRAPHIFY_VERSION"' in text
+    assert "graphifyy==0.9.48" not in text
+    assert "tests/test_compatibility.py tests/test_graphify_0_9_48_adapter.py tests/test_evidence.py" in text
+    assert "tests/test_real_graphify_pipeline.py tests/test_cli_adoption.py tests/test_queries.py" in text
+    assert "tests/test_bundles_pack.py tests/test_bundles_parse.py tests/test_agent_install.py tests/test_fleet.py tests/test_workflows.py" in text
 
 
 def test_dogfood_and_example_manifests_are_v2_and_optional_by_default() -> None:

@@ -13,6 +13,10 @@ All notable changes to AtlasWeaver are documented here.
   model.
 - Added packaged agent resources, a bounded upstream Graphify compatibility
   probe, and artifact transport/workflow foundations.
+- Added the Graphify compatibility registry, evidence-bound
+  `GRAPH_EVIDENCE.json`, reason-coded endpoint quarantine, deterministic final
+  edge IDs, and read-only CI compatibility probes; Graphify 0.9.48 remains
+  navigation-only.
 
 ## 0.2.2 - 2026-08-25
 

@@ -38,6 +38,8 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Verify Graphify contract
         run: uv run project-knowledge preflight --repo . --json
+      - name: Focused compatibility contracts
+        run: uv run pytest -q tests/test_compatibility.py tests/test_graphify_0_9_48_adapter.py tests/test_evidence.py
       - name: Focused adoption contracts
         run: |
           uv run pytest -q tests/test_real_graphify_pipeline.py tests/test_cli_adoption.py tests/test_queries.py

@@ -116,6 +116,22 @@ project-knowledge atlas-promote --repo /path/to/project --candidate "$ATLAS_CAND
 Never point Graphify at an unsanitized repository or write its export directly
 into a live vault.
 
+## Graphify compatibility and evidence
+
+The compatibility registry is the sole authority for supported Graphify
+versions. For Graphify 0.9.48 AtlasWeaver runs the reviewed official sequence:
+code-only `extract --no-cluster`, `diagnose multigraph --undirected --json`,
+then normalized `cluster-only --no-label --no-viz` when HTML is disabled.
+The resulting schema-2 graph is bound to `GRAPH_EVIDENCE.json`, its extraction
+invocation, source and projection digests, and the ownership record.
+
+Graphify 0.9.48 remains navigation-only because its post-dedup artifact cannot
+prove complete pre-dedup occurrence lineage. A new production adapter therefore
+requires sanitized official fixtures, an explicit complete-lineage capability,
+a reviewed fixture digest, compatibility tests, and reviewed adapter code.
+Scheduled upstream-probe reports are advisory and never declare a version
+supported; support changes only through the reviewed registry.
+
 ## Health and trust
 
 ```sh
