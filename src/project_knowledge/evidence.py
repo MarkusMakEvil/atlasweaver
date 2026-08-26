@@ -26,14 +26,14 @@ from project_knowledge.compatibility import (
     admitted_graphify_environment,
     render_graphify_argv,
     resolve_graphify_compatibility,
+    validate_public_model_identifier,
 )
 from project_knowledge.integrity import (
     GraphIntegrity,
     IntegrityError,
     validate_final_graph,
 )
-from project_knowledge.privacy import GLOBAL_DENY_PATTERNS, is_denied
-from project_knowledge.secrets_scan import has_secret_shape
+from project_knowledge.privacy import classify_path
 
 
 class EvidenceError(ValueError):
@@ -46,11 +46,6 @@ _INVOCATION_DOMAIN = b"atlasweaver-graphify-pipeline-v1\0"
 _HEX_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _FINAL_EDGE_ID = re.compile(r"edge-[0-9a-f]{64}\Z")
 _SOURCE_LOCATION = re.compile(r"L?(?P<line>[1-9][0-9]*)(?::(?P<column>[1-9][0-9]*))?\Z")
-_PUBLIC_MODEL_IDENTIFIER = re.compile(
-    r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}"
-    r"(?:/[A-Za-z0-9][A-Za-z0-9._-]{0,63})?"
-    r"(?::[A-Za-z0-9][A-Za-z0-9._-]{0,63})?\Z"
-)
 _DIAGNOSIS_MAX_BYTES = 4_194_304
 _BASE_ENVIRONMENT_NAMES = ("HOME", "LANG", "LC_ALL", "PATH")
 _BASE_ARTIFACT_PATHS = frozenset(
@@ -332,7 +327,7 @@ def build_graph_evidence(
         supplied_repairs,
         supplied_quarantines,
     ) = _normalization_components(normalization)
-    staged_files = _require_staged_files(staged_files)
+    staged_files = _require_staged_files(staged_files, contract)
     _require_artifact_descriptor(clustered_graph)
     _require_artifact_descriptor(final_graph)
     if len(clustered_graph.payload) > GRAPH_EVIDENCE_MAX_BYTES:
@@ -1186,6 +1181,7 @@ def _confined_path(value: object) -> PurePosixPath:
 
 def _require_staged_files(
     staged_files: object,
+    contract: GraphifyCompatibility,
 ) -> frozenset[PurePosixPath]:
     if type(staged_files) is not frozenset:
         raise EvidenceError("staged files must be an exact confined path set")
@@ -1197,9 +1193,12 @@ def _require_staged_files(
             confined = _confined_path(rendered)
         except Exception:
             raise EvidenceError("staged files must be an exact confined path set") from None
-        if confined.as_posix() != rendered or is_denied(
-            confined, GLOBAL_DENY_PATTERNS
-        ):
+        decision = classify_path(
+            confined,
+            project_excludes=(),
+            sensitive_source_suffixes=contract.sensitive_source_suffixes,
+        )
+        if confined.as_posix() != rendered or decision.action == "deny":
             raise EvidenceError("staged files must be an exact confined path set")
     return staged_files
 
@@ -1404,12 +1403,9 @@ def _require_public_model_identifier(
         return
     if type(backend) is not str or not backend or type(model) is not str:
         raise EvidenceError("invocation backend and model are inconsistent")
-    if (
-        not model
-        or len(model) > 128
-        or _PUBLIC_MODEL_IDENTIFIER.fullmatch(model) is None
-        or has_secret_shape(model.encode("ascii"))
-    ):
+    try:
+        validate_public_model_identifier(model)
+    except CompatibilityError:
         raise EvidenceError("invocation requires a public model identifier")
 
 

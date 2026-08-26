@@ -16,6 +16,8 @@ from project_knowledge.health import (
     safe_input_snapshot,
 )
 from project_knowledge.models import ProjectManifest
+from project_knowledge.staging import inspect_projection
+from tests.support import manifest_v2
 
 
 def manifest() -> ProjectManifest:
@@ -155,6 +157,19 @@ def test_safe_input_snapshot_recomputes_digest_without_creating_files(
     assert first.files == (PurePosixPath("src/app.py"),)
     assert len(first.source_digest) == 64
     assert snapshot_tree(tmp_path) == before
+
+
+def test_safe_input_snapshot_uses_v2_projection_source_digest(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "src/app.py").write_text("safe\n", encoding="utf-8")
+    selected = manifest_v2()
+
+    projection = inspect_projection(repo, selected)
+    snapshot = safe_input_snapshot(repo, selected)
+
+    assert snapshot.source_digest == projection.source_digest
+    assert snapshot.files == tuple(item.path for item in projection.files)
 
 
 def test_safe_input_snapshot_reads_each_source_only_once(

@@ -17,7 +17,7 @@ from .integrity import GraphIntegrity, IntegrityError, analyze_graph
 from .models import ProjectManifest
 from .privacy import effective_excludes, is_denied
 from .secrets_scan import load_secret_exceptions, scan_payload
-from .staging import iter_safe_files
+from .staging import inspect_projection, iter_safe_files
 
 
 HealthStatus = Literal["error", "missing", "stale", "partial", "healthy"]
@@ -138,6 +138,12 @@ def assess_health(state: KnowledgeState) -> KnowledgeHealth:
 
 def safe_input_snapshot(repo_root: Path, manifest: ProjectManifest) -> SafeInputSnapshot:
     """Recompute the safe-input digest without creating a staging directory."""
+    if manifest.schema_version == 2:
+        projection = inspect_projection(repo_root, manifest)
+        return SafeInputSnapshot(
+            projection.source_digest,
+            tuple(item.path for item in projection.files),
+        )
     root_fd = _open_directory(repo_root.absolute())
     try:
         files = set(iter_safe_files(repo_root, manifest))

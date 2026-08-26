@@ -540,6 +540,22 @@ def test_adapt_clustered_graph_canonicalizes_source_aliases_only_for_staged_file
         )
 
 
+def test_adapt_clustered_graph_accepts_scanned_sensitive_source_name() -> None:
+    document = valid_clustered_document()
+    for node in document["nodes"]:
+        node["source_file"] = "src/credentials.py"
+    for edge in document["links"]:
+        edge["source_file"] = "src/credentials.py"
+
+    payload = adapter().adapt_clustered_graph(
+        clustered_artifact(document),
+        staged_files=frozenset({PurePosixPath("src/credentials.py")}),
+    )
+
+    final = json.loads(payload)
+    assert final["nodes"][0]["source_file"] == "src/credentials.py"
+
+
 @pytest.mark.parametrize(
     "path",
     [PurePosixPath("."), PurePosixPath("C:/src/a.py"), PurePosixPath("src/a\x00.py")],
@@ -560,6 +576,7 @@ def test_adapt_clustered_graph_rejects_unconfined_staged_paths(
         ".env",
         "private/.env",
         "config/auth-token.yaml",
+        "src/database-creds.json",
         "workspace/runtime/state.json",
     ],
 )

@@ -23,7 +23,7 @@ from project_knowledge.integrity import (
     canonical_final_edge_id,
     validate_final_graph,
 )
-from project_knowledge.privacy import GLOBAL_DENY_PATTERNS, is_denied
+from project_knowledge.privacy import classify_path
 
 from .base import (
     AdapterContractError,
@@ -153,7 +153,7 @@ class Graphify0948Adapter:
         *,
         staged_files: frozenset[PurePosixPath],
     ) -> bytes:
-        _require_staged_files(staged_files)
+        _require_staged_files(staged_files, self.contract)
         document = _strict_json_object(artifact.payload, "clustered graph")
         if "edges" in document or _contains_wrapper_metadata(document):
             raise AdapterContractError("Graphify 0.9.48 clustered schema is invalid")
@@ -343,7 +343,9 @@ def _source_path(value: object) -> PurePosixPath:
     return path
 
 
-def _require_staged_files(staged_files: frozenset[PurePosixPath]) -> None:
+def _require_staged_files(
+    staged_files: frozenset[PurePosixPath], contract: GraphifyCompatibility
+) -> None:
     if type(staged_files) is not frozenset:
         raise AdapterContractError("staged files must be an immutable path set")
     for path in staged_files:
@@ -351,8 +353,12 @@ def _require_staged_files(staged_files: frozenset[PurePosixPath]) -> None:
             raise AdapterContractError("staged files contain an invalid path")
         try:
             confined = _source_path(path.as_posix())
-            denied = is_denied(confined, GLOBAL_DENY_PATTERNS)
+            decision = classify_path(
+                confined,
+                project_excludes=(),
+                sensitive_source_suffixes=contract.sensitive_source_suffixes,
+            )
         except Exception:
             raise AdapterContractError("staged files contain an invalid path") from None
-        if denied:
+        if decision.action == "deny":
             raise AdapterContractError("staged files contain an invalid path")

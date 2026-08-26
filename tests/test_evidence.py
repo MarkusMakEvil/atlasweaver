@@ -400,7 +400,12 @@ def test_invocation_rejects_an_option_in_the_cluster_graph_path_role() -> None:
 
 @pytest.mark.parametrize(
     "model",
-    ["gpt-4.1-mini", "llama3.2:latest", "public-org/model-v2"],
+    [
+        "gpt-4.1-mini",
+        "llama3.2:latest",
+        "public-org/model-v2",
+        "m" * 65,
+    ],
 )
 def test_invocation_accepts_bounded_public_model_identifiers(model: str) -> None:
     invocation = invocation_factory(model=model)
@@ -447,7 +452,7 @@ def test_invocation_rejects_private_or_secret_shaped_models_without_echo(
 
     monkeypatch.setattr(evidence_module, "_canonical_json", record_serialization)
     with pytest.raises(EvidenceError, match="public model identifier") as captured:
-        invocation_factory(model=model)
+        invocation_factory(model=model, commands=rendered_commands())
     assert model not in str(captured.value)
     assert all(model not in value for value in serialized)
 
@@ -477,7 +482,7 @@ def test_invocation_rejects_namespaced_secret_models_without_echo(
 
     monkeypatch.setattr(evidence_module, "_canonical_json", record_serialization)
     with pytest.raises(EvidenceError, match="public model identifier") as captured:
-        invocation_factory(model=model)
+        invocation_factory(model=model, commands=rendered_commands())
     assert captured.value.__cause__ is None
     assert model not in str(captured.value)
     assert all(model not in value for value in serialized)
@@ -811,6 +816,7 @@ def test_builder_requires_exact_confined_staged_files(staged_files: object) -> N
         ".env",
         "private/.env",
         "config/auth-token.yaml",
+        "src/database-creds.json",
         "workspace/runtime/state.json",
     ],
 )
@@ -824,6 +830,17 @@ def test_builder_reapplies_immutable_privacy_denies_to_staged_files(
     with pytest.raises(EvidenceError, match="staged files") as captured:
         build_from_pipeline(fixture_pipeline(), staged_files=staged_files)
     assert denied not in str(captured.value)
+
+
+def test_builder_accepts_scanned_sensitive_source_name() -> None:
+    evidence = build_from_pipeline(
+        fixture_pipeline(),
+        staged_files=frozenset(
+            {PurePosixPath("fixture.py"), PurePosixPath("src/credentials.py")}
+        ),
+    )
+
+    assert evidence.source_digest == "c" * 64
 
 
 @pytest.mark.parametrize(
