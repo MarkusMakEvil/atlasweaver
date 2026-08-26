@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 from pathlib import Path
 import re
+import subprocess
+import sys
 
+import pytest
 import yaml
 
 
@@ -66,6 +70,16 @@ def steps(workflow: dict[str, object]) -> list[dict[str, object]]:
 
 def step_named(workflow: dict[str, object], name: str) -> dict[str, object]:
     return next(item for item in steps(workflow) if item.get("name") == name)
+
+
+def job_step_named(
+    workflow: dict[str, object], job_name: str, name: str
+) -> dict[str, object]:
+    return next(
+        item
+        for item in workflow["jobs"][job_name]["steps"]
+        if item.get("name") == name
+    )
 
 
 def test_check_workflow_has_closed_typed_inputs_and_read_only_permissions() -> None:
@@ -145,6 +159,40 @@ def test_check_scopes_semantic_secret_to_one_mode_step() -> None:
         assert "ATLASWEAVER_BACKEND_TOKEN" not in json.dumps(item, sort_keys=True)
 
 
+@pytest.mark.parametrize(
+    ("workflow_name", "job_name", "code_only_name", "semantic_name"),
+    [
+        (
+            "atlasweaver-check.yml",
+            "check",
+            "Code-only preflight",
+            "Semantic preflight",
+        ),
+        (
+            "atlasweaver-publish.yml",
+            "build",
+            "Refresh private graph (code-only)",
+            "Refresh private graph",
+        ),
+    ],
+)
+def test_workflow_drivers_forward_required_impact_trust_in_both_modes(
+    workflow_name: str,
+    job_name: str,
+    code_only_name: str,
+    semantic_name: str,
+) -> None:
+    workflow = load_workflow(workflow_name)
+    expected = "${{ inputs.require-impact-trust }}"
+
+    assert job_step_named(workflow, job_name, code_only_name)["env"][
+        "ATLASWEAVER_REQUIRE_IMPACT_TRUST"
+    ] == expected
+    assert job_step_named(workflow, job_name, semantic_name)["env"][
+        "ATLASWEAVER_REQUIRE_IMPACT_TRUST"
+    ] == expected
+
+
 def test_reusable_workflow_uses_hard_pinned_trusted_tool_checkout() -> None:
     workflow = load_workflow("atlasweaver-check.yml")
     tool_sha = workflow["env"]["ATLASWEAVER_TOOL_SHA"]
@@ -154,6 +202,47 @@ def test_reusable_workflow_uses_hard_pinned_trusted_tool_checkout() -> None:
     assert "github.workflow_sha" not in text
     assert '--project "$GITHUB_WORKSPACE/atlasweaver-tool"' in raw
     assert '--project "$GITHUB_WORKSPACE/consumer"' not in raw
+
+
+def test_reusable_workflow_pins_execute_the_internal_driver_modules(
+    tmp_path: Path,
+) -> None:
+    cases = (
+        ("atlasweaver-check.yml", "project_knowledge.workflow_boundary", "check"),
+        ("atlasweaver-publish.yml", "project_knowledge.workflow_publish", "prepare"),
+    )
+    for workflow_name, module, verb in cases:
+        workflow = load_workflow(workflow_name)
+        tool_sha = workflow["env"]["ATLASWEAVER_TOOL_SHA"]
+        checkout = tmp_path / workflow_name
+        checkout.mkdir()
+        archive = tmp_path / f"{workflow_name}.tar"
+        archived = subprocess.run(
+            ["git", "archive", f"--output={archive}", tool_sha],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert archived.returncode == 0, archived.stderr
+        extracted = subprocess.run(
+            ["tar", "-xf", str(archive), "-C", str(checkout)],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert extracted.returncode == 0, extracted.stderr
+        executed = subprocess.run(
+            [sys.executable, "-m", module, "--help"],
+            cwd=checkout,
+            env={**os.environ, "PYTHONPATH": str(checkout / "src")},
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert executed.returncode == 0, executed.stderr
+        assert verb in executed.stdout
 
 
 def test_publish_workflow_splits_privilege_and_serializes_release_identity() -> None:

@@ -102,6 +102,7 @@ jobs:
           ATLASWEAVER_DEEP: ${{ inputs.deep-mode }}
           ATLASWEAVER_MODEL: ${{ inputs.model }}
           ATLASWEAVER_REPO_ROOT: ${{ inputs.repo-root }}
+          ATLASWEAVER_REQUIRE_IMPACT_TRUST: ${{ inputs.require-impact-trust }}
         run: >-
           uv run --project "$GITHUB_WORKSPACE/atlasweaver-tool"
           python -m project_knowledge.workflow_boundary check

@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import stat
+import subprocess
+import sys
 
 import pytest
 
@@ -72,6 +76,67 @@ def test_read_only_load_and_render_create_nothing(tmp_path: Path) -> None:
     ]
     assert "demo" in markdown
     assert list(tmp_path.iterdir()) == []
+
+
+def test_ci_summary_command_writes_explicit_private_markdown_output(
+    tmp_path: Path,
+) -> None:
+    inputs: list[Path] = []
+    for name in ("preflight", "doctor", "scan", "health"):
+        path = tmp_path / f"{name}.json"
+        path.write_text(
+            json.dumps({
+                "project_id": "demo",
+                "operation": name,
+                "status": "healthy",
+            }),
+            encoding="utf-8",
+        )
+        inputs.append(path)
+
+    output_json = tmp_path / "summary.json"
+    output_markdown = tmp_path / "summary.md"
+    repository_root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "project_knowledge.operation_state",
+            "ci-summary",
+            "--output-json",
+            str(output_json),
+            "--output-markdown",
+            str(output_markdown),
+            "--preflight",
+            str(inputs[0]),
+            "--doctor",
+            str(inputs[1]),
+            "--scan",
+            str(inputs[2]),
+            "--health",
+            str(inputs[3]),
+        ],
+        cwd=repository_root,
+        env={**os.environ, "PYTHONPATH": str(repository_root / "src")},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(output_json.read_text(encoding="utf-8"))["results"] == [
+        {"operation": name, "project_id": "demo", "status": "healthy"}
+        for name in ("preflight", "doctor", "scan", "health")
+    ]
+    assert output_markdown.read_text(encoding="utf-8") == (
+        "# AtlasWeaver summary\n\n"
+        "- demo: preflight — healthy\n"
+        "- demo: doctor — healthy\n"
+        "- demo: scan — healthy\n"
+        "- demo: health — healthy\n"
+    )
+    assert stat.S_IMODE(output_json.stat().st_mode) == 0o600
+    assert stat.S_IMODE(output_markdown.stat().st_mode) == 0o600
 
 
 @pytest.mark.parametrize("key", ["path", "source_file", "query", "environment", "fingerprint", "message"])

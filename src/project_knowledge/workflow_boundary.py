@@ -260,7 +260,7 @@ def _bounded_environment(name: str) -> str:
 
 
 def _prepare_output_directory(path: Path) -> Path:
-    if type(path) is not Path or not path.is_absolute():
+    if not isinstance(path, Path) or not path.is_absolute():
         raise WorkflowBoundaryError("workflow_root_invalid")
     try:
         if path.exists():
@@ -375,7 +375,7 @@ def run_workflow_check(
             before_exec=workflow.revalidate,
         )
         workflow.revalidate()
-        doctor_project(
+        doctor = doctor_project(
             repository_path,
             expected_repository_identity=workflow.repository_identity,
             expected_manifest=manifest,
@@ -390,11 +390,6 @@ def run_workflow_check(
         )
         workflow.revalidate()
         if health.core_status not in {"healthy", "partial"}:
-            raise WorkflowBoundaryError("workflow_root_invalid")
-        raw_required = _bounded_environment("ATLASWEAVER_REQUIRE_IMPACT_TRUST")
-        if raw_required not in {"", "true", "false"}:
-            raise WorkflowBoundaryError("workflow_extraction_invalid")
-        if raw_required == "true" and health.trust.impact != "trusted":
             raise WorkflowBoundaryError("workflow_root_invalid")
         if require_impact and health.trust.impact != "trusted":
             raise WorkflowBoundaryError("workflow_root_invalid")
@@ -570,6 +565,10 @@ def run_workflow_build(
         else:
             os.environ.pop("ATLASWEAVER_BACKEND_TOKEN", None)
 
+        raw_required = _bounded_environment("ATLASWEAVER_REQUIRE_IMPACT_TRUST")
+        if raw_required not in {"", "true", "false"}:
+            raise WorkflowBoundaryError("workflow_extraction_invalid")
+        require_impact = raw_required == "true"
         workflow.revalidate()
         doctor = doctor_project(
             repository_path,
@@ -596,7 +595,10 @@ def run_workflow_build(
                 repository_access=workflow.repository_access,
             )
         )
+        workflow.revalidate()
         if health.core_status not in {"healthy", "partial"}:
+            raise WorkflowBoundaryError("workflow_root_invalid")
+        if require_impact and health.trust.impact != "trusted":
             raise WorkflowBoundaryError("workflow_root_invalid")
         output_parent = _prepare_output_directory(output_bundle.absolute().parent)
         if output_summary.absolute().parent != output_parent:

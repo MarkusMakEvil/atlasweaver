@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,6 +13,7 @@ from project_knowledge.workflow_boundary import (
     admit_workflow_extraction_mode,
     open_workflow_repository,
 )
+from tests.support import write_manifest_v2
 
 
 def checkouts(tmp_path: Path) -> tuple[Path, Path, Path]:
@@ -200,3 +202,128 @@ def test_internal_build_has_closed_root_and_output_surface(
         "--output-summary", str(summary),
     ]) == 0
     assert calls == [(consumer, "nested/repo", trusted, bundle, summary)]
+
+
+def _workflow_project(tmp_path: Path) -> tuple[Path, Path]:
+    consumer = tmp_path / "consumer"
+    (consumer / "src").mkdir(parents=True)
+    (consumer / "src/app.py").write_text("safe = True\n", encoding="utf-8")
+    write_manifest_v2(consumer)
+    trusted = tmp_path / "trusted"
+    trusted.mkdir()
+    return consumer, trusted
+
+
+def _workflow_health(impact: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        core_status="healthy",
+        trust=SimpleNamespace(impact=impact),
+        to_dict=lambda: {
+            "schema_version": 2,
+            "core_status": "healthy",
+            "trust": {"impact": impact, "limitations": []},
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    ("backend", "model", "deep", "impact"),
+    [
+        ("", "", "false", "trusted"),
+        ("", "", "false", "navigation"),
+        ("ollama", "llama3.2", "true", "trusted"),
+        ("ollama", "llama3.2", "true", "navigation"),
+    ],
+)
+def test_check_enforces_required_trusted_impact_after_final_health(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    backend: str,
+    model: str,
+    deep: str,
+    impact: str,
+) -> None:
+    consumer, trusted = _workflow_project(tmp_path)
+    output = tmp_path / "check"
+    monkeypatch.setenv("ATLASWEAVER_BACKEND", backend)
+    monkeypatch.setenv("ATLASWEAVER_MODEL", model)
+    monkeypatch.setenv("ATLASWEAVER_DEEP", deep)
+    monkeypatch.setenv("ATLASWEAVER_REQUIRE_IMPACT_TRUST", "true")
+    monkeypatch.setattr(
+        workflow_module,
+        "inspect_projection",
+        lambda *args, **kwargs: SimpleNamespace(files=("src/app.py",), reason_counts={}),
+    )
+    monkeypatch.setattr(workflow_module, "resolve_graphify_executable", lambda: Path("graphify"))
+    monkeypatch.setattr(
+        workflow_module,
+        "probe_graphify",
+        lambda *args, **kwargs: SimpleNamespace(version="0.9.48"),
+    )
+    monkeypatch.setattr(
+        workflow_module,
+        "doctor_project",
+        lambda *args, **kwargs: SimpleNamespace(
+            to_dict=lambda: {"schema_version": 1, "status": "ready"}
+        ),
+    )
+    monkeypatch.setattr(workflow_module, "inspect_project_state", lambda *args, **kwargs: object())
+    monkeypatch.setattr(workflow_module, "assess_health", lambda state: _workflow_health(impact))
+
+    if impact == "navigation":
+        with pytest.raises(WorkflowBoundaryError) as raised:
+            workflow_module.run_workflow_check(consumer, ".", trusted, output)
+        assert raised.value.code == "workflow_root_invalid"
+        assert not output.exists()
+        return
+
+    workflow_module.run_workflow_check(consumer, ".", trusted, output)
+    assert (output / "health.json").is_file()
+
+
+@pytest.mark.parametrize(
+    ("backend", "model", "deep"),
+    [("", "", "false"), ("ollama", "llama3.2", "true")],
+)
+def test_build_rejects_required_navigation_impact_after_refresh_before_pack(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    backend: str,
+    model: str,
+    deep: str,
+) -> None:
+    consumer, trusted = _workflow_project(tmp_path)
+    monkeypatch.setenv("ATLASWEAVER_BACKEND", backend)
+    monkeypatch.setenv("ATLASWEAVER_MODEL", model)
+    monkeypatch.setenv("ATLASWEAVER_DEEP", deep)
+    monkeypatch.setenv("ATLASWEAVER_REQUIRE_IMPACT_TRUST", "true")
+    monkeypatch.setattr(
+        workflow_module,
+        "doctor_project",
+        lambda *args, **kwargs: SimpleNamespace(),
+    )
+    refreshed: list[bool] = []
+    monkeypatch.setattr(
+        workflow_module,
+        "refresh_project",
+        lambda *args, **kwargs: refreshed.append(True) or SimpleNamespace(status="refreshed"),
+    )
+    monkeypatch.setattr(workflow_module, "inspect_project_state", lambda *args, **kwargs: object())
+    monkeypatch.setattr(workflow_module, "assess_health", lambda state: _workflow_health("navigation"))
+    monkeypatch.setattr(
+        workflow_module,
+        "pack_bundle",
+        lambda *args, **kwargs: pytest.fail("bundle packed before impact trust gate"),
+    )
+
+    with pytest.raises(WorkflowBoundaryError) as raised:
+        workflow_module.run_workflow_build(
+            consumer,
+            ".",
+            trusted,
+            tmp_path / "build/bundle.zip",
+            tmp_path / "build/summary.json",
+        )
+
+    assert refreshed == [True]
+    assert raised.value.code == "workflow_root_invalid"

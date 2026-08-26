@@ -563,11 +563,58 @@ def _load_envelope(path: Path) -> dict[str, object]:
     return value
 
 
+def _write_exclusive_atomic(path: Path, payload: bytes) -> None:
+    parent_fd = os.open(
+        path.parent,
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | _nofollow_flag()
+        | getattr(os, "O_CLOEXEC", 0),
+    )
+    temporary = f".{path.name}-{os.getpid()}-{os.urandom(16).hex()}.tmp"
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | _nofollow_flag()
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=parent_fd,
+        )
+        os.fchmod(descriptor, 0o600)
+        _write_all(descriptor, payload)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.link(
+            temporary,
+            path.name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        os.unlink(temporary, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary, dir_fd=parent_fd)
+        except FileNotFoundError:
+            pass
+        finally:
+            os.close(parent_fd)
+
+
 def _main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m project_knowledge.operation_state")
     subparsers = parser.add_subparsers(dest="verb", required=True)
     summary = subparsers.add_parser("ci-summary")
     summary.add_argument("--output-json", type=Path, required=True)
+    summary.add_argument("--output-markdown", type=Path)
     for name in ("preflight", "doctor", "scan", "health"):
         summary.add_argument(f"--{name}", type=Path, required=True)
     args = parser.parse_args(argv)
@@ -575,13 +622,9 @@ def _main(argv: Sequence[str] | None = None) -> int:
         "preflight", "doctor", "scan", "health"
     )]
     machine, markdown = render_ci_summary(inputs)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(args.output_json, flags, 0o600)
-    try:
-        os.write(descriptor, machine)
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    _write_exclusive_atomic(args.output_json, machine)
+    if args.output_markdown is not None:
+        _write_exclusive_atomic(args.output_markdown, markdown.encode("utf-8"))
     print(markdown, end="")
     return 0
 
