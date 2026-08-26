@@ -170,7 +170,7 @@ def test_dogfood_and_example_manifests_are_v2_and_optional_by_default() -> None:
         "MarkusMakEvil/atlasweaver/.github/workflows/atlasweaver-publish.yml"
     )
     assert dogfood.artifacts.signer_digest == (
-        "6263ecd37b6717e084b79415127b3b01251d5df5"
+        "ce64121ffb5a9d28c371b02da852082dfa5f3c04"
     )
 
     example = load_manifest(
