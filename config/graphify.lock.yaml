@@ -1,9 +1,0 @@
-schema_version: 1
-package: graphifyy
-version: "0.9.48"
-required_commands:
-  - query
-  - explain
-  - path
-  - global
-  - export

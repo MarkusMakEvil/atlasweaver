@@ -84,6 +84,13 @@ def test_manifest_rejects_unknown_keys(tmp_path: Path) -> None:
         load_manifest(write_manifest(tmp_path, unreviewed_option="enabled"), tmp_path)
 
 
+def test_manifest_rejects_versions_absent_from_the_compatibility_registry(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ManifestError, match="unsupported Graphify version: 0.9.49"):
+        load_manifest(write_manifest(tmp_path, graphify_version="0.9.49"), tmp_path)
+
+
 def test_manifest_rejects_non_string_unknown_keys(tmp_path: Path) -> None:
     path = write_manifest(tmp_path)
     path.write_text(path.read_text(encoding="utf-8") + "42: enabled\n", encoding="utf-8")

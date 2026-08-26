@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""Capture a bounded, deterministic fixture through the official Graphify CLI."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import sys
+import tempfile
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from project_knowledge.compatibility import (
+    _DIAGNOSTIC_SUMMARY_FIELDS,
+    admitted_graphify_environment,
+    production_graphify_compatibility,
+    render_graphify_argv,
+)
+from project_knowledge.graphify import (
+    GraphifyContractError,
+    SubprocessCommandRunner,
+    minimal_environment,
+    resolve_graphify_executable,
+    run_checked,
+)
+
+
+_WINDOWS_ABSOLUTE = re.compile(r"^[A-Za-z]:[\\/]|^\\\\")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--binary", type=Path, required=True)
+    parser.add_argument("--source", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--expected-version")
+    parser.add_argument("--replace", action="store_true")
+    arguments = parser.parse_args()
+
+    contract = production_graphify_compatibility()
+    expected_version = arguments.expected_version or contract.version
+    executable = resolve_graphify_executable(test_override=arguments.binary)
+    runner = SubprocessCommandRunner()
+    with tempfile.TemporaryDirectory(prefix="atlasweaver-fixture-capture-") as temporary:
+        root = Path(temporary)
+        root.chmod(0o700)
+        source_root = root / "source"
+        source_root.mkdir(mode=0o700)
+        fixture_source = arguments.source.resolve(strict=True)
+        if not fixture_source.is_dir():
+            raise GraphifyContractError("fixture source must be a directory")
+        source_files = tuple(path for path in fixture_source.rglob("*") if path.is_file())
+        if not source_files:
+            raise GraphifyContractError("fixture source must not be empty")
+        for path in source_files:
+            relative = path.relative_to(fixture_source)
+            if path.is_symlink() or ".." in relative.parts:
+                raise GraphifyContractError("fixture source is invalid")
+            target = source_root / relative
+            target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            shutil.copyfile(path, target)
+
+        environment = admitted_graphify_environment(
+            contract,
+            None,
+            {**minimal_environment(), "HOME": str(root / "home")},
+        )
+        Path(environment["HOME"]).mkdir(mode=0o700)
+        version = run_checked(
+            runner, executable, (str(executable.path), "--version"), env=environment
+        ).stdout.strip()
+        if version != f"graphify {expected_version}":
+            raise GraphifyContractError("Graphify fixture version mismatch")
+
+        output_root = root / "output"
+        extract = render_graphify_argv(
+            contract, "extract", binary=executable.path, source=source_root,
+            output=output_root, code_only=True,
+        )
+        run_checked(runner, executable, extract.argv, env=environment)
+        native_path = output_root / "graphify-out" / "graph.json"
+        native_graph = _load_json(native_path)
+
+        diagnose = render_graphify_argv(
+            contract, "diagnose", binary=executable.path, source=source_root,
+            output=output_root, graph=native_path,
+        )
+        diagnosis = json.loads(
+            run_checked(runner, executable, diagnose.argv, env=environment).stdout
+        )
+        summary = diagnosis.get("summary") if isinstance(diagnosis, dict) else None
+        if not isinstance(summary, dict) or any(
+            name not in summary for name in _DIAGNOSTIC_SUMMARY_FIELDS
+        ):
+            raise GraphifyContractError("Graphify fixture diagnosis is invalid")
+        sanitized_diagnosis = {
+            "schema_version": diagnosis.get("schema_version"),
+            "summary": {name: summary[name] for name in _DIAGNOSTIC_SUMMARY_FIELDS},
+        }
+        normalized_graph = _normalize_paths(native_graph, source_root)
+        document = {
+            "schema_version": 1,
+            "graphify_version": expected_version,
+            "source_digest": _source_digest(source_root),
+            "native_graph": normalized_graph,
+            "diagnosis": sanitized_diagnosis,
+        }
+        _reject_absolute_paths(document)
+        payload = (
+            json.dumps(document, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            + "\n"
+        ).encode("utf-8")
+        _write_output(arguments.output, payload, replace=arguments.replace)
+        print(hashlib.sha256(payload).hexdigest())
+    return 0
+
+
+def _load_json(path: Path) -> object:
+    payload = path.read_bytes()
+    if len(payload) > 16 * 1024 * 1024:
+        raise GraphifyContractError("Graphify fixture artifact is oversized")
+    return json.loads(payload)
+
+
+def _source_digest(root: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(item for item in root.rglob("*") if item.is_file()):
+        relative = path.relative_to(root).as_posix().encode("utf-8")
+        payload = path.read_bytes()
+        digest.update(len(relative).to_bytes(8, "big"))
+        digest.update(relative)
+        digest.update(len(payload).to_bytes(8, "big"))
+        digest.update(payload)
+    return digest.hexdigest()
+
+
+def _normalize_paths(value: object, source_root: Path) -> object:
+    if isinstance(value, dict):
+        return {key: _normalize_paths(item, source_root) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_normalize_paths(item, source_root) for item in value]
+    if isinstance(value, str):
+        source = str(source_root)
+        if value == source:
+            return "fixture"
+        if value.startswith(source + os.sep):
+            return "fixture/" + value[len(source + os.sep):].replace(os.sep, "/")
+    return value
+
+
+def _reject_absolute_paths(value: object) -> None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            _reject_absolute_paths(key)
+            _reject_absolute_paths(item)
+    elif isinstance(value, list):
+        for item in value:
+            _reject_absolute_paths(item)
+    elif isinstance(value, str) and (value.startswith("/") or _WINDOWS_ABSOLUTE.match(value)):
+        raise GraphifyContractError("fixture contains an absolute path")
+
+
+def _write_output(path: Path, payload: bytes, *, replace: bool) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT
+    flags |= os.O_TRUNC if replace else os.O_EXCL
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            view = view[written:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

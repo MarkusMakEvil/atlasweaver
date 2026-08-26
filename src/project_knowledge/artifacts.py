@@ -17,6 +17,7 @@ import tempfile
 import secrets
 from typing import Any
 
+from .compatibility import CompatibilityError, resolve_graphify_compatibility
 from .integrity import GraphIntegrity, IntegrityError, analyze_graph
 from .models import ProjectManifest
 from .privacy import effective_excludes, is_denied
@@ -24,7 +25,6 @@ from .staging import StagedInput
 from .locking import ExclusiveFileLock
 
 
-PINNED_GRAPHIFY_VERSION = "0.9.48"
 OWNERSHIP_MANIFEST = ".project-knowledge-ownership.json"
 _OWNERSHIP_SCHEMA_VERSION = 1
 _TRANSACTION_SCHEMA_VERSION = 1
@@ -156,10 +156,10 @@ def validate_candidate(
     exact ``project_id``, ``graphify_version``, and ``source_digest`` metadata.
     The ownership manifest is written only after all candidate bytes pass.
     """
-    if manifest.graphify_version != PINNED_GRAPHIFY_VERSION:
-        raise ArtifactValidationError(
-            f"Graphify version must be exactly {PINNED_GRAPHIFY_VERSION}"
-        )
+    try:
+        contract = resolve_graphify_compatibility(manifest.graphify_version)
+    except CompatibilityError as error:
+        raise ArtifactValidationError(str(error)) from error
     root = _require_candidate_directory(candidate_dir)
     required = [root / "graph.json", root / "GRAPH_REPORT.md"]
     if manifest.track_html:
@@ -196,7 +196,7 @@ def validate_candidate(
     _require_identity(
         document,
         "graphify_version",
-        PINNED_GRAPHIFY_VERSION,
+        contract.version,
         "Graphify version mismatch",
     )
     _require_identity(
@@ -226,7 +226,7 @@ def validate_candidate(
     ownership = {
         "schema_version": _OWNERSHIP_SCHEMA_VERSION,
         "project_id": manifest.project_id,
-        "graphify_version": PINNED_GRAPHIFY_VERSION,
+        "graphify_version": contract.version,
         "source_digest": staged.source_digest,
         "graph_digest": graph_digest,
         "artifact_digests": artifact_digests,

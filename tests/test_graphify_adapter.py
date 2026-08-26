@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 import os
+import json
 from pathlib import Path
 import subprocess
 from subprocess import CompletedProcess
@@ -12,15 +13,18 @@ import time
 
 import pytest
 
+from project_knowledge.compatibility import resolve_graphify_compatibility
 from project_knowledge.graphify import (
     COMMAND_TIMEOUT,
     GraphifyCommandError,
     GraphifyContractError,
     MAX_CAPTURED_OUTPUT_CHARS,
+    ResolvedGraphifyExecutable,
     SubprocessCommandRunner,
     probe_assistant_skill,
     probe_graphify,
     query_graph,
+    resolve_graphify_executable,
     sanitize_stderr,
     sync_global_registry,
 )
@@ -86,9 +90,103 @@ class FakeRunner:
         return CompletedProcess(call, 0, "", "")
 
 
+class ProbeRunner(FakeRunner):
+    """Official-surface fake that materializes each confined probe artifact."""
+
+    def __init__(self, mutation: str | None = None) -> None:
+        super().__init__()
+        self.mutation = mutation
+
+    def run(self, argv: Sequence[str], **options: object) -> CompletedProcess[str]:
+        result = super().run(argv, **options)  # type: ignore[arg-type]
+        call = tuple(argv)
+        environment = options["env"]
+        assert isinstance(environment, Mapping)
+        if len(call) > 1 and call[1] == "extract" and result.returncode == 0:
+            output = Path(call[call.index("--out") + 1]) / "graphify-out"
+            output.mkdir(parents=True)
+            (output / "graph.json").write_text(json.dumps({
+                "nodes": [{"id": 7 if self.mutation == "native-id" else "probe"}],
+                "edges": [], "hyperedges": [], "input_tokens": 0, "output_tokens": 0,
+            }), encoding="utf-8")
+        elif len(call) > 1 and call[1] == "diagnose" and result.returncode == 0:
+            summary = {
+                "node_count": 1, "raw_edge_count": 0, "missing_endpoint_edges": 0,
+                "dangling_endpoint_edges": 0, "self_loop_edges": 0,
+                "exact_duplicate_edges": 0, "undirected_unique_endpoint_pairs": 0,
+                "undirected_same_endpoint_collapsed_edges": 0,
+                "same_endpoint_group_count": 0, "relation_variant_groups": 0,
+                "source_file_variant_groups": 0, "source_location_variant_groups": 0,
+                "context_variant_groups": 0, "post_build_graph_type": "Graph",
+                "post_build_node_count": 1, "post_build_edge_count": 0,
+                "effective_directed": False,
+            }
+            if self.mutation == "diagnosis-count":
+                summary["node_count"] = "1"
+            return CompletedProcess(call, 0, json.dumps({"schema_version": 1, "summary": summary}), "")
+        elif len(call) > 1 and call[1] == "cluster-only" and result.returncode == 0:
+            graph = Path(call[call.index("--graph") + 1])
+            graph.write_text(json.dumps({
+                "directed": False, "multigraph": False,
+                "graph": {}, "nodes": [{"id": "probe"}], "links": [],
+                "hyperedges": [],
+            }), encoding="utf-8")
+            if self.mutation == "cluster-directed":
+                graph.write_text(json.dumps({
+                    "directed": True, "multigraph": False, "graph": {},
+                    "nodes": [{"id": "probe"}], "links": [], "hyperedges": [],
+                }), encoding="utf-8")
+        elif call[1:3] == ("global", "add") and result.returncode == 0:
+            registry = Path(str(environment["HOME"])) / ".graphify"
+            registry.mkdir(parents=True)
+            key = call[call.index("--as") + 1]
+            manifest_key = "atlasweaver/11111111-1111-4111-8111-111111111111" if self.mutation == "global-key" else key
+            (registry / "global-graph.json").write_text(
+                json.dumps({"nodes": [] if self.mutation == "global-empty" else [{"id": "probe"}], "links": []}), encoding="utf-8"
+            )
+            (registry / "global-manifest.json").write_text(
+                json.dumps({"repos": {manifest_key: {}}}), encoding="utf-8"
+            )
+        elif len(call) > 1 and call[1] == "install" and result.returncode == 0:
+            platform = call[call.index("--platform") + 1]
+            target = Path(str(environment["HOME"])) / f".{platform}/skills/graphify/SKILL.md"
+            if self.mutation != f"install-{platform}":
+                target.parent.mkdir(parents=True)
+                target.write_text("# Graphify\n", encoding="utf-8")
+        return result
+
+
 @pytest.fixture
 def fake_runner() -> FakeRunner:
     return FakeRunner()
+
+
+@pytest.fixture
+def resolved_graphify(tmp_path: Path) -> ResolvedGraphifyExecutable:
+    launcher = tmp_path / "graphify"
+    launcher.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    launcher.chmod(0o755)
+    return resolve_graphify_executable(test_override=launcher)
+
+
+def _probe_runner(executable: ResolvedGraphifyExecutable, help_text: str) -> ProbeRunner:
+    runner = ProbeRunner()
+    runner.answer((str(executable.path), "--version"), stdout="graphify 0.9.48\n")
+    runner.answer((str(executable.path), "--help"), stdout=help_text)
+    return runner
+
+
+_REQUIRED_HELP = """Usage: graphify <command>\n\nCommands:
+  extract <path>
+  diagnose multigraph
+  cluster-only <path>
+  query "<question>"
+  explain "node"
+  path "A" "B"
+  global add <graph.json>
+  export callflow-html
+  install --platform codex
+"""
 
 
 @pytest.fixture
@@ -98,66 +196,83 @@ def graph(tmp_path: Path) -> Path:
     return path
 
 
-def test_probe_rejects_wrong_version(fake_runner: FakeRunner) -> None:
+def test_probe_rejects_wrong_version(resolved_graphify: ResolvedGraphifyExecutable) -> None:
     """Accepting a different CLI release could select an incompatible contract."""
-    fake_runner.answer(("graphify", "--version"), stdout="graphify 9.9.9\n")
+    fake_runner = ProbeRunner()
+    fake_runner.answer((str(resolved_graphify.path), "--version"), stdout="graphify 9.9.9\n")
 
     with pytest.raises(GraphifyContractError, match="expected 0.9.48, got 9.9.9"):
-        probe_graphify(Path("graphify"), "0.9.48", fake_runner)
+        probe_graphify(resolved_graphify, resolve_graphify_compatibility("0.9.48"), fake_runner)
 
 
 def test_probe_reports_cli_commands_but_not_skill_only_export(
-    fake_runner: FakeRunner,
+    resolved_graphify: ResolvedGraphifyExecutable,
 ) -> None:
     """Treating assistant-skill syntax as a CLI command would break bootstrap."""
-    fake_runner.answer(("graphify", "--version"), stdout="graphify 0.9.48\n")
-    fake_runner.answer(
-        ("graphify", "--help"),
-        stdout="""Usage: graphify <command>\n\nCommands:\n  query \"<question>\"\n  explain \"node\"\n  path \"A\" \"B\"\n  global add <graph.json>\n  export callflow-html\n""",
-    )
+    fake_runner = _probe_runner(resolved_graphify, _REQUIRED_HELP)
 
-    capabilities = probe_graphify(Path("graphify"), "0.9.48", fake_runner)
+    capabilities = probe_graphify(resolved_graphify, resolve_graphify_compatibility("0.9.48"), fake_runner)
 
     assert capabilities.commands == frozenset(
-        {"query", "explain", "path", "global", "export"}
+        {"extract", "diagnose", "cluster-only", "query", "explain", "path", "global", "export", "install"}
     )
     assert capabilities.supports_global_registry is True
     assert capabilities.supports_obsidian_export is False
+    assert len(fake_runner.calls) == 9
+    assert all(
+        set(option["env"]) <= {"HOME", "LANG", "LC_ALL", "PATH"}
+        for option in fake_runner.options
+    )
 
 
 def test_probe_keeps_late_required_commands_inside_captured_help(
-    fake_runner: FakeRunner,
+    resolved_graphify: ResolvedGraphifyExecutable,
 ) -> None:
     """Truncating real help before `global` would reject the pinned CLI contract."""
-    fake_runner.answer(("graphify", "--version"), stdout="graphify 0.9.48\n")
-    fake_runner.answer(
-        ("graphify", "--help"),
-        stdout=(
-            "Usage: graphify <command>\n\nCommands:\n"
-            + "x" * 9_000
-            + "\n  query \"<question>\"\n  explain \"node\"\n  path \"A\" \"B\"\n"
-            "  global add <graph.json>\n  export callflow-html\n"
-        ),
+    fake_runner = _probe_runner(
+        resolved_graphify,
+        _REQUIRED_HELP.replace("  query", "x" * 9_000 + "\n  query"),
     )
 
-    capabilities = probe_graphify(Path("graphify"), "0.9.48", fake_runner)
+    capabilities = probe_graphify(resolved_graphify, resolve_graphify_compatibility("0.9.48"), fake_runner)
 
     assert {"query", "explain", "path", "global", "export"} <= capabilities.commands
 
 
 def test_probe_does_not_treat_wrapped_help_descriptions_as_commands(
-    fake_runner: FakeRunner,
+    resolved_graphify: ResolvedGraphifyExecutable,
 ) -> None:
     """A permissive indentation match would report help prose as CLI operations."""
-    fake_runner.answer(("graphify", "--version"), stdout="graphify 0.9.48\n")
-    fake_runner.answer(
-        ("graphify", "--help"),
-        stdout="""Usage: graphify <command>\n\nCommands:\n  query \"<question>\"\n                            and filters context\n  explain \"node\"\n  path \"A\" \"B\"\n  global add <graph.json>\n  export callflow-html\n""",
+    fake_runner = _probe_runner(
+        resolved_graphify,
+        _REQUIRED_HELP.replace("  explain", "                            and filters context\n  explain"),
     )
 
-    capabilities = probe_graphify(Path("graphify"), "0.9.48", fake_runner)
+    capabilities = probe_graphify(resolved_graphify, resolve_graphify_compatibility("0.9.48"), fake_runner)
 
     assert "and" not in capabilities.commands
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "native-id", "diagnosis-count", "cluster-directed", "global-key",
+        "global-empty", "install-codex", "install-agents",
+    ],
+)
+def test_operational_probe_rejects_each_artifact_surface_mutation(
+    resolved_graphify: ResolvedGraphifyExecutable, mutation: str
+) -> None:
+    runner = ProbeRunner(mutation)
+    runner.answer((str(resolved_graphify.path), "--version"), stdout="graphify 0.9.48\n")
+    runner.answer((str(resolved_graphify.path), "--help"), stdout=_REQUIRED_HELP)
+
+    with pytest.raises(GraphifyContractError):
+        probe_graphify(
+            resolved_graphify,
+            resolve_graphify_compatibility("0.9.48"),
+            runner,
+        )
 
 
 def test_assistant_skill_probe_detects_obsidian_pipeline_from_skill_text(
@@ -176,13 +291,13 @@ def test_assistant_skill_probe_detects_obsidian_pipeline_from_skill_text(
 
 
 def test_query_passes_untrusted_text_as_one_argument(
-    fake_runner: FakeRunner, graph: Path
+    fake_runner: FakeRunner, graph: Path, resolved_graphify: ResolvedGraphifyExecutable
 ) -> None:
     """Splitting a question into shell syntax could execute untrusted input."""
-    query_graph(Path("graphify"), graph, "auth; touch /tmp/pwned", fake_runner)
+    query_graph(resolved_graphify, graph, "auth; touch /tmp/pwned", fake_runner)
 
     assert fake_runner.calls[-1] == (
-        "graphify",
+        str(resolved_graphify.path),
         "query",
         "auth; touch /tmp/pwned",
         "--graph",
@@ -198,10 +313,12 @@ def test_query_passes_untrusted_text_as_one_argument(
     assert set(fake_runner.options[-1]["env"]) <= {"HOME", "LANG", "LC_ALL", "PATH"}
 
 
-def test_command_failures_are_capped_and_sanitized(fake_runner: FakeRunner, graph: Path) -> None:
+def test_command_failures_are_capped_and_sanitized(
+    fake_runner: FakeRunner, graph: Path, resolved_graphify: ResolvedGraphifyExecutable
+) -> None:
     """Raw Graphify diagnostics could disclose atlas paths or credentials."""
     fake_runner.answer(
-        ("graphify", "query", "where", "--graph", str(graph)),
+        (str(resolved_graphify.path), "query", "where", "--graph", str(graph)),
         returncode=1,
         stderr=(
             "token=top-secret /Users/example/Documents/Obsidian Vault/Private "
@@ -210,7 +327,7 @@ def test_command_failures_are_capped_and_sanitized(fake_runner: FakeRunner, grap
     )
 
     with pytest.raises(GraphifyCommandError) as raised:
-        query_graph(Path("graphify"), graph, "where", fake_runner)
+        query_graph(resolved_graphify, graph, "where", fake_runner)
 
     message = str(raised.value)
     assert "top-secret" not in message
@@ -293,14 +410,19 @@ def test_subprocess_timeout_kills_pipe_holding_child_without_blocking(tmp_path: 
 
 
 def test_registry_failure_is_reported_without_invalidating_project_graph(
-    fake_runner: FakeRunner, graph: Path
+    fake_runner: FakeRunner, graph: Path, resolved_graphify: ResolvedGraphifyExecutable
 ) -> None:
     """A local-registry outage must not make an already validated graph unusable."""
     fake_runner.answer_prefix(
-        ("graphify", "global", "add"), returncode=1, stderr="registry unavailable"
+        (str(resolved_graphify.path), "global", "add"), returncode=1, stderr="registry unavailable"
     )
 
-    result = sync_global_registry(Path("graphify"), graph, "demo", fake_runner)
+    result = sync_global_registry(
+        resolved_graphify,
+        graph,
+        "atlasweaver/00000000-0000-4000-8000-000000000000",
+        fake_runner,
+    )
 
     assert result.status == "partial"
     assert graph.exists()

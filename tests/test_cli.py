@@ -151,21 +151,11 @@ def test_detect_json_is_read_only_and_path_free(tmp_path: Path) -> None:
 def test_preflight_json_is_non_mutating_and_probes_exact_graphify_argv(
     tmp_path: Path,
 ) -> None:
-    """Preflight must use the safe adapter without staging or guessing flags."""
+    """Preflight resolves only the literal Graphify command and stays read-only."""
     repo = project(tmp_path)
-    executable, calls = graphify_executable(tmp_path)
-    skill = write(tmp_path / "SKILL.md", "# /graphify\nUse `--obsidian`.\n")
     before = tree_snapshot(repo)
 
-    result = run_cli(
-        repo,
-        "preflight",
-        "--graphify-binary",
-        executable,
-        "--assistant-skill",
-        skill,
-        "--json",
-    )
+    result = run_cli(repo, "preflight", "--json")
 
     assert result.returncode == 0
     assert payload(result) == {
@@ -175,14 +165,20 @@ def test_preflight_json_is_non_mutating_and_probes_exact_graphify_argv(
         "project_id": "demo",
         "graphify_version": "0.9.48",
         "safe_file_count": 1,
-        "obsidian_export": True,
+        "obsidian_export": False,
     }
-    assert [json.loads(line) for line in calls.read_text().splitlines()] == [
-        ["--version"],
-        ["--help"],
-    ]
     assert tree_snapshot(repo) == before
     assert not (repo / ".project-knowledge").exists()
+
+
+@pytest.mark.parametrize("option", ["--graphify-binary", "--assistant-skill"])
+def test_preflight_exposes_no_executable_or_skill_override(
+    tmp_path: Path, option: str
+) -> None:
+    repo = project(tmp_path)
+    result = run_cli(repo, "preflight", option, str(tmp_path / "untrusted"), "--json")
+
+    assert result.returncode == 2
 
 
 def test_scan_secrets_is_read_only_redacted_and_path_confined(tmp_path: Path) -> None:

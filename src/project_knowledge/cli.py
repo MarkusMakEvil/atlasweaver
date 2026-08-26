@@ -14,6 +14,7 @@ from typing import Callable, Sequence
 
 from .adapter import AdapterError, adapt_candidate
 from .artifacts import ArtifactValidationError, promote_graph, validate_candidate
+from .compatibility import resolve_graphify_compatibility
 from .atlas import (
     AtlasOwnershipError,
     generated_root,
@@ -26,6 +27,7 @@ from .graphify import (
     GraphifyError,
     SubprocessCommandRunner,
     probe_graphify,
+    resolve_graphify_executable,
 )
 from .health import assess_health, inspect_project_state, safe_input_snapshot
 from .manifest import ManifestError, load_manifest
@@ -84,9 +86,7 @@ def add_detect(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None
 
 
 def add_preflight(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
-    parser = _command(sub, "preflight")
-    parser.add_argument("--graphify-binary", type=Path, default=Path("graphify"))
-    parser.add_argument("--assistant-skill", type=Path)
+    _command(sub, "preflight")
 
 
 def add_stage(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -239,10 +239,9 @@ def _preflight(
 ) -> dict[str, object]:
     snapshot = safe_input_snapshot(repo, manifest)
     capabilities = probe_graphify(
-        arguments.graphify_binary,
-        manifest.graphify_version,
+        resolve_graphify_executable(),
+        resolve_graphify_compatibility(manifest.graphify_version),
         SubprocessCommandRunner(),
-        assistant_skill=arguments.assistant_skill,
     )
     return _success(
         "preflight",

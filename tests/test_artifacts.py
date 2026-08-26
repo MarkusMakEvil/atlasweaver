@@ -718,7 +718,7 @@ def test_candidate_requires_the_pinned_graphify_release(
     manifest = replace(manifest, graphify_version="0.9.49")
     write_graph(candidate, staged, manifest)
 
-    with pytest.raises(ArtifactValidationError, match="0.9.48"):
+    with pytest.raises(ArtifactValidationError, match="unsupported Graphify version"):
         validate_candidate(candidate, staged, manifest)
 
 

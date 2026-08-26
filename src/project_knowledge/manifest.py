@@ -9,6 +9,7 @@ from typing import Any
 
 import yaml
 
+from .compatibility import CompatibilityError, resolve_graphify_compatibility
 from .models import ProjectManifest
 
 
@@ -30,7 +31,6 @@ _FIELDS = frozenset(
     }
 )
 _PROJECT_ID = re.compile(r"[a-z0-9][a-z0-9-]{1,62}\Z")
-_GRAPHIFY_VERSION = "0.9.48"
 
 
 def confined_relative(value: str, field: str) -> PurePosixPath:
@@ -104,8 +104,10 @@ def load_manifest(path: Path, repo_root: Path) -> ProjectManifest:
         raise ManifestError("track_html must be a boolean")
 
     graphify_version = _required_string(loaded, "graphify_version")
-    if graphify_version != _GRAPHIFY_VERSION:
-        raise ManifestError(f"graphify_version must be exactly {_GRAPHIFY_VERSION}")
+    try:
+        resolve_graphify_compatibility(graphify_version)
+    except CompatibilityError as error:
+        raise ManifestError(str(error)) from error
 
     return ProjectManifest(
         schema_version=schema_version,
