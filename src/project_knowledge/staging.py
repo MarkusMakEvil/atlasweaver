@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import os
@@ -15,6 +15,7 @@ import stat
 from .compatibility import resolve_graphify_compatibility
 from .locking import RepositoryAccess, open_repository_access
 from .models import (
+    CoverageApproval,
     PrivacyDecision,
     ProjectionFile,
     ProjectionSnapshot,
@@ -53,7 +54,8 @@ class StagedInput:
     files: tuple[PurePosixPath, ...]
     projection_digest: str | None = None
     reason_counts: tuple[tuple[str, int], ...] = ()
-    coverage_approvals: tuple[str, ...] = ()
+    coverage_approvals: tuple[CoverageApproval, ...] = ()
+    projection_files: tuple[ProjectionFile, ...] = ()
 
 
 SOURCE_DIGEST_DOMAIN = b"atlasweaver-source-v2\0"
@@ -251,6 +253,28 @@ def inspect_projection(
     repository_access: RepositoryAccess | None = None,
 ) -> ProjectionSnapshot:
     """Capture the complete v2 privacy decision and safe-byte projection."""
+    base = _inspect_projection_base(
+        repo_root, manifest, repository_access=repository_access
+    )
+    from .coverage import load_coverage_approvals
+
+    with _repository_access(repo_root, repository_access) as repository:
+        approvals = load_coverage_approvals(
+            repo_root,
+            base,
+            resolve_graphify_compatibility(manifest.graphify_version),
+            repository_access=repository,
+        )
+    return replace(base, coverage_approvals=approvals)
+
+
+def _inspect_projection_base(
+    repo_root: Path,
+    manifest: ProjectManifest,
+    *,
+    repository_access: RepositoryAccess | None = None,
+) -> ProjectionSnapshot:
+    """Capture projection bytes without recursively loading approvals."""
     if manifest.schema_version != 2 or manifest.project_uid is None:
         raise StagingError("projection v2 requires manifest schema 2")
     contract = resolve_graphify_compatibility(manifest.graphify_version)
@@ -358,7 +382,8 @@ def _stage_input_v2(
                 tuple(item.path for item in projection.files),
                 projection.projection_digest,
                 projection.reason_counts,
-                (),
+                projection.coverage_approvals,
+                projection.files,
             )
         except BaseException:
             try:

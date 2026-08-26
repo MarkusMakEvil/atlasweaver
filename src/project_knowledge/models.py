@@ -66,6 +66,15 @@ class ProjectionFile:
 
 
 @dataclass(frozen=True)
+class CoverageApproval:
+    path: PurePosixPath
+    content_sha256: str
+    adapter_id: str
+    reason_code: str
+    rationale: str
+
+
+@dataclass(frozen=True)
 class ProjectionSnapshot:
     source_digest: str
     projection_digest: str | None
@@ -75,3 +84,4 @@ class ProjectionSnapshot:
     ignore_digests: tuple[str, ...]
     secret_exception_digest: str | None
     coverage_digest: str | None
+    coverage_approvals: tuple[CoverageApproval, ...] = ()
