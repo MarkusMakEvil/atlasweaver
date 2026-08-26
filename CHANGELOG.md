@@ -2,6 +2,11 @@
 
 All notable changes to AtlasWeaver are documented here.
 
+## 0.3.2 - 2026-08-26
+
+- Allowed securely resolved package-manager symlinks for the GitHub CLI while
+  preserving executable identity and mutation checks during attestation.
+
 ## 0.3.1 - 2026-08-26
 
 - Canonicalized Graphify 0.9.48 diagnostic supersets before evidence binding.

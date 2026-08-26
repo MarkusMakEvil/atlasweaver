@@ -838,14 +838,15 @@ class _SystemGhResolver:
     ) -> ResolvedGhExecutable:
         for path in self._candidates:
             try:
-                resolved = _capture_gh(path, version="pending")
-            except GithubArtifactError:
+                executable = path.resolve(strict=True)
+                resolved = _capture_gh(executable, version="pending")
+            except (OSError, RuntimeError, GithubArtifactError):
                 continue
             environment = {"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"}
             before_exec()
             _revalidate_gh(resolved)
             version_result = SUBPROCESS_GH_RUNNER.run(
-                (str(path), "--version"), environment, GH_TIMEOUT_SECONDS, GH_OUTPUT_LIMIT
+                (str(executable), "--version"), environment, GH_TIMEOUT_SECONDS, GH_OUTPUT_LIMIT
             )
             if version_result.returncode != 0:
                 continue
@@ -855,7 +856,7 @@ class _SystemGhResolver:
             before_exec()
             _revalidate_gh(resolved)
             help_result = SUBPROCESS_GH_RUNNER.run(
-                (str(path), "attestation", "verify", "--help"),
+                (str(executable), "attestation", "verify", "--help"),
                 environment,
                 GH_TIMEOUT_SECONDS,
                 GH_OUTPUT_LIMIT,

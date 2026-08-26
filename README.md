@@ -32,10 +32,10 @@ or treat inferred graph relationships as proof.
 ## Install
 
 ```sh
-uv tool install 'git+https://github.com/MarkusMakEvil/atlasweaver.git@v0.3.1'
+uv tool install 'git+https://github.com/MarkusMakEvil/atlasweaver.git@v0.3.2'
 uv tool install 'graphifyy==0.9.48'
 graphify install --platform codex
-git clone --depth 1 --branch v0.3.1 https://github.com/MarkusMakEvil/atlasweaver.git
+git clone --depth 1 --branch v0.3.2 https://github.com/MarkusMakEvil/atlasweaver.git
 cd atlasweaver
 scripts/install-project-knowledge-skill --codex-home "${CODEX_HOME:-$HOME/.codex}"
 ```

@@ -10,6 +10,8 @@ import zipfile
 
 import pytest
 
+import project_knowledge.github_artifacts as github_artifacts
+
 from project_knowledge.bundles import (
     ArtifactManifest,
     GitIdentity,
@@ -267,6 +269,39 @@ class _Runner:
         assert list(config.iterdir()) == []
         self.calls.append((argv, dict(env), timeout_seconds, output_limit, config))
         return self.result
+
+
+class _ResolverRunner:
+    def run(self, argv, env, timeout_seconds, output_limit):
+        if argv[-1] == "--version":
+            return _Completed(0, "gh version 2.96.0 (test)\n")
+        return _Completed(
+            0,
+            " ".join((
+                "--hostname", "--repo", "--signer-workflow", "--signer-digest",
+                "--source-ref", "--source-digest", "--predicate-type",
+                "--deny-self-hosted-runners", "--format",
+            )),
+        )
+
+
+def test_system_gh_resolver_accepts_safe_package_manager_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "cellar" / "gh"
+    target.parent.mkdir()
+    target.write_bytes(b"#!/bin/sh\nexit 0\n")
+    target.chmod(0o700)
+    candidate = tmp_path / "bin" / "gh"
+    candidate.parent.mkdir()
+    candidate.symlink_to(target)
+    resolver = github_artifacts._SystemGhResolver()
+    monkeypatch.setattr(resolver, "_candidates", (candidate,))
+    monkeypatch.setattr(github_artifacts, "SUBPROCESS_GH_RUNNER", _ResolverRunner())
+
+    resolved = resolver.resolve()
+
+    assert resolved.path == target.resolve()
 
 
 def _resolved_gh(tmp_path: Path) -> ResolvedGhExecutable:
