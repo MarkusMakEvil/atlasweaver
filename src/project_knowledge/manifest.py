@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 import json
+import hashlib
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -14,6 +15,7 @@ from uuid import UUID, RFC_4122
 import yaml
 
 from .compatibility import CompatibilityError, resolve_graphify_compatibility
+from .locking import RepositoryAccess, _ManifestBinding
 from .models import ArtifactIntent, FeatureIntent, ProjectManifest
 
 
@@ -133,10 +135,24 @@ def load_manifest_payload(payload: bytes, repo_root: Path) -> ProjectManifest:
     raise ManifestError("schema_version must be 1 or 2")
 
 
-def load_manifest(path: Path, repo_root: Path) -> ProjectManifest:
+def load_manifest(
+    path: Path,
+    repo_root: Path,
+    *,
+    repository_access: RepositoryAccess | None = None,
+) -> ProjectManifest:
     """Descriptor-read the canonical manifest and parse its exact bytes."""
     if path.name != ".graphify-project.yaml":
         raise ManifestError("manifest filename must be .graphify-project.yaml")
+    if repository_access is not None:
+        payload, binding = _capture_manifest_binding(repository_access.descriptor)
+        try:
+            parsed = load_manifest_payload(payload, repo_root)
+        except BaseException:
+            binding.close()
+            raise
+        repository_access._replace_manifest_binding(binding)
+        return parsed
     try:
         root = repo_root.absolute()
         if path.absolute() != root / ".graphify-project.yaml":
@@ -181,6 +197,132 @@ def load_manifest(path: Path, repo_root: Path) -> ProjectManifest:
             os.close(descriptor)
         os.close(root_fd)
     return load_manifest_payload(payload, root)
+
+
+def require_current_manifest(
+    repo_root: Path,
+    supplied: ProjectManifest,
+    *,
+    repository_access: RepositoryAccess,
+) -> ProjectManifest:
+    """Pin the current manifest and require the caller's contract to match it."""
+    current = load_manifest(
+        repo_root / ".graphify-project.yaml",
+        repo_root,
+        repository_access=repository_access,
+    )
+    if current != supplied:
+        raise ManifestError("project manifest changed", kind="changed")
+    return current
+
+
+def assert_current_manifest_unchanged(
+    repo_root: Path,
+    manifest: ProjectManifest,
+    *,
+    repository_access: RepositoryAccess,
+) -> None:
+    """Recheck the retained manifest fd and its descriptor-relative entry."""
+    del repo_root
+    binding = repository_access._manifest_binding
+    if binding is None or binding.descriptor < 0:
+        raise ManifestError("project manifest changed", kind="changed")
+    candidate = -1
+    try:
+        retained = os.fstat(binding.descriptor)
+        if _binding_metadata(retained) != (
+            binding.identity,
+            binding.size,
+            binding.mtime_ns,
+            binding.ctime_ns,
+        ):
+            raise ManifestError("project manifest changed", kind="changed")
+        retained_payload = _pread_capped(binding.descriptor, MAX_MANIFEST_BYTES)
+        if hashlib.sha256(retained_payload).hexdigest() != binding.sha256:
+            raise ManifestError("project manifest changed", kind="changed")
+        candidate = os.open(
+            ".graphify-project.yaml",
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=repository_access.descriptor,
+        )
+        info = os.fstat(candidate)
+        if _binding_metadata(info) != (
+            binding.identity,
+            binding.size,
+            binding.mtime_ns,
+            binding.ctime_ns,
+        ):
+            raise ManifestError("project manifest changed", kind="changed")
+        payload = _pread_capped(candidate, MAX_MANIFEST_BYTES)
+        if (
+            hashlib.sha256(payload).hexdigest() != binding.sha256
+            or load_manifest_payload(payload, Path(".")) != manifest
+        ):
+            raise ManifestError("project manifest changed", kind="changed")
+    except ManifestError as error:
+        if error.kind == "changed":
+            raise
+        raise ManifestError("project manifest changed", kind="changed") from None
+    except (OSError, ValueError):
+        raise ManifestError("project manifest changed", kind="changed") from None
+    finally:
+        if candidate >= 0:
+            os.close(candidate)
+
+
+def _capture_manifest_binding(root_descriptor: int) -> tuple[bytes, _ManifestBinding]:
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            ".graphify-project.yaml",
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=root_descriptor,
+        )
+        before = os.fstat(descriptor)
+        named = os.stat(
+            ".graphify-project.yaml",
+            dir_fd=root_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or (before.st_dev, before.st_ino) != (named.st_dev, named.st_ino)
+            or before.st_size > MAX_MANIFEST_BYTES
+        ):
+            raise ManifestError("project manifest changed", kind="changed")
+        first = _pread_capped(descriptor, MAX_MANIFEST_BYTES)
+        middle = os.fstat(descriptor)
+        second = _pread_capped(descriptor, MAX_MANIFEST_BYTES)
+        after = os.fstat(descriptor)
+        rebound = os.stat(
+            ".graphify-project.yaml",
+            dir_fd=root_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            _file_identity(before) != _file_identity(middle)
+            or _file_identity(before) != _file_identity(after)
+            or (before.st_dev, before.st_ino) != (rebound.st_dev, rebound.st_ino)
+            or first != second
+        ):
+            raise ManifestError("project manifest changed", kind="changed")
+        digest = hashlib.sha256(first).hexdigest()
+        return first, _ManifestBinding(
+            descriptor=descriptor,
+            identity=(before.st_dev, before.st_ino),
+            size=before.st_size,
+            mtime_ns=before.st_mtime_ns,
+            ctime_ns=before.st_ctime_ns,
+            sha256=digest,
+        )
+    except ManifestError:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+    except OSError:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise ManifestError("project manifest changed", kind="changed") from None
 
 
 def confined_relative(value: str, field: str) -> PurePosixPath:
@@ -539,6 +681,32 @@ def _read_capped(descriptor: int, limit: int) -> bytes:
     if len(payload) > limit:
         raise ManifestError("manifest exceeds its byte cap")
     return payload
+
+
+def _pread_capped(descriptor: int, limit: int) -> bytes:
+    chunks: list[bytes] = []
+    offset = 0
+    while offset <= limit:
+        chunk = os.pread(descriptor, min(65_536, limit + 1 - offset), offset)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        offset += len(chunk)
+    payload = b"".join(chunks)
+    if len(payload) > limit:
+        raise ManifestError("manifest exceeds its byte cap")
+    return payload
+
+
+def _binding_metadata(
+    info: os.stat_result,
+) -> tuple[tuple[int, int], int, int, int]:
+    return (
+        (info.st_dev, info.st_ino),
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
 
 
 def _file_identity(info: os.stat_result) -> tuple[int, int, int, int, int]:

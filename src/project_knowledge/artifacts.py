@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
+import fcntl
 import json
 import math
 import os
@@ -26,7 +27,14 @@ from .integrity import GraphIntegrity, IntegrityError, analyze_graph
 from .models import ProjectManifest
 from .privacy import effective_excludes, is_denied
 from .staging import StagedInput
-from .locking import ExclusiveFileLock
+from .locking import (
+    ExclusiveDescriptorLock,
+    RepositoryAccess,
+    TransactionLockError,
+    assert_lifecycle_lock_held,
+    capture_lifecycle_descriptors,
+    capture_lifecycle_repository,
+)
 
 
 OWNERSHIP_MANIFEST = ".project-knowledge-ownership.json"
@@ -291,6 +299,8 @@ def promote_graph(
     candidate: ValidatedGraph,
     repo_root: Path,
     fs: FileSystem = REAL_FS,
+    *,
+    repository_access: RepositoryAccess | None = None,
 ) -> PromotionResult:
     """Stage, journal, backup, and durably promote a validated graph directory.
 
@@ -298,33 +308,96 @@ def promote_graph(
     A durable journal lets the next invocation recover a process interruption
     before beginning another promotion.
     """
+    assert_lifecycle_lock_held(repo_root)
+    if repository_access is None:
+        with capture_lifecycle_repository(repo_root) as captured:
+            return promote_graph(
+                candidate,
+                repo_root,
+                fs,
+                repository_access=captured,
+            )
+
     evidence = _VALIDATED_IN_PROCESS.get(id(candidate))
     if evidence is None or evidence.candidate is not candidate:
         raise ArtifactValidationError(
             "candidate was not validated in the current process"
         )
-    root = _require_repository_directory(repo_root)
-    target = root / "graphify-out"
-    if candidate.root == target:
-        raise ArtifactValidationError("candidate must be staged outside graphify-out")
-    _assert_snapshot(candidate.root, evidence.files)
+    with capture_lifecycle_descriptors(repo_root) as descriptors:
+        try:
+            access_info = os.fstat(repository_access.descriptor)
+        except OSError:
+            raise TransactionLockError(
+                "repository access is unavailable", kind="authority"
+            ) from None
+        if (
+            (access_info.st_dev, access_info.st_ino)
+            != descriptors.repository_identity
+            or repository_access.identity != descriptors.repository_identity
+        ):
+            raise TransactionLockError(
+                "repository identity changed", kind="authority"
+            )
+        root = _path_for_open_directory(descriptors.repository_descriptor)
+        state_root = _path_for_open_directory(descriptors.state_descriptor)
+        target = root / "graphify-out"
+        if candidate.root == target:
+            raise ArtifactValidationError(
+                "candidate must be staged outside graphify-out"
+            )
+        _assert_snapshot(candidate.root, evidence.files)
 
-    state_root = root / ".project-knowledge"
-    staging_parent = state_root / "staging"
-    rollback_parent = state_root / "rollback"
-    transactions = state_root / "transactions"
-    fs.prepare_private_dir(state_root)
-    fs.fsync_directory(root)
-    for directory in (staging_parent, rollback_parent, transactions):
-        fs.prepare_private_dir(directory)
-    fs.fsync_directory(state_root)
-    transaction_id = secrets.token_hex(16)
-    stage = staging_parent / transaction_id
-    backup = rollback_parent / transaction_id
-    journal = transactions / f"{transaction_id}.json"
+        staging_parent = state_root / "staging"
+        rollback_parent = state_root / "rollback"
+        transactions = state_root / "transactions"
+        for directory in (staging_parent, rollback_parent, transactions):
+            fs.prepare_private_dir(directory)
+        fs.fsync_directory(state_root)
+        fs.fsync_directory(root)
+        transaction_id = secrets.token_hex(16)
+        stage = staging_parent / transaction_id
+        backup = rollback_parent / transaction_id
+        journal = transactions / f"{transaction_id}.json"
 
-    with ExclusiveFileLock(state_root / "promotion.lock"):
-        return _promote_graph_locked(candidate, evidence, root, target, stage, backup, journal, fs)
+        with ExclusiveDescriptorLock(
+            descriptors.state_descriptor, "promotion.lock"
+        ):
+            return _promote_graph_locked(
+                candidate,
+                evidence,
+                root,
+                target,
+                stage,
+                backup,
+                journal,
+                fs,
+            )
+
+
+def _path_for_open_directory(descriptor: int) -> Path:
+    """Return the kernel's current name for an already-authorized directory."""
+    try:
+        if hasattr(fcntl, "F_GETPATH"):
+            payload = fcntl.fcntl(descriptor, fcntl.F_GETPATH, b"\0" * 1024)
+            encoded = payload.split(b"\0", 1)[0]
+            path = Path(os.fsdecode(encoded))
+        else:
+            path = Path(os.readlink(f"/proc/self/fd/{descriptor}"))
+        opened = os.fstat(descriptor)
+        named = path.stat(follow_symlinks=False)
+    except OSError:
+        raise TransactionLockError(
+            "repository lifecycle descriptors are unavailable", kind="unavailable"
+        ) from None
+    if (
+        not stat.S_ISDIR(opened.st_mode)
+        or stat.S_ISLNK(named.st_mode)
+        or (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)
+    ):
+        raise TransactionLockError(
+            "repository lifecycle descriptors are unavailable", kind="authority"
+        )
+    return path
 
 
 def _promote_graph_locked(candidate, evidence, root, target, stage, backup, journal, fs):

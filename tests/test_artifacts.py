@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from dataclasses import replace
 from datetime import datetime
 import json
+import os
 from pathlib import Path, PurePosixPath
 import shutil
 from time import perf_counter
@@ -17,6 +18,11 @@ from project_knowledge.artifacts import (
     ValidatedGraph,
     promote_graph,
     validate_candidate,
+)
+from project_knowledge.locking import (
+    TransactionLockError,
+    capture_lifecycle_repository,
+    repository_lifecycle_lock,
 )
 from project_knowledge.compatibility import production_graphify_compatibility
 from project_knowledge.integrity import analyze_graph
@@ -984,6 +990,27 @@ def write_committed_graph(repo: Path, marker: str = "old") -> Path:
     return target
 
 
+def promote_with_lifecycle(
+    candidate: ValidatedGraph,
+    repo: Path,
+    *,
+    fs: FileSystem | None = None,
+):
+    """Exercise production promotion with its required outer lock authority."""
+    state = repo / ".project-knowledge"
+    if state.is_dir() and not state.is_symlink():
+        state.chmod(0o700)
+    with repository_lifecycle_lock(repo):
+        with capture_lifecycle_repository(repo) as repository:
+            if fs is None:
+                return promote_graph(
+                    candidate, repo, repository_access=repository
+                )
+            return promote_graph(
+                candidate, repo, fs=fs, repository_access=repository
+            )
+
+
 def test_promotion_installs_candidate_and_durably_cleans_unique_backup(
     tmp_path: Path, candidate: Path, staged: StagedInput, manifest: ProjectManifest
 ) -> None:
@@ -992,7 +1019,7 @@ def test_promotion_installs_candidate_and_durably_cleans_unique_backup(
     old_inode = old.stat().st_ino
     validated = validate_candidate(candidate, staged, manifest)
 
-    result = promote_graph(validated, repo)
+    result = promote_with_lifecycle(validated, repo)
 
     assert result.target == repo / "graphify-out"
     assert result.backup.parent == repo / ".project-knowledge/rollback"
@@ -1003,16 +1030,55 @@ def test_promotion_installs_candidate_and_durably_cleans_unique_backup(
     assert result.target.stat().st_ino != old_inode
 
 
+def test_promotion_requires_repository_lifecycle_authority(
+    tmp_path: Path, candidate: Path, staged: StagedInput, manifest: ProjectManifest
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    validated = validate_candidate(candidate, staged, manifest)
+
+    with pytest.raises(TransactionLockError) as raised:
+        promote_graph(validated, repo)
+
+    assert raised.value.kind == "authority"
+    assert not (repo / ".project-knowledge").exists()
+
+
+def test_promotion_remains_bound_when_repository_path_is_replaced(
+    tmp_path: Path, candidate: Path, staged: StagedInput, manifest: ProjectManifest
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    validated = validate_candidate(candidate, staged, manifest)
+    original = tmp_path / "original-repo"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    with repository_lifecycle_lock(repo):
+        with capture_lifecycle_repository(repo) as repository:
+            repo.rename(original)
+            os.symlink(outside, repo, target_is_directory=True)
+            result = promote_graph(
+                validated, repo, repository_access=repository
+            )
+
+    assert result.digest == validated.graph_digest
+    assert (original / "graphify-out/graph.json").is_file()
+    assert not (outside / "graphify-out").exists()
+
+
 def test_identical_owned_graph_promotion_is_idempotent(
     tmp_path: Path, candidate: Path, staged: StagedInput, manifest: ProjectManifest
 ) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
-    first = promote_graph(validate_candidate(candidate, staged, manifest), repo)
+    first = promote_with_lifecycle(
+        validate_candidate(candidate, staged, manifest), repo
+    )
     installed_inode = first.target.stat().st_ino
     fresh = tmp_path / "fresh"
     write_valid_candidate(fresh, staged, manifest)
-    second = promote_graph(validate_candidate(fresh, staged, manifest), repo)
+    second = promote_with_lifecycle(validate_candidate(fresh, staged, manifest), repo)
     assert second.changed is False
     assert second.target.stat().st_ino == installed_inode
     assert list((repo / ".project-knowledge/rollback").iterdir()) == []
@@ -1032,7 +1098,7 @@ def test_failed_promotion_keeps_previous_graph(
     faulting_fs = FaultingFS(failure)
 
     with pytest.raises(OSError, match="injected"):
-        promote_graph(validated, repo, fs=faulting_fs)
+        promote_with_lifecycle(validated, repo, fs=faulting_fs)
 
     assert faulting_fs.triggered
     assert (repo / "graphify-out/marker").read_text(encoding="utf-8") == "old"
@@ -1047,7 +1113,7 @@ def test_failed_first_promotion_leaves_no_untrusted_graph(
     validated = validate_candidate(candidate, staged, manifest)
 
     with pytest.raises(OSError, match="fsync-promote"):
-        promote_graph(validated, repo, fs=FaultingFS("fsync-promote"))
+        promote_with_lifecycle(validated, repo, fs=FaultingFS("fsync-promote"))
 
     assert not (repo / "graphify-out").exists()
 
@@ -1061,7 +1127,7 @@ def test_first_use_state_directories_are_durable_before_staging(
     fs = RecordingFaultingFS("copy-stage")
 
     with pytest.raises(OSError, match="copy-stage"):
-        promote_graph(validated, repo, fs=fs)
+        promote_with_lifecycle(validated, repo, fs=fs)
 
     assert repo.resolve() in fs.fsynced_directories
     assert (repo.resolve() / ".project-knowledge") in fs.fsynced_directories
@@ -1077,7 +1143,7 @@ def test_promotion_rejects_candidate_changed_after_validation(
     write(candidate / "GRAPH_REPORT.md", "tampered after validation\n")
 
     with pytest.raises(ArtifactValidationError, match="changed after validation"):
-        promote_graph(validated, repo)
+        promote_with_lifecycle(validated, repo)
 
     assert (repo / "graphify-out/marker").read_text(encoding="utf-8") == "old"
 
@@ -1092,8 +1158,8 @@ def test_promotion_rejects_symlinked_transaction_state_directory(
     (repo / ".project-knowledge").symlink_to(external, target_is_directory=True)
     validated = validate_candidate(candidate, staged, manifest)
 
-    with pytest.raises(ArtifactValidationError, match="private directory"):
-        promote_graph(validated, repo)
+    with pytest.raises(TransactionLockError, match="private state"):
+        promote_with_lifecycle(validated, repo)
 
     assert (repo / "graphify-out/marker").read_text(encoding="utf-8") == "old"
     assert list(external.iterdir()) == []
@@ -1112,7 +1178,7 @@ def test_journal_temp_symlink_cannot_overwrite_external_file(
     predictable_temp = transactions / f"{validated.graph_digest}.tmp"
     predictable_temp.symlink_to(external)
 
-    result = promote_graph(validated, repo)
+    result = promote_with_lifecycle(validated, repo)
 
     assert result.target.is_dir()
     assert external.read_text(encoding="utf-8") == "do-not-touch"
@@ -1134,7 +1200,7 @@ def test_promotion_rejects_forged_validated_graph(
     )
 
     with pytest.raises(ArtifactValidationError, match="current process"):
-        promote_graph(forged, repo)
+        promote_with_lifecycle(forged, repo)
 
     assert (repo / "graphify-out/marker").read_text(encoding="utf-8") == "old"
 
@@ -1152,7 +1218,7 @@ def test_interrupted_backup_is_recovered_before_a_new_attempt(
     write(transaction, json.dumps({"schema_version": 1, "state": "backed_up", "graph_digest": validated.graph_digest}))
 
     with pytest.raises(OSError, match="copy-stage"):
-        promote_graph(validated, repo, fs=FaultingFS("copy-stage"))
+        promote_with_lifecycle(validated, repo, fs=FaultingFS("copy-stage"))
 
     assert (target / "marker").read_text(encoding="utf-8") == "old"
     assert not transaction.exists()
@@ -1172,7 +1238,7 @@ def test_random_id_transaction_is_recovered_before_a_new_attempt(
     write(transaction, json.dumps({"schema_version": 1, "state": "backed_up", "graph_digest": validated.graph_digest}))
 
     with pytest.raises(OSError, match="copy-stage"):
-        promote_graph(validated, repo, fs=FaultingFS("copy-stage"))
+        promote_with_lifecycle(validated, repo, fs=FaultingFS("copy-stage"))
 
     assert (target / "marker").read_text(encoding="utf-8") == "old"
     assert not transaction.exists()
@@ -1184,10 +1250,10 @@ def test_tampered_report_is_not_accepted_as_an_unchanged_owned_target(
     repo = tmp_path / "repo"
     repo.mkdir()
     validated = validate_candidate(candidate, staged, manifest)
-    assert promote_graph(validated, repo).changed is True
+    assert promote_with_lifecycle(validated, repo).changed is True
     write(repo / "graphify-out/GRAPH_REPORT.md", "tampered\n")
 
-    result = promote_graph(validated, repo)
+    result = promote_with_lifecycle(validated, repo)
 
     assert result.changed is True
     assert (repo / "graphify-out/GRAPH_REPORT.md").read_text() != "tampered\n"
@@ -1217,7 +1283,7 @@ def test_prepared_journal_recovers_backup_created_before_state_advance(
     )
 
     with pytest.raises(OSError, match="copy-stage"):
-        promote_graph(validated, repo, fs=FaultingFS("copy-stage"))
+        promote_with_lifecycle(validated, repo, fs=FaultingFS("copy-stage"))
 
     assert (target / "marker").read_text(encoding="utf-8") == "old"
     assert not transaction.exists()
@@ -1237,7 +1303,7 @@ def test_interrupted_promoted_target_is_rolled_back_before_retry(
     write(transaction, json.dumps({"schema_version": 1, "state": "promoted", "graph_digest": validated.graph_digest}))
 
     with pytest.raises(OSError, match="copy-stage"):
-        promote_graph(validated, repo, fs=FaultingFS("copy-stage"))
+        promote_with_lifecycle(validated, repo, fs=FaultingFS("copy-stage"))
 
     assert (target / "marker").read_text(encoding="utf-8") == "old"
     assert not transaction.exists()
@@ -1267,7 +1333,7 @@ def test_recovery_rejects_symlinked_rollback_before_touching_valid_target(
     )
 
     with pytest.raises(ArtifactValidationError, match="rollback graph"):
-        promote_graph(validated, repo)
+        promote_with_lifecycle(validated, repo)
 
     assert (target / "marker").read_text(encoding="utf-8") == "old"
     assert (external / "marker").read_text(encoding="utf-8") == "external"
@@ -1299,7 +1365,7 @@ def test_interrupted_first_promotion_is_removed_before_retry(
     )
 
     with pytest.raises(OSError, match="copy-stage"):
-        promote_graph(validated, repo, fs=FaultingFS("copy-stage"))
+        promote_with_lifecycle(validated, repo, fs=FaultingFS("copy-stage"))
 
     assert not target.exists()
     assert not transaction.exists()
@@ -1318,6 +1384,6 @@ def test_recovery_fsync_failure_still_restores_previous_graph(
     write(transaction, json.dumps({"schema_version": 1, "state": "backed_up", "graph_digest": validated.graph_digest}))
 
     with pytest.raises(OSError, match="fsync-recovery"):
-        promote_graph(validated, repo, fs=FaultingFS("fsync-recovery"))
+        promote_with_lifecycle(validated, repo, fs=FaultingFS("fsync-recovery"))
 
     assert (target / "marker").read_text(encoding="utf-8") == "old"
