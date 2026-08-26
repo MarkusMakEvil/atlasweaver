@@ -16,14 +16,23 @@ import shutil
 import stat
 import tempfile
 import secrets
-from typing import Any
+from typing import Any, Literal
+from uuid import UUID
 
+from .adapter import _generation_digest
 from .compatibility import (
     CompatibilityError,
     GraphSemantics,
     resolve_graphify_compatibility,
 )
-from .integrity import GraphIntegrity, IntegrityError, analyze_graph
+from .evidence import (
+    EvidenceError,
+    GraphEvidence,
+    decide_impact_trust,
+    index_final_edge_evidence,
+    parse_graph_evidence,
+)
+from .integrity import GraphIntegrity, IntegrityError, analyze_graph, validate_final_graph
 from .models import ProjectManifest
 from .privacy import effective_excludes, is_denied
 from .staging import StagedInput
@@ -67,10 +76,21 @@ _EXTENSIONLESS_SOURCE_NAMES = frozenset(
     }
 )
 _PATH_FIELDS = frozenset({"source", "source_file", "source_path", "path", "file"})
+_HEX_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
+_GIT_OID = {
+    "sha1": re.compile(r"[0-9a-f]{40}\Z"),
+    "sha256": re.compile(r"[0-9a-f]{64}\Z"),
+}
 
 
 class ArtifactValidationError(ValueError):
     """Raised when candidate bytes cannot be trusted for promotion."""
+
+
+@dataclass(frozen=True)
+class GitIdentity:
+    commit_oid: str
+    algorithm: Literal["sha1", "sha256"]
 
 
 @dataclass(frozen=True)
@@ -84,7 +104,21 @@ class ValidatedGraph:
     edge_count: int
     skipped_count: int = 0
     unapproved_skips: int = 0
-    impact_analysis_trusted: bool = False
+    artifact_schema_version: int = 1
+    project_uid: UUID | None = None
+    adapter_id: str | None = None
+    projection_digest: str | None = None
+    evidence_digest: str | None = None
+    extraction_invocation_digest: str | None = None
+    generation_digest: str = ""
+    impact_trust: Literal["trusted", "navigation"] = "navigation"
+    impact_limitations: tuple[str, ...] = ()
+    build_epoch: int | None = None
+    git_identity: GitIdentity | None = None
+
+    @property
+    def impact_analysis_trusted(self) -> bool:
+        return self.impact_trust == "trusted"
 
 
 @dataclass(frozen=True)
@@ -94,6 +128,8 @@ class PromotionResult:
     target: Path
     backup: Path
     digest: str
+    generation_digest: str = ""
+    build_epoch: int | None = None
     changed: bool = True
 
 
@@ -160,7 +196,14 @@ REAL_FS = FileSystem()
 
 
 def validate_candidate(
-    candidate_dir: Path, staged: StagedInput, manifest: ProjectManifest
+    candidate_dir: Path,
+    staged: StagedInput,
+    manifest: ProjectManifest,
+    *,
+    expected_projection_digest: str | None = None,
+    expected_evidence_digest: str | None = None,
+    build_epoch: int | None = None,
+    git_identity: GitIdentity | None = None,
 ) -> ValidatedGraph:
     """Validate a complete candidate and attach process-local ownership evidence.
 
@@ -204,6 +247,29 @@ def validate_candidate(
         if relative == PurePosixPath("graph.json")
     )
     document = _load_graph_json(graph_bytes)
+    artifact_schema_version = document.get("artifact_schema_version", 1)
+    if type(artifact_schema_version) is not int or artifact_schema_version not in {1, 2}:
+        raise ArtifactValidationError("artifact schema version is invalid")
+    if artifact_schema_version == 2:
+        _require_regular_file(root / "GRAPH_EVIDENCE.json", "required artifact")
+        allowed = {
+            PurePosixPath("graph.json"),
+            PurePosixPath("GRAPH_REPORT.md"),
+            PurePosixPath("GRAPH_EVIDENCE.json"),
+            *((PurePosixPath("graph.html"),) if manifest.track_html else ()),
+        }
+        if {relative for relative, _, _ in artifact_files} != allowed:
+            raise ArtifactValidationError("schema 2 artifact set is invalid")
+    elif any(
+        value is not None
+        for value in (
+            expected_projection_digest,
+            expected_evidence_digest,
+            build_epoch,
+            git_identity,
+        )
+    ):
+        raise ArtifactValidationError("legacy artifact validation arguments are invalid")
     _require_identity(document, "project_id", manifest.project_id, "project ID mismatch")
     _require_identity(
         document,
@@ -229,31 +295,132 @@ def validate_candidate(
         document, nodes, edges, staged
     )
     staged_files = frozenset(staged.files)
-    for _, text in artifact_text:
-        _reject_text_path_leaks(text, excludes, staged_files)
+    for relative, text in artifact_text:
+        if relative != PurePosixPath("GRAPH_EVIDENCE.json"):
+            _reject_text_path_leaks(text, excludes, staged_files)
     graph_digest = hashlib.sha256(graph_bytes).hexdigest()
+    generation_digest = _generation_digest(
+        tuple((relative, payload) for relative, _, payload in artifact_files)
+    )
     artifact_digests = {
         relative.as_posix(): hashlib.sha256(payload).hexdigest()
         for relative, _, payload in artifact_files
     }
 
-    generated_at = datetime.now(timezone.utc).isoformat()
-    relative_files = sorted(
-        (OWNERSHIP_MANIFEST, *(relative.as_posix() for relative, _, _ in artifact_files))
-    )
-    ownership = {
-        "schema_version": _OWNERSHIP_SCHEMA_VERSION,
-        "project_id": manifest.project_id,
-        "graphify_version": contract.version,
-        "source_digest": staged.source_digest,
-        "graph_digest": graph_digest,
-        "artifact_digests": artifact_digests,
-        "generated_at": generated_at,
-        "files": relative_files,
-        "skipped_count": skipped_count,
-        "unapproved_skips": unapproved_skips,
-        "impact_analysis_trusted": False,
-    }
+    parsed_evidence: GraphEvidence | None = None
+    impact_trust: Literal["trusted", "navigation"] = "navigation"
+    impact_limitations: tuple[str, ...] = ("legacy_artifact_schema",)
+    if artifact_schema_version == 2:
+        if manifest.project_uid is None:
+            raise ArtifactValidationError("artifact schema 2 requires project UID")
+        _require_positive_epoch(build_epoch)
+        git_identity = _validate_git_identity(git_identity)
+        expected_projection_digest = _require_digest(
+            expected_projection_digest, "expected projection digest"
+        )
+        expected_evidence_digest = _require_digest(
+            expected_evidence_digest, "expected evidence digest"
+        )
+        if staged.projection_digest != expected_projection_digest:
+            raise ArtifactValidationError("projection digest mismatch")
+        for forbidden in (
+            "impact_trust",
+            "impact_limitations",
+            "impact_analysis_trusted",
+        ):
+            if _identity_values(document, forbidden):
+                raise ArtifactValidationError("graph contains forged impact trust")
+        _require_identity(
+            document,
+            "projection_digest",
+            expected_projection_digest,
+            "projection digest mismatch",
+        )
+        _require_identity(
+            document,
+            "evidence_digest",
+            expected_evidence_digest,
+            "evidence digest mismatch",
+        )
+        evidence_bytes = next(
+            payload
+            for relative, _, payload in artifact_files
+            if relative == PurePosixPath("GRAPH_EVIDENCE.json")
+        )
+        try:
+            parsed_evidence = parse_graph_evidence(
+                evidence_bytes, contract, expected_digest=expected_evidence_digest
+            )
+        except EvidenceError as error:
+            raise ArtifactValidationError("graph evidence is invalid") from error
+        _validate_graph_evidence_bindings(
+            document,
+            parsed_evidence,
+            staged.source_digest,
+            expected_projection_digest,
+            graph_health,
+            contract.semantics,
+        )
+        trust = decide_impact_trust(
+            parsed_evidence,
+            graph_health,
+            source_current=True,
+            projection_current=True,
+            coverage_complete=(unapproved_skips == 0 and skipped_count == 0),
+            artifacts_bound=True,
+        )
+        impact_trust = trust.level
+        impact_limitations = trust.limitations
+        ownership: dict[str, Any] = {
+            "schema_version": 2,
+            "artifact_schema_version": 2,
+            "project_id": manifest.project_id,
+            "project_uid": str(manifest.project_uid),
+            "graphify_version": contract.version,
+            "adapter_id": contract.adapter_id,
+            "source_digest": staged.source_digest,
+            "projection_digest": parsed_evidence.projection_digest,
+            "extraction_invocation_digest": (
+                parsed_evidence.extraction_invocation_digest
+            ),
+            "evidence_digest": parsed_evidence.digest,
+            "graph_digest": graph_digest,
+            "generation_digest": generation_digest,
+            "build_epoch": build_epoch,
+            "impact_trust": impact_trust,
+            "impact_limitations": list(impact_limitations),
+            "artifacts": {
+                relative.as_posix(): {
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                    "byte_length": len(payload),
+                }
+                for relative, _, payload in artifact_files
+            },
+        }
+        if git_identity is not None:
+            ownership["git_commit_oid"] = git_identity.commit_oid
+            ownership["git_commit_algorithm"] = git_identity.algorithm
+    else:
+        generated_at = datetime.now(timezone.utc).isoformat()
+        relative_files = sorted(
+            (
+                OWNERSHIP_MANIFEST,
+                *(relative.as_posix() for relative, _, _ in artifact_files),
+            )
+        )
+        ownership = {
+            "schema_version": _OWNERSHIP_SCHEMA_VERSION,
+            "project_id": manifest.project_id,
+            "graphify_version": contract.version,
+            "source_digest": staged.source_digest,
+            "graph_digest": graph_digest,
+            "artifact_digests": artifact_digests,
+            "generated_at": generated_at,
+            "files": relative_files,
+            "skipped_count": skipped_count,
+            "unapproved_skips": unapproved_skips,
+            "impact_analysis_trusted": False,
+        }
     ownership_path = root / OWNERSHIP_MANIFEST
     ownership_payload = _json_payload(ownership)
     _write_new_json(ownership_path, ownership)
@@ -288,11 +455,515 @@ def validate_candidate(
         edge_count=len(edges),
         skipped_count=skipped_count,
         unapproved_skips=unapproved_skips,
-        impact_analysis_trusted=False,
+        artifact_schema_version=artifact_schema_version,
+        project_uid=(manifest.project_uid if artifact_schema_version == 2 else None),
+        adapter_id=(contract.adapter_id if artifact_schema_version == 2 else None),
+        projection_digest=(
+            None if parsed_evidence is None else parsed_evidence.projection_digest
+        ),
+        evidence_digest=None if parsed_evidence is None else parsed_evidence.digest,
+        extraction_invocation_digest=(
+            None
+            if parsed_evidence is None
+            else parsed_evidence.extraction_invocation_digest
+        ),
+        generation_digest=generation_digest,
+        impact_trust=impact_trust,
+        impact_limitations=impact_limitations,
+        build_epoch=build_epoch,
+        git_identity=git_identity,
     )
     evidence = _ValidationEvidence(validated, expected_snapshot)
     _VALIDATED_IN_PROCESS[id(validated)] = evidence
     return validated
+
+
+def _require_digest(value: object, description: str) -> str:
+    if type(value) is not str or _HEX_DIGEST.fullmatch(value) is None:
+        raise ArtifactValidationError(f"{description} is invalid")
+    return value
+
+
+def _require_positive_epoch(value: object) -> int:
+    if type(value) is not int or value < 1:
+        raise ArtifactValidationError("build epoch is invalid")
+    return value
+
+
+def _validate_git_identity(value: object) -> GitIdentity | None:
+    if value is None:
+        return None
+    if type(value) is not GitIdentity:
+        raise ArtifactValidationError("Git identity is invalid")
+    pattern = _GIT_OID.get(value.algorithm)
+    if pattern is None or type(value.commit_oid) is not str or pattern.fullmatch(
+        value.commit_oid
+    ) is None:
+        raise ArtifactValidationError("Git identity is invalid")
+    return value
+
+
+def _validate_graph_evidence_bindings(
+    document: Mapping[str, Any],
+    evidence: GraphEvidence,
+    source_digest: str,
+    projection_digest: str,
+    integrity: GraphIntegrity,
+    semantics: GraphSemantics,
+) -> None:
+    if (
+        evidence.source_digest != source_digest
+        or evidence.projection_digest != projection_digest
+        or evidence.extraction_invocation_digest != evidence.invocation.digest
+        or evidence.final_integrity != integrity
+    ):
+        raise ArtifactValidationError("graph evidence binding mismatch")
+    _require_identity(
+        document,
+        "extraction_invocation_digest",
+        evidence.extraction_invocation_digest,
+        "extraction invocation digest mismatch",
+    )
+    try:
+        computed = validate_final_graph(document, semantics)
+        evidence_index = index_final_edge_evidence(evidence)
+    except (IntegrityError, EvidenceError) as error:
+        raise ArtifactValidationError("graph evidence final edge mismatch") from error
+    if computed != integrity:
+        raise ArtifactValidationError("graph evidence integrity mismatch")
+    member = "links" if "links" in document else "edges"
+    actual: dict[str, tuple[object, ...]] = {}
+    for edge in document[member]:
+        identifier = edge.get("atlasweaver_edge_id")
+        line, column = _edge_source_coordinates(edge)
+        actual[identifier] = (
+            edge.get(semantics.source_field),
+            edge.get(semantics.target_field),
+            edge.get("relation"),
+            edge.get("confidence"),
+            edge.get("source_file"),
+            line,
+            column,
+        )
+    expected = {
+        identifier: (
+            item.source,
+            item.target,
+            item.relation,
+            item.confidence,
+            None if item.source_file is None else item.source_file.as_posix(),
+            item.source_line,
+            item.source_column,
+        )
+        for identifier, item in evidence_index.items()
+    }
+    if actual != expected:
+        raise ArtifactValidationError("graph evidence final edge mismatch")
+
+
+def _edge_source_coordinates(edge: Mapping[str, Any]) -> tuple[object, object]:
+    location = edge.get("source_location")
+    if isinstance(location, str):
+        match = re.fullmatch(r"L?([1-9][0-9]*)(?::([1-9][0-9]*))?", location)
+        if match is None:
+            raise ArtifactValidationError("graph evidence final edge mismatch")
+        return int(match.group(1)), (
+            None if match.group(2) is None else int(match.group(2))
+        )
+    return edge.get("source_line"), edge.get("source_column")
+
+
+def validate_owned_graph(
+    root: Path,
+    manifest: ProjectManifest,
+    *,
+    expected_source_digest: str | None = None,
+    expected_projection_digest: str | None = None,
+    repository_access: RepositoryAccess | None = None,
+) -> ValidatedGraph:
+    """Read and revalidate a complete ownership-bound live graph tree."""
+    owned_root = _require_candidate_directory(root)
+    if repository_access is not None:
+        repository_root = _path_for_open_directory(repository_access.descriptor)
+        if repository_access.identity != (
+            os.fstat(repository_access.descriptor).st_dev,
+            os.fstat(repository_access.descriptor).st_ino,
+        ) or owned_root != (repository_root / manifest.output_dir).absolute():
+            raise ArtifactValidationError("owned graph repository authority mismatch")
+    ownership_path = owned_root / OWNERSHIP_MANIFEST
+    _require_regular_file(ownership_path, "ownership manifest")
+    ownership_payload = _read_regular_bytes(ownership_path)
+    if len(ownership_payload) > 1_048_576:
+        raise ArtifactValidationError("ownership manifest exceeds size cap")
+    ownership = _load_graph_json(ownership_payload)
+    schema = ownership.get("schema_version")
+    captured = _capture_candidate(owned_root)
+    initial_snapshot = tuple(
+        (relative, hashlib.sha256(payload).hexdigest())
+        for relative, _, payload in captured
+    )
+    try:
+        contract = resolve_graphify_compatibility(manifest.graphify_version)
+    except CompatibilityError as error:
+        raise ArtifactValidationError(str(error)) from error
+    if schema == 2:
+        validated = _validate_owned_schema2(
+            owned_root,
+            captured,
+            ownership,
+            manifest,
+            contract,
+            expected_source_digest=expected_source_digest,
+            expected_projection_digest=expected_projection_digest,
+        )
+    elif schema == 1:
+        validated = _validate_owned_schema1(
+            owned_root,
+            captured,
+            ownership,
+            manifest,
+            contract,
+            expected_source_digest=expected_source_digest,
+        )
+    else:
+        raise ArtifactValidationError("ownership schema version is invalid")
+    if _snapshot(owned_root) != initial_snapshot:
+        raise ArtifactValidationError("owned graph changed during validation")
+    return validated
+
+
+def _validate_owned_schema2(
+    root: Path,
+    captured: tuple[tuple[PurePosixPath, Path, bytes], ...],
+    ownership: Mapping[str, Any],
+    manifest: ProjectManifest,
+    contract: Any,
+    *,
+    expected_source_digest: str | None,
+    expected_projection_digest: str | None,
+) -> ValidatedGraph:
+    base_keys = {
+        "schema_version",
+        "artifact_schema_version",
+        "project_id",
+        "project_uid",
+        "graphify_version",
+        "adapter_id",
+        "source_digest",
+        "projection_digest",
+        "extraction_invocation_digest",
+        "evidence_digest",
+        "graph_digest",
+        "generation_digest",
+        "build_epoch",
+        "impact_trust",
+        "impact_limitations",
+        "artifacts",
+    }
+    git_keys = {"git_commit_oid", "git_commit_algorithm"}
+    if frozenset(ownership) not in {
+        frozenset(base_keys),
+        frozenset(base_keys | git_keys),
+    }:
+        raise ArtifactValidationError("ownership schema 2 is invalid")
+    if (
+        ownership["artifact_schema_version"] != 2
+        or manifest.project_uid is None
+        or ownership["project_id"] != manifest.project_id
+        or ownership["project_uid"] != str(manifest.project_uid)
+        or ownership["graphify_version"] != contract.version
+        or ownership["adapter_id"] != contract.adapter_id
+    ):
+        raise ArtifactValidationError("ownership identity mismatch")
+    source_digest = _require_digest(ownership["source_digest"], "source digest")
+    projection_digest = _require_digest(
+        ownership["projection_digest"], "projection digest"
+    )
+    evidence_digest = _require_digest(ownership["evidence_digest"], "evidence digest")
+    invocation_digest = _require_digest(
+        ownership["extraction_invocation_digest"], "extraction invocation digest"
+    )
+    graph_digest = _require_digest(ownership["graph_digest"], "graph digest")
+    generation_digest = _require_digest(
+        ownership["generation_digest"], "generation digest"
+    )
+    build_epoch = _require_positive_epoch(ownership["build_epoch"])
+    git_identity = _ownership_git_identity(ownership)
+    artifacts = ownership["artifacts"]
+    if not isinstance(artifacts, dict):
+        raise ArtifactValidationError("ownership artifacts are invalid")
+    allowed = {
+        "graph.json",
+        "GRAPH_REPORT.md",
+        "GRAPH_EVIDENCE.json",
+        *(("graph.html",) if manifest.track_html else ()),
+    }
+    if set(artifacts) != allowed or OWNERSHIP_MANIFEST in artifacts:
+        raise ArtifactValidationError("ownership artifact set is invalid")
+    by_path = {relative.as_posix(): payload for relative, _, payload in captured}
+    if set(by_path) != allowed | {OWNERSHIP_MANIFEST}:
+        raise ArtifactValidationError("owned graph artifact set is invalid")
+    artifact_payloads: list[tuple[PurePosixPath, bytes]] = []
+    for relative in sorted(allowed):
+        descriptor = artifacts[relative]
+        if not isinstance(descriptor, dict) or set(descriptor) != {
+            "sha256",
+            "byte_length",
+        }:
+            raise ArtifactValidationError("ownership artifact descriptor is invalid")
+        payload = by_path[relative]
+        expected_digest = _require_digest(
+            descriptor["sha256"], "artifact digest"
+        )
+        if (
+            type(descriptor["byte_length"]) is not int
+            or descriptor["byte_length"] < 0
+        ):
+            raise ArtifactValidationError("artifact length is invalid")
+        if hashlib.sha256(payload).hexdigest() != expected_digest:
+            raise ArtifactValidationError("artifact digest mismatch")
+        if len(payload) != descriptor["byte_length"]:
+            raise ArtifactValidationError("artifact length mismatch")
+        artifact_payloads.append((PurePosixPath(relative), payload))
+    if _generation_digest(tuple(artifact_payloads)) != generation_digest:
+        raise ArtifactValidationError("generation digest mismatch")
+    graph_bytes = by_path["graph.json"]
+    if hashlib.sha256(graph_bytes).hexdigest() != graph_digest:
+        raise ArtifactValidationError("graph digest mismatch")
+    document = _load_graph_json(graph_bytes)
+    staged = _owned_staged(document, root, source_digest, projection_digest)
+    excludes = effective_excludes(manifest)
+    _require_schema2_graph_identity(
+        document, manifest, contract, source_digest, projection_digest,
+        evidence_digest, invocation_digest,
+    )
+    nodes, edges = _validate_graph_shape(document, staged, excludes)
+    integrity = _validate_graph_health(
+        document,
+        nodes,
+        edges,
+        semantics=contract.semantics,
+        collapsed_evidence_available=contract.evidence.pre_dedup_occurrences,
+    )
+    skipped_count, unapproved_skips = _validate_extraction_coverage(
+        document, nodes, edges, staged
+    )
+    try:
+        evidence = parse_graph_evidence(
+            by_path["GRAPH_EVIDENCE.json"], contract, expected_digest=evidence_digest
+        )
+    except EvidenceError as error:
+        raise ArtifactValidationError("graph evidence is invalid") from error
+    _validate_graph_evidence_bindings(
+        document,
+        evidence,
+        source_digest,
+        projection_digest,
+        integrity,
+        contract.semantics,
+    )
+    generated = decide_impact_trust(
+        evidence,
+        integrity,
+        source_current=True,
+        projection_current=True,
+        coverage_complete=(unapproved_skips == 0 and skipped_count == 0),
+        artifacts_bound=True,
+    )
+    limitations = ownership["impact_limitations"]
+    if (
+        ownership["impact_trust"] != generated.level
+        or not isinstance(limitations, list)
+        or tuple(limitations) != generated.limitations
+    ):
+        raise ArtifactValidationError("ownership impact trust mismatch")
+    _validate_owned_text(captured, manifest, staged)
+    source_state = _currency(expected_source_digest, source_digest, "source digest")
+    projection_state = _currency(
+        expected_projection_digest, projection_digest, "projection digest"
+    )
+    current = decide_impact_trust(
+        evidence,
+        integrity,
+        source_current=source_state,
+        projection_current=projection_state,
+        coverage_complete=(unapproved_skips == 0 and skipped_count == 0),
+        artifacts_bound=True,
+    )
+    return ValidatedGraph(
+        root=root,
+        source_digest=source_digest,
+        graph_digest=graph_digest,
+        node_count=len(nodes),
+        edge_count=len(edges),
+        skipped_count=skipped_count,
+        unapproved_skips=unapproved_skips,
+        artifact_schema_version=2,
+        project_uid=manifest.project_uid,
+        adapter_id=contract.adapter_id,
+        projection_digest=projection_digest,
+        evidence_digest=evidence_digest,
+        extraction_invocation_digest=invocation_digest,
+        generation_digest=generation_digest,
+        impact_trust=current.level,
+        impact_limitations=current.limitations,
+        build_epoch=build_epoch,
+        git_identity=git_identity,
+    )
+
+
+def _validate_owned_schema1(
+    root: Path,
+    captured: tuple[tuple[PurePosixPath, Path, bytes], ...],
+    ownership: Mapping[str, Any],
+    manifest: ProjectManifest,
+    contract: Any,
+    *,
+    expected_source_digest: str | None,
+) -> ValidatedGraph:
+    required = {
+        "schema_version", "project_id", "graphify_version", "source_digest",
+        "graph_digest", "artifact_digests", "generated_at", "files",
+        "skipped_count", "unapproved_skips", "impact_analysis_trusted",
+    }
+    if set(ownership) != required:
+        raise ArtifactValidationError("legacy ownership schema is invalid")
+    source_digest = _require_digest(ownership["source_digest"], "source digest")
+    graph_digest = _require_digest(ownership["graph_digest"], "graph digest")
+    if (
+        ownership["project_id"] != manifest.project_id
+        or ownership["graphify_version"] != contract.version
+        or ownership["impact_analysis_trusted"] is not False
+    ):
+        raise ArtifactValidationError("legacy ownership identity mismatch")
+    artifact_digests = ownership["artifact_digests"]
+    files = ownership["files"]
+    if not isinstance(artifact_digests, dict) or not isinstance(files, list):
+        raise ArtifactValidationError("legacy ownership artifacts are invalid")
+    by_path = {relative.as_posix(): payload for relative, _, payload in captured}
+    if sorted(by_path) != files or set(artifact_digests) != set(by_path) - {
+        OWNERSHIP_MANIFEST
+    }:
+        raise ArtifactValidationError("legacy ownership artifact set is invalid")
+    artifact_payloads: list[tuple[PurePosixPath, bytes]] = []
+    for relative, expected in artifact_digests.items():
+        expected = _require_digest(expected, "artifact digest")
+        payload = by_path.get(relative)
+        if payload is None or hashlib.sha256(payload).hexdigest() != expected:
+            raise ArtifactValidationError("artifact digest mismatch")
+        artifact_payloads.append((PurePosixPath(relative), payload))
+    graph_bytes = by_path["graph.json"]
+    if hashlib.sha256(graph_bytes).hexdigest() != graph_digest:
+        raise ArtifactValidationError("graph digest mismatch")
+    document = _load_graph_json(graph_bytes)
+    staged = _owned_staged(document, root, source_digest, None)
+    excludes = effective_excludes(manifest)
+    _require_identity(document, "project_id", manifest.project_id, "project ID mismatch")
+    _require_identity(document, "graphify_version", contract.version, "Graphify version mismatch")
+    _require_identity(document, "source_digest", source_digest, "source digest mismatch")
+    nodes, edges = _validate_graph_shape(document, staged, excludes)
+    _validate_graph_health(
+        document, nodes, edges, semantics=contract.semantics,
+        collapsed_evidence_available=contract.evidence.pre_dedup_occurrences,
+    )
+    skipped, unapproved = _validate_extraction_coverage(document, nodes, edges, staged)
+    _validate_owned_text(captured, manifest, staged)
+    limitations = {"legacy_artifact_schema", "projection_digest_unverified"}
+    if expected_source_digest is None:
+        limitations.add("source_digest_unverified")
+    elif _require_digest(expected_source_digest, "expected source digest") != source_digest:
+        limitations.add("source_digest_stale")
+    return ValidatedGraph(
+        root=root, source_digest=source_digest, graph_digest=graph_digest,
+        node_count=len(nodes), edge_count=len(edges), skipped_count=skipped,
+        unapproved_skips=unapproved,
+        generation_digest=_generation_digest(tuple(artifact_payloads)),
+        impact_limitations=tuple(sorted(limitations)),
+    )
+
+
+def _require_schema2_graph_identity(
+    document: Mapping[str, Any], manifest: ProjectManifest, contract: Any,
+    source_digest: str, projection_digest: str, evidence_digest: str,
+    invocation_digest: str,
+) -> None:
+    if document.get("artifact_schema_version") != 2:
+        raise ArtifactValidationError("artifact schema version mismatch")
+    for forbidden in ("impact_trust", "impact_limitations", "impact_analysis_trusted"):
+        if _identity_values(document, forbidden):
+            raise ArtifactValidationError("graph contains forged impact trust")
+    for field, expected, message in (
+        ("project_id", manifest.project_id, "project ID mismatch"),
+        ("graphify_version", contract.version, "Graphify version mismatch"),
+        ("source_digest", source_digest, "source digest mismatch"),
+        ("projection_digest", projection_digest, "projection digest mismatch"),
+        ("evidence_digest", evidence_digest, "evidence digest mismatch"),
+        ("extraction_invocation_digest", invocation_digest, "extraction invocation digest mismatch"),
+    ):
+        _require_identity(document, field, expected, message)
+
+
+def _ownership_git_identity(ownership: Mapping[str, Any]) -> GitIdentity | None:
+    has_oid = "git_commit_oid" in ownership
+    has_algorithm = "git_commit_algorithm" in ownership
+    if has_oid != has_algorithm:
+        raise ArtifactValidationError("Git identity is invalid")
+    if not has_oid:
+        return None
+    return _validate_git_identity(
+        GitIdentity(ownership["git_commit_oid"], ownership["git_commit_algorithm"])
+    )
+
+
+def _owned_staged(
+    document: Mapping[str, Any], root: Path, source_digest: str,
+    projection_digest: str | None,
+) -> StagedInput:
+    coverage = document.get("extraction_coverage")
+    if not isinstance(coverage, Mapping):
+        raise ArtifactValidationError("graph extraction coverage is missing or invalid")
+    represented = coverage.get("represented_source_paths")
+    skipped = coverage.get("skipped")
+    if not isinstance(represented, list) or not isinstance(skipped, list):
+        raise ArtifactValidationError("graph extraction coverage lists are invalid")
+    paths: list[PurePosixPath] = []
+    for value in represented:
+        if type(value) is not str:
+            raise ArtifactValidationError("graph extraction coverage lists are invalid")
+        paths.append(PurePosixPath(value))
+    for item in skipped:
+        if not isinstance(item, Mapping) or type(item.get("path")) is not str:
+            raise ArtifactValidationError("skipped source coverage entry is invalid")
+        paths.append(PurePosixPath(item["path"]))
+    return StagedInput(root, source_digest, tuple(sorted(paths)), projection_digest)
+
+
+def _validate_owned_text(
+    captured: tuple[tuple[PurePosixPath, Path, bytes], ...],
+    manifest: ProjectManifest,
+    staged: StagedInput,
+) -> None:
+    excludes = effective_excludes(manifest)
+    staged_files = frozenset(staged.files)
+    for relative, _, payload in captured:
+        if relative in {
+            PurePosixPath(OWNERSHIP_MANIFEST),
+            PurePosixPath("GRAPH_EVIDENCE.json"),
+        }:
+            continue
+        try:
+            text = payload.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ArtifactValidationError("candidate artifacts must be UTF-8 text") from error
+        if _CONFLICT_MARKER.search(text):
+            raise ArtifactValidationError(f"conflict marker in {relative.as_posix()}")
+        _reject_text_path_leaks(text, excludes, staged_files)
+
+
+def _currency(expected: str | None, actual: str, description: str) -> bool | None:
+    if expected is None:
+        return None
+    return _require_digest(expected, f"expected {description}") == actual
 
 
 def promote_graph(
@@ -410,8 +1081,16 @@ def _promote_graph_locked(candidate, evidence, root, target, stage, backup, jour
         repo_root=root,
         fs=fs,
     )
-    if _owned_target_digest(target) == candidate.graph_digest:
-        return PromotionResult(target, backup, candidate.graph_digest, False)
+    installed = _owned_target_identity(target)
+    if installed is not None and installed[1] == candidate.generation_digest:
+        return PromotionResult(
+            target=target,
+            backup=backup,
+            digest=installed[0],
+            generation_digest=installed[1],
+            build_epoch=installed[2],
+            changed=False,
+        )
     if backup.exists() or backup.is_symlink():
         raise ArtifactValidationError("rollback destination already exists")
     if stage.exists() or stage.is_symlink():
@@ -459,7 +1138,16 @@ def _promote_graph_locked(candidate, evidence, root, target, stage, backup, jour
             ) from rollback_error
         raise error
 
-    return PromotionResult(target=target, backup=backup, digest=candidate.graph_digest)
+    installed = _owned_target_identity(target)
+    if installed is None or installed[1] != candidate.generation_digest:
+        raise ArtifactValidationError("promoted graph ownership is invalid")
+    return PromotionResult(
+        target=target,
+        backup=backup,
+        digest=installed[0],
+        generation_digest=installed[1],
+        build_epoch=installed[2],
+    )
 
 
 def _require_candidate_directory(path: Path) -> Path:
@@ -1320,40 +2008,81 @@ def _recover_interrupted(
 
 
 def _owned_target_digest(target: Path) -> str | None:
+    identity = _owned_target_identity(target)
+    return None if identity is None else identity[0]
+
+
+def _owned_target_identity(target: Path) -> tuple[str, str, int | None] | None:
     manifest_path = target / OWNERSHIP_MANIFEST
     try:
-        document = json.loads(_read_regular_bytes(manifest_path))
+        document = _load_graph_json(_read_regular_bytes(manifest_path))
     except (OSError, ValueError, ArtifactValidationError):
         return None
-    if not isinstance(document, dict):
-        return None
     value = document.get("graph_digest")
-    files = document.get("files")
-    artifact_digests = document.get("artifact_digests")
-    if (
-        not isinstance(value, str)
-        or not isinstance(files, list)
-        or not isinstance(artifact_digests, dict)
-    ):
+    if type(value) is not str or _HEX_DIGEST.fullmatch(value) is None:
         return None
     try:
-        actual = sorted(path.relative_to(target).as_posix() for path in target.rglob("*") if path.is_file())
-        expected_artifacts = sorted(path for path in files if path != OWNERSHIP_MANIFEST)
-        if actual != files or sorted(artifact_digests) != expected_artifacts:
-            return None
-        for relative, expected_digest in artifact_digests.items():
+        captured = _capture_candidate(target)
+        by_path = {relative.as_posix(): payload for relative, _, payload in captured}
+        if document.get("schema_version") == 2:
+            artifacts = document.get("artifacts")
+            generation = document.get("generation_digest")
+            epoch = document.get("build_epoch")
             if (
-                not isinstance(relative, str)
-                or not isinstance(expected_digest, str)
-                or hashlib.sha256(_read_regular_bytes(target / relative)).hexdigest()
-                != expected_digest
+                not isinstance(artifacts, dict)
+                or type(generation) is not str
+                or _HEX_DIGEST.fullmatch(generation) is None
+                or type(epoch) is not int
+                or epoch < 1
+                or set(by_path) != set(artifacts) | {OWNERSHIP_MANIFEST}
             ):
                 return None
+            payloads: list[tuple[PurePosixPath, bytes]] = []
+            for relative, descriptor in artifacts.items():
+                if not isinstance(descriptor, dict) or set(descriptor) != {
+                    "sha256",
+                    "byte_length",
+                }:
+                    return None
+                payload = by_path.get(relative)
+                if (
+                    payload is None
+                    or type(descriptor["sha256"]) is not str
+                    or hashlib.sha256(payload).hexdigest() != descriptor["sha256"]
+                    or type(descriptor["byte_length"]) is not int
+                    or len(payload) != descriptor["byte_length"]
+                ):
+                    return None
+                payloads.append((PurePosixPath(relative), payload))
+            if (
+                hashlib.sha256(by_path["graph.json"]).hexdigest() != value
+                or _generation_digest(tuple(payloads)) != generation
+            ):
+                return None
+            return value, generation, epoch
+
+        files = document.get("files")
+        artifact_digests = document.get("artifact_digests")
+        if not isinstance(files, list) or not isinstance(artifact_digests, dict):
+            return None
+        expected_artifacts = sorted(path for path in files if path != OWNERSHIP_MANIFEST)
+        if sorted(by_path) != files or sorted(artifact_digests) != expected_artifacts:
+            return None
+        payloads = []
+        for relative, expected_digest in artifact_digests.items():
+            payload = by_path.get(relative)
+            if (
+                type(expected_digest) is not str
+                or payload is None
+                or hashlib.sha256(payload).hexdigest() != expected_digest
+            ):
+                return None
+            payloads.append((PurePosixPath(relative), payload))
         if artifact_digests.get("graph.json") != value:
             return None
-    except OSError:
+        return value, _generation_digest(tuple(payloads)), None
+    except (OSError, ArtifactValidationError, KeyError):
         return None
-    return value
 
 
 def _rollback_transaction(

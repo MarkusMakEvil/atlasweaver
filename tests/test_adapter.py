@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path, PurePosixPath
 import os
 
@@ -8,8 +9,10 @@ import pytest
 
 from project_knowledge.adapter import AdapterError, adapt_candidate
 from project_knowledge.artifacts import validate_candidate
-from project_knowledge.models import ProjectManifest
+from project_knowledge.models import ProjectManifest, ProjectionFile
 from project_knowledge.staging import StagedInput
+from tests.support import manifest_v2
+from tests.test_evidence import build_fixture_evidence, fixture_pipeline
 
 
 def manifest(*, track_html: bool = False) -> ProjectManifest:
@@ -65,6 +68,86 @@ def raw_candidate(root: Path, **graph_updates: object) -> Path:
     (root / "cache").mkdir()
     (root / "cache/ignored").write_text("runtime\n", encoding="utf-8")
     return root
+
+
+def evidenced_inputs(tmp_path: Path):
+    evidence = build_fixture_evidence()
+    pipeline = fixture_pipeline()
+    raw = tmp_path / "raw-evidenced"
+    raw.mkdir()
+    (raw / "graph.json").write_bytes(pipeline[4].payload)
+    (raw / "GRAPH_REPORT.md").write_bytes(b"# Graph report\n")
+    stage_root = tmp_path / "stage-evidenced"
+    stage_root.mkdir()
+    source_payload = b"def fixture():\n    return 1\n"
+    (stage_root / "fixture.py").write_bytes(source_payload)
+    stage = StagedInput(
+        root=stage_root,
+        source_digest=evidence.source_digest,
+        files=(PurePosixPath("fixture.py"),),
+        projection_digest=evidence.projection_digest,
+        reason_counts=(("allow:ordinary_source", 1),),
+        projection_files=(
+            ProjectionFile(
+                PurePosixPath("fixture.py"),
+                hashlib.sha256(source_payload).hexdigest(),
+                len(source_payload),
+            ),
+        ),
+    )
+    return raw, stage, manifest_v2(include_roots=(PurePosixPath("fixture.py"),)), evidence
+
+
+def test_evidenced_adapter_writes_schema2_graph_evidence_and_report(
+    tmp_path: Path,
+) -> None:
+    raw, stage, selected_manifest, evidence = evidenced_inputs(tmp_path)
+    destination = tmp_path / "adapted-evidenced"
+
+    result = adapt_candidate(
+        raw,
+        destination,
+        stage,
+        selected_manifest,
+        evidence=evidence,
+    )
+
+    assert result.artifact_schema_version == 2
+    assert result.projection_digest == evidence.projection_digest
+    assert result.evidence_digest == evidence.digest
+    assert result.extraction_invocation_digest == evidence.extraction_invocation_digest
+    assert len(result.generation_digest) == 64
+    assert (result.root / "GRAPH_EVIDENCE.json").read_bytes() == evidence.payload
+    document = json.loads((result.root / "graph.json").read_text())
+    assert document["artifact_schema_version"] == 2
+    assert document["projection_digest"] == evidence.projection_digest
+    assert document["evidence_digest"] == evidence.digest
+    assert (
+        document["extraction_invocation_digest"]
+        == evidence.extraction_invocation_digest
+    )
+    assert "impact_trust" not in document
+    assert "impact_limitations" not in document
+    report = (result.root / "GRAPH_REPORT.md").read_text()
+    assert "AtlasWeaver Integrity" in report
+    assert evidence.digest in report
+    assert "/Users/" not in report
+
+
+def test_evidenced_adaptation_is_byte_deterministic(tmp_path: Path) -> None:
+    raw, stage, selected_manifest, evidence = evidenced_inputs(tmp_path)
+
+    first = adapt_candidate(
+        raw, tmp_path / "first", stage, selected_manifest, evidence=evidence
+    )
+    second = adapt_candidate(
+        raw, tmp_path / "second", stage, selected_manifest, evidence=evidence
+    )
+
+    assert first.generation_digest == second.generation_digest
+    assert {
+        path.name: path.read_bytes() for path in first.root.iterdir()
+    } == {path.name: path.read_bytes() for path in second.root.iterdir()}
 
 
 def test_adapter_enriches_native_graph_without_mutating_raw_candidate(

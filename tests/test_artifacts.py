@@ -15,10 +15,13 @@ from project_knowledge.artifacts import (
     OWNERSHIP_MANIFEST,
     ArtifactValidationError,
     FileSystem,
+    GitIdentity,
     ValidatedGraph,
     promote_graph,
     validate_candidate,
+    validate_owned_graph,
 )
+from project_knowledge.adapter import adapt_candidate
 from project_knowledge.locking import (
     TransactionLockError,
     capture_lifecycle_repository,
@@ -28,6 +31,7 @@ from project_knowledge.compatibility import production_graphify_compatibility
 from project_knowledge.integrity import analyze_graph
 from project_knowledge.models import ProjectManifest
 from project_knowledge.staging import StagedInput
+from tests.test_adapter import evidenced_inputs
 
 
 @pytest.fixture
@@ -202,6 +206,98 @@ def test_candidate_rejects_claimed_collapsed_edge_evidence_for_graphify_0948(
 
 def load_ownership(root: Path) -> dict[str, object]:
     return json.loads((root / OWNERSHIP_MANIFEST).read_text(encoding="utf-8"))
+
+
+def test_schema2_validation_writes_non_circular_evidence_ownership(
+    tmp_path: Path,
+) -> None:
+    raw, staged_input, selected_manifest, evidence = evidenced_inputs(tmp_path)
+    adapted = adapt_candidate(
+        raw, tmp_path / "adapted-schema2", staged_input, selected_manifest,
+        evidence=evidence,
+    )
+    before_graph = (adapted.root / "graph.json").read_bytes()
+
+    validated = validate_candidate(
+        adapted.root,
+        staged_input,
+        selected_manifest,
+        expected_projection_digest=evidence.projection_digest,
+        expected_evidence_digest=evidence.digest,
+        build_epoch=7,
+        git_identity=GitIdentity(commit_oid="a" * 40, algorithm="sha1"),
+    )
+
+    ownership = load_ownership(adapted.root)
+    assert (adapted.root / "graph.json").read_bytes() == before_graph
+    assert validated.artifact_schema_version == 2
+    assert validated.generation_digest == adapted.generation_digest
+    assert validated.impact_trust == "navigation"
+    assert ownership["schema_version"] == 2
+    assert ownership["project_uid"] == str(selected_manifest.project_uid)
+    assert ownership["build_epoch"] == 7
+    assert ownership["generation_digest"] == adapted.generation_digest
+    assert ownership["git_commit_oid"] == "a" * 40
+    assert ownership["git_commit_algorithm"] == "sha1"
+    assert OWNERSHIP_MANIFEST not in ownership["artifacts"]
+    assert ownership["artifacts"]["GRAPH_EVIDENCE.json"] == {
+        "sha256": evidence.digest,
+        "byte_length": (adapted.root / "GRAPH_EVIDENCE.json").stat().st_size,
+    }
+    assert "generated_at" not in ownership
+
+
+@pytest.mark.parametrize("build_epoch", [None, 0, -1, True, 1.5])
+def test_schema2_validation_requires_positive_exact_build_epoch(
+    tmp_path: Path, build_epoch: object
+) -> None:
+    raw, staged_input, selected_manifest, evidence = evidenced_inputs(tmp_path)
+    adapted = adapt_candidate(
+        raw, tmp_path / "adapted-schema2", staged_input, selected_manifest,
+        evidence=evidence,
+    )
+
+    with pytest.raises(ArtifactValidationError, match="build epoch"):
+        validate_candidate(
+            adapted.root,
+            staged_input,
+            selected_manifest,
+            expected_projection_digest=evidence.projection_digest,
+            expected_evidence_digest=evidence.digest,
+            build_epoch=build_epoch,  # type: ignore[arg-type]
+        )
+
+
+def test_owned_schema2_graph_recomputes_every_bound_artifact(tmp_path: Path) -> None:
+    raw, staged_input, selected_manifest, evidence = evidenced_inputs(tmp_path)
+    adapted = adapt_candidate(
+        raw, tmp_path / "adapted-schema2", staged_input, selected_manifest,
+        evidence=evidence,
+    )
+    validated = validate_candidate(
+        adapted.root,
+        staged_input,
+        selected_manifest,
+        expected_projection_digest=evidence.projection_digest,
+        expected_evidence_digest=evidence.digest,
+        build_epoch=7,
+    )
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    promote_with_lifecycle(validated, repo)
+
+    owned = validate_owned_graph(
+        repo / "graphify-out",
+        selected_manifest,
+        expected_source_digest=evidence.source_digest,
+        expected_projection_digest=evidence.projection_digest,
+    )
+    assert owned.generation_digest == validated.generation_digest
+    assert owned.build_epoch == 7
+
+    (repo / "graphify-out/GRAPH_EVIDENCE.json").write_bytes(b"{}\n")
+    with pytest.raises(ArtifactValidationError, match="artifact digest mismatch"):
+        validate_owned_graph(repo / "graphify-out", selected_manifest)
 
 
 def test_valid_candidate_is_bound_to_project_version_and_staged_source(

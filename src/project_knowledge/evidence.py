@@ -9,6 +9,7 @@ import json
 import math
 from pathlib import Path, PurePosixPath
 import re
+from types import MappingProxyType
 from typing import Any, Literal
 
 from project_knowledge.adapters import (
@@ -23,7 +24,6 @@ from project_knowledge.compatibility import (
     GraphifyCompatibility,
     RenderedCommand,
     _validate_diagnostic_document,
-    admitted_graphify_environment,
     render_graphify_argv,
     resolve_graphify_compatibility,
     validate_public_model_identifier,
@@ -69,6 +69,12 @@ class ArtifactBinding:
 
 
 @dataclass(frozen=True)
+class CommandEnvironmentBinding:
+    operation: Literal["extract", "diagnose", "cluster"]
+    names: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class ExtractionInvocation:
     adapter_id: str
     graphify_version: str
@@ -80,7 +86,7 @@ class ExtractionInvocation:
     configuration_sha256: str
     source_digest: str
     projection_digest: str
-    environment_names: tuple[str, ...]
+    environments: tuple[CommandEnvironmentBinding, ...]
     artifacts: tuple[ArtifactBinding, ...]
     payload: bytes
     digest: str
@@ -150,7 +156,7 @@ def _invocation_document(
     configuration_sha256: str,
     source_digest: str,
     projection_digest: str,
-    environment_names: tuple[str, ...],
+    environments: tuple[CommandEnvironmentBinding, ...],
     artifacts: tuple[ArtifactBinding, ...],
 ) -> dict[str, object]:
     operations = ("extract", "diagnose", "cluster")
@@ -171,7 +177,10 @@ def _invocation_document(
         "configuration_sha256": configuration_sha256,
         "source_digest": source_digest,
         "projection_digest": projection_digest,
-        "environment_names": list(environment_names),
+        "environments": [
+            {"operation": item.operation, "names": list(item.names)}
+            for item in environments
+        ],
         "artifacts": [
             {
                 "path": item.path.as_posix(),
@@ -208,7 +217,7 @@ def _graph_evidence_document(
         configuration_sha256=invocation.configuration_sha256,
         source_digest=invocation.source_digest,
         projection_digest=invocation.projection_digest,
-        environment_names=invocation.environment_names,
+        environments=invocation.environments,
         artifacts=invocation.artifacts,
     )
     return {
@@ -247,7 +256,7 @@ def build_extraction_invocation(
     configuration_sha256: str,
     source_digest: str,
     projection_digest: str,
-    environment_names: tuple[str, ...],
+    environments: tuple[CommandEnvironmentBinding, ...],
     artifacts: tuple[CapturedArtifact, ...],
 ) -> ExtractionInvocation:
     """Bind the complete canonical orchestration without private argv or values."""
@@ -270,7 +279,7 @@ def build_extraction_invocation(
         model=model,
         track_html=track_html,
     )
-    _require_environment_names(contract, backend, environment_names)
+    _require_command_environments(contract, backend, environments)
 
     document = _invocation_document(
         contract,
@@ -282,7 +291,7 @@ def build_extraction_invocation(
         configuration_sha256=configuration_sha256,
         source_digest=source_digest,
         projection_digest=projection_digest,
-        environment_names=environment_names,
+        environments=environments,
         artifacts=bindings,
     )
     payload = _canonical_json(document)
@@ -297,7 +306,7 @@ def build_extraction_invocation(
         configuration_sha256=configuration_sha256,
         source_digest=source_digest,
         projection_digest=projection_digest,
-        environment_names=environment_names,
+        environments=environments,
         artifacts=bindings,
         payload=payload,
         digest=hashlib.sha256(_INVOCATION_DOMAIN + payload).hexdigest(),
@@ -567,6 +576,159 @@ def parse_graph_evidence(
     )
 
 
+def index_final_edge_evidence(
+    evidence: GraphEvidence,
+) -> Mapping[str, FinalEdgeEvidence]:
+    """Expose the immutable, stable-ID evidence join used by affected queries."""
+    if type(evidence) is not GraphEvidence or type(evidence.final_edges) is not tuple:
+        raise EvidenceError("final edge evidence is invalid")
+    index: dict[str, FinalEdgeEvidence] = {}
+    for item in evidence.final_edges:
+        if type(item) is not FinalEdgeEvidence:
+            raise EvidenceError("final edge evidence is invalid")
+        if item.final_edge_id in index:
+            raise EvidenceError("final edge evidence IDs are duplicated")
+        index[item.final_edge_id] = item
+    return MappingProxyType(index)
+
+
+def decide_impact_trust(
+    evidence: GraphEvidence,
+    final_integrity: GraphIntegrity,
+    *,
+    source_current: bool | None,
+    projection_current: bool | None,
+    coverage_complete: bool,
+    artifacts_bound: bool,
+) -> ImpactTrust:
+    """Make the sole evidence-driven impact-authority decision."""
+    if type(evidence) is not GraphEvidence or type(final_integrity) is not GraphIntegrity:
+        raise EvidenceError("impact trust evidence is invalid")
+    if source_current not in {True, False, None} or projection_current not in {
+        True,
+        False,
+        None,
+    }:
+        raise EvidenceError("impact trust currency flag is invalid")
+    if type(coverage_complete) is not bool or type(artifacts_bound) is not bool:
+        raise EvidenceError("impact trust binding flag is invalid")
+    try:
+        contract = resolve_graphify_compatibility(evidence.graphify_version)
+    except CompatibilityError as error:
+        raise EvidenceError("impact trust adapter is invalid") from error
+    if evidence.adapter_id != contract.adapter_id:
+        raise EvidenceError("impact trust adapter is invalid")
+
+    limitations = set(evidence.limitations)
+    if not evidence.evidence_complete:
+        limitations.add("impact_evidence_incomplete")
+    if source_current is False:
+        limitations.add("source_digest_stale")
+    elif source_current is None:
+        limitations.add("source_digest_unverified")
+    if projection_current is False:
+        limitations.add("projection_digest_stale")
+    elif projection_current is None:
+        limitations.add("projection_digest_unverified")
+    if not coverage_complete:
+        limitations.add("scope_coverage_incomplete")
+    if not artifacts_bound:
+        limitations.add("artifact_binding_invalid")
+
+    try:
+        edge_index = index_final_edge_evidence(evidence)
+    except EvidenceError:
+        edge_index = MappingProxyType({})
+        limitations.add("final_edge_evidence_duplicate")
+    final_ids = set(edge_index)
+    if len(final_ids) != final_integrity.edge_count:
+        limitations.add("final_edge_evidence_incomplete")
+    if evidence.final_integrity != final_integrity:
+        limitations.add("final_integrity_mismatch")
+
+    counter_codes = (
+        ("missing_endpoint_edges", "final_missing_endpoint_edges"),
+        ("dangling_endpoint_edges", "final_dangling_endpoint_edges"),
+        ("invalid_self_loop_edges", "final_invalid_self_loop_edges"),
+        ("exact_duplicate_edges", "final_exact_duplicate_edges"),
+        ("conflicting_relation_edges", "final_conflicting_relation_edges"),
+    )
+    for field, code in counter_codes:
+        if getattr(final_integrity, field) != 0:
+            limitations.add(code)
+    if not final_integrity.structurally_valid:
+        limitations.add("final_graph_structurally_invalid")
+    if (
+        type(final_integrity.collapsed_edges) is not int
+        or final_integrity.collapsed_edges < 0
+    ):
+        limitations.add("collapsed_edge_evidence_unavailable")
+
+    if not contract.evidence.pre_dedup_occurrences or evidence.pre_dedup is None:
+        limitations.add("pre_dedup_edge_projection_unavailable")
+    if not contract.evidence.total_transform_lineage:
+        limitations.add("transform_lineage_incomplete")
+    _check_lineage(evidence.pre_dedup, final_ids, limitations)
+    _check_final_edge_provenance(evidence.final_edges, contract, limitations)
+
+    ordered = tuple(sorted(limitations))
+    return ImpactTrust("trusted" if not ordered else "navigation", ordered)
+
+
+def _check_lineage(
+    occurrences: tuple[PreDedupEdgeEvidence, ...] | None,
+    final_ids: set[str],
+    limitations: set[str],
+) -> None:
+    if occurrences is None:
+        return
+    occurrence_ids: set[str] = set()
+    predecessors: set[str] = set()
+    for item in occurrences:
+        if type(item) is not PreDedupEdgeEvidence or item.occurrence_id in occurrence_ids:
+            limitations.add("transform_lineage_incomplete")
+            continue
+        occurrence_ids.add(item.occurrence_id)
+        if item.disposition in {"kept", "rewritten"}:
+            if item.final_edge_id not in final_ids or item.reason is not None:
+                limitations.add("transform_lineage_incomplete")
+            elif item.final_edge_id is not None:
+                predecessors.add(item.final_edge_id)
+        elif item.disposition == "dropped":
+            if item.final_edge_id is not None or not item.reason:
+                limitations.add("transform_lineage_incomplete")
+        else:
+            limitations.add("transform_lineage_incomplete")
+    if predecessors != final_ids:
+        limitations.add("transform_lineage_incomplete")
+
+
+def _check_final_edge_provenance(
+    final_edges: tuple[FinalEdgeEvidence, ...],
+    contract: GraphifyCompatibility,
+    limitations: set[str],
+) -> None:
+    for item in final_edges:
+        try:
+            path_valid = (
+                item.source_file is not None
+                and _confined_path(item.source_file.as_posix()) == item.source_file
+            )
+        except (EvidenceError, AttributeError):
+            path_valid = False
+        confidence_valid = any(
+            type(item.confidence) is type(accepted) and item.confidence == accepted
+            for accepted in contract.semantics.accepted_confidence
+        )
+        if (
+            not confidence_valid
+            or not path_valid
+            or type(item.source_line) is not int
+            or item.source_line < 1
+        ):
+            limitations.add("impact_edge_provenance_incomplete")
+
+
 def _bounded_evidence_payload(payload: bytes) -> bytes:
     if type(payload) is not bytes:
         raise EvidenceError("graph evidence payload must be bytes")
@@ -647,7 +809,7 @@ def _parse_invocation_document(
             "configuration_sha256",
             "source_digest",
             "projection_digest",
-            "environment_names",
+            "environments",
             "artifacts",
         },
         "extraction invocation schema",
@@ -695,10 +857,23 @@ def _parse_invocation_document(
             RenderedCommand(operation, tuple(items), tuple(items))  # type: ignore[arg-type]
         )
 
-    environment_value = value["environment_names"]
+    environment_value = value["environments"]
     if not isinstance(environment_value, list):
-        raise EvidenceError("extraction invocation environment names are invalid")
-    environment_names = tuple(environment_value)
+        raise EvidenceError("extraction invocation environments are invalid")
+    parsed_environments: list[CommandEnvironmentBinding] = []
+    for item in environment_value:
+        _require_exact_keys(
+            item, {"operation", "names"}, "environment binding schema"
+        )
+        assert isinstance(item, Mapping)
+        operation = item["operation"]
+        names = item["names"]
+        if type(operation) is not str or not isinstance(names, list):
+            raise EvidenceError("extraction invocation environments are invalid")
+        parsed_environments.append(
+            CommandEnvironmentBinding(operation, tuple(names))  # type: ignore[arg-type]
+        )
+    environments = tuple(parsed_environments)
 
     artifact_value = value["artifacts"]
     if not isinstance(artifact_value, list):
@@ -734,7 +909,7 @@ def _parse_invocation_document(
         track_html=_HTML_ARTIFACT_PATH in paths,
         validate_actual=False,
     )
-    _require_environment_names(contract, backend, environment_names)
+    _require_command_environments(contract, backend, environments)
 
     document = _invocation_document(
         contract,
@@ -746,7 +921,7 @@ def _parse_invocation_document(
         configuration_sha256=configuration_digest,
         source_digest=source_digest,
         projection_digest=projection_digest,
-        environment_names=environment_names,
+        environments=environments,
         artifacts=tuple(bindings),
     )
     payload = _canonical_json(document)
@@ -762,7 +937,7 @@ def _parse_invocation_document(
         configuration_sha256=configuration_digest,
         source_digest=source_digest,
         projection_digest=projection_digest,
-        environment_names=environment_names,
+        environments=environments,
         artifacts=tuple(bindings),
         payload=payload,
         digest=digest,
@@ -1500,28 +1675,48 @@ def _actual_command_path(value: object) -> Path:
     return Path(value)
 
 
-def _require_environment_names(
+def _require_command_environments(
     contract: GraphifyCompatibility,
     backend: str | None,
-    environment_names: tuple[str, ...],
+    environments: tuple[CommandEnvironmentBinding, ...],
 ) -> None:
+    operations = ("extract", "diagnose", "cluster")
     if (
-        type(environment_names) is not tuple
-        or any(type(name) is not str or not name for name in environment_names)
-        or tuple(sorted(set(environment_names))) != environment_names
+        type(environments) is not tuple
+        or any(type(item) is not CommandEnvironmentBinding for item in environments)
+        or tuple(item.operation for item in environments) != operations
     ):
-        raise EvidenceError("invocation environment names are invalid")
-    candidates = set(_BASE_ENVIRONMENT_NAMES)
-    candidates.update(
-        name for item in contract.backends for name in item.admitted_environment
+        raise EvidenceError("invocation environments are invalid")
+    for item in environments:
+        if (
+            type(item.names) is not tuple
+            or any(type(name) is not str or not name for name in item.names)
+            or tuple(sorted(set(item.names))) != item.names
+        ):
+            raise EvidenceError("invocation environment names are invalid")
+    extract_names, diagnose_names, cluster_names = (
+        item.names for item in environments
     )
-    try:
-        admitted = admitted_graphify_environment(
-            contract, backend, {name: "admitted" for name in candidates}
-        )
-    except CompatibilityError as error:
-        raise EvidenceError("invocation environment names are invalid") from error
-    if not set(environment_names) <= set(admitted):
+    if (
+        diagnose_names != _BASE_ENVIRONMENT_NAMES
+        or cluster_names != _BASE_ENVIRONMENT_NAMES
+    ):
+        raise EvidenceError("invocation local environment names are invalid")
+    if not set(_BASE_ENVIRONMENT_NAMES) <= set(extract_names):
+        raise EvidenceError("invocation environment names are invalid")
+    if backend is None:
+        if extract_names != _BASE_ENVIRONMENT_NAMES:
+            raise EvidenceError("invocation environment names are invalid")
+        return
+    selected = next((item for item in contract.backends if item.name == backend), None)
+    if selected is None:
+        raise EvidenceError("invocation environment names are invalid")
+    backend_names = set(extract_names) - set(_BASE_ENVIRONMENT_NAMES)
+    if not backend_names <= set(selected.admitted_environment):
+        raise EvidenceError("invocation environment names are invalid")
+    if not selected.allows_credentialless and not (
+        backend_names & set(selected.credential_environment)
+    ):
         raise EvidenceError("invocation environment names are invalid")
 
 

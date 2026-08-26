@@ -22,10 +22,13 @@ from project_knowledge.compatibility import (
 )
 from project_knowledge.evidence import (
     GRAPH_EVIDENCE_MAX_BYTES,
+    CommandEnvironmentBinding,
     EvidenceError,
     ExtractionInvocation,
     build_extraction_invocation,
     build_graph_evidence,
+    decide_impact_trust,
+    index_final_edge_evidence,
     parse_graph_evidence,
 )
 from project_knowledge.integrity import GraphIntegrity, canonical_final_edge_id
@@ -111,6 +114,25 @@ def invocation_artifacts(*, track_html: bool = False) -> tuple[CapturedArtifact,
     return items
 
 
+def command_environments(
+    *,
+    extract_names: tuple[str, ...] = (
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "OPENAI_API_KEY",
+        "PATH",
+    ),
+    diagnose_names: tuple[str, ...] = ("HOME", "LANG", "LC_ALL", "PATH"),
+    cluster_names: tuple[str, ...] = ("HOME", "LANG", "LC_ALL", "PATH"),
+) -> tuple[CommandEnvironmentBinding, ...]:
+    return (
+        CommandEnvironmentBinding("extract", extract_names),
+        CommandEnvironmentBinding("diagnose", diagnose_names),
+        CommandEnvironmentBinding("cluster", cluster_names),
+    )
+
+
 def invocation_factory(**overrides: object):
     arguments: dict[str, object] = {
         "executable_sha256": "a" * 64,
@@ -121,7 +143,7 @@ def invocation_factory(**overrides: object):
         "configuration_sha256": "b" * 64,
         "source_digest": "c" * 64,
         "projection_digest": "d" * 64,
-        "environment_names": ("HOME", "LANG", "LC_ALL", "OPENAI_API_KEY", "PATH"),
+        "environments": command_environments(),
         "artifacts": invocation_artifacts(),
     }
     if "commands" not in overrides and (
@@ -169,7 +191,19 @@ def test_invocation_digest_binds_contract_without_private_paths() -> None:
         ("configuration_sha256", "f" * 64),
         ("source_digest", "1" * 64),
         ("projection_digest", "2" * 64),
-        ("environment_names", ("HOME", "PATH")),
+        (
+            "environments",
+            command_environments(
+                extract_names=(
+                    "HOME",
+                    "LANG",
+                    "LC_ALL",
+                    "OPENAI_API_KEY",
+                    "OPENAI_BASE_URL",
+                    "PATH",
+                )
+            ),
+        ),
     ],
 )
 def test_invocation_mutation_changes_digest(field: str, replacement: object) -> None:
@@ -197,9 +231,22 @@ def test_invocation_optional_html_is_bound_to_command_and_artifact() -> None:
             {"artifacts": invocation_artifacts() + (artifact("raw/graph.json"),)},
             "artifact paths",
         ),
-        ({"environment_names": ("PATH", "HOME")}, "environment names"),
         (
-            {"environment_names": ("HOME", "LANG", "LC_ALL", "NOT_ADMITTED", "PATH")},
+            {"environments": command_environments(extract_names=("PATH", "HOME"))},
+            "environment names",
+        ),
+        (
+            {
+                "environments": command_environments(
+                    extract_names=(
+                        "HOME",
+                        "LANG",
+                        "LC_ALL",
+                        "NOT_ADMITTED",
+                        "PATH",
+                    )
+                )
+            },
             "environment names",
         ),
         (
@@ -285,9 +332,63 @@ def test_invocation_rejects_a_spoofed_compatibility_contract() -> None:
             configuration_sha256="b" * 64,
             source_digest="c" * 64,
             projection_digest="d" * 64,
-            environment_names=("HOME", "PATH"),
+            environments=command_environments(),
             artifacts=invocation_artifacts(),
         )
+
+
+def test_invocation_binds_semantic_environment_only_to_extract() -> None:
+    invocation = invocation_factory()
+    document = json.loads(invocation.payload)
+
+    assert document["environments"] == [
+        {
+            "operation": "extract",
+            "names": ["HOME", "LANG", "LC_ALL", "OPENAI_API_KEY", "PATH"],
+        },
+        {"operation": "diagnose", "names": ["HOME", "LANG", "LC_ALL", "PATH"]},
+        {"operation": "cluster", "names": ["HOME", "LANG", "LC_ALL", "PATH"]},
+    ]
+    assert "environment_names" not in document
+
+
+@pytest.mark.parametrize(
+    "environments",
+    [
+        command_environments()[::-1],
+        command_environments(
+            diagnose_names=("HOME", "LANG", "LC_ALL", "OPENAI_API_KEY", "PATH")
+        ),
+        command_environments(
+            cluster_names=("HOME", "LANG", "LC_ALL", "OPENAI_API_KEY", "PATH")
+        ),
+        command_environments(
+            extract_names=("HOME", "LANG", "LC_ALL", "PATH")
+        ),
+    ],
+)
+def test_invocation_rejects_reordered_or_cross_command_environment_names(
+    environments: tuple[CommandEnvironmentBinding, ...],
+) -> None:
+    with pytest.raises(EvidenceError, match="environment"):
+        invocation_factory(environments=environments)
+
+
+def test_invocation_parser_rejects_the_legacy_environment_shape() -> None:
+    invocation = invocation_factory()
+    document = json.loads(invocation.payload)
+    document["environment_names"] = document.pop("environments")[0]["names"]
+    payload = canonical_json(document)
+    forged = replace(
+        invocation,
+        payload=payload,
+        digest=hashlib.sha256(
+            b"atlasweaver-graphify-pipeline-v1\0" + payload
+        ).hexdigest(),
+    )
+
+    with pytest.raises(EvidenceError, match="extraction invocation"):
+        evidence_module._validate_invocation(forged, contract())
 
 
 def test_invocation_rejects_actual_nonpath_tokens_that_disagree_with_canonical() -> None:
@@ -1380,3 +1481,73 @@ def test_builder_rejects_unbound_source_projection_and_artifacts() -> None:
             final_graph=final,
             staged_files=frozenset({PurePosixPath("fixture.py")}),
         )
+
+
+def test_final_edge_evidence_index_is_read_only_and_joinable() -> None:
+    evidence = build_fixture_evidence()
+
+    index = index_final_edge_evidence(evidence)
+
+    assert tuple(index) == tuple(item.final_edge_id for item in evidence.final_edges)
+    graph = json.loads(fixture_pipeline()[5].payload)
+    assert all(edge["atlasweaver_edge_id"] in index for edge in graph["links"])
+    with pytest.raises(TypeError):
+        index["forged"] = evidence.final_edges[0]  # type: ignore[index]
+
+
+def test_final_edge_evidence_index_rejects_duplicate_ids() -> None:
+    evidence = build_fixture_evidence()
+    duplicated = replace(
+        evidence, final_edges=(*evidence.final_edges, evidence.final_edges[0])
+    )
+
+    with pytest.raises(EvidenceError, match="duplicated"):
+        index_final_edge_evidence(duplicated)
+
+
+@pytest.mark.parametrize(
+    ("flags", "limitation"),
+    [
+        ({"source_current": False}, "source_digest_stale"),
+        ({"source_current": None}, "source_digest_unverified"),
+        ({"projection_current": False}, "projection_digest_stale"),
+        ({"projection_current": None}, "projection_digest_unverified"),
+        ({"coverage_complete": False}, "scope_coverage_incomplete"),
+        ({"artifacts_bound": False}, "artifact_binding_invalid"),
+    ],
+)
+def test_external_trust_predicates_have_distinct_stable_limitations(
+    flags: dict[str, object], limitation: str
+) -> None:
+    evidence = build_fixture_evidence()
+    arguments = {
+        "source_current": True,
+        "projection_current": True,
+        "coverage_complete": True,
+        "artifacts_bound": True,
+    }
+    arguments.update(flags)
+
+    trust = decide_impact_trust(
+        evidence, evidence.final_integrity, **arguments  # type: ignore[arg-type]
+    )
+
+    assert trust.level == "navigation"
+    assert limitation in trust.limitations
+    assert trust.limitations == tuple(sorted(set(trust.limitations)))
+
+
+def test_graphify_0948_remains_navigation_only_with_clean_external_flags() -> None:
+    evidence = build_fixture_evidence()
+
+    trust = decide_impact_trust(
+        evidence,
+        evidence.final_integrity,
+        source_current=True,
+        projection_current=True,
+        coverage_complete=True,
+        artifacts_bound=True,
+    )
+
+    assert trust.level == "navigation"
+    assert "pre_dedup_edge_projection_unavailable" in trust.limitations

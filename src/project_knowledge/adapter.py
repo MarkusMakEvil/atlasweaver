@@ -4,15 +4,20 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+import hashlib
 import json
 import math
 import os
 from pathlib import Path, PurePosixPath
+import re
 import stat
 from typing import Any
 
+from .adapters import AdapterContractError, CapturedArtifact, adapter_for
 from .compatibility import CompatibilityError, resolve_graphify_compatibility
-from .integrity import IntegrityError, analyze_graph
+from .coverage import omission_is_approved
+from .evidence import EvidenceError, GraphEvidence, parse_graph_evidence
+from .integrity import IntegrityError, analyze_graph, validate_final_graph
 from .models import ProjectManifest
 from .staging import StagedInput
 
@@ -20,13 +25,22 @@ from .staging import StagedInput
 _WRAPPER_FIELDS = frozenset(
     {
         "project_id",
+        "artifact_schema_version",
         "graphify_version",
         "source_digest",
+        "projection_digest",
+        "evidence_digest",
+        "extraction_invocation_digest",
         "extraction_coverage",
         "graph_health",
+        "impact_trust",
+        "impact_limitations",
+        "impact_analysis_trusted",
     }
 )
 _PATH_FIELDS = frozenset({"source", "source_file", "source_path", "path", "file"})
+_GENERATION_DOMAIN = b"atlasweaver-generation-v1\0"
+_COVERAGE_REASON = "not_represented_by_graphify"
 
 
 class AdapterError(ValueError):
@@ -38,7 +52,12 @@ class AdaptedCandidate:
     """Safe summary of one separately written wrapper candidate."""
 
     root: Path
+    artifact_schema_version: int
     source_digest: str
+    projection_digest: str | None
+    evidence_digest: str | None
+    extraction_invocation_digest: str | None
+    generation_digest: str
     node_count: int
     edge_count: int
     skipped_count: int
@@ -50,6 +69,7 @@ def adapt_candidate(
     staged: StagedInput,
     manifest: ProjectManifest,
     *,
+    evidence: GraphEvidence | None = None,
     post_write_check: Callable[[], None] | None = None,
 ) -> AdaptedCandidate:
     """Copy only public graph artifacts and inject deterministic wrapper metadata."""
@@ -77,33 +97,73 @@ def adapt_candidate(
         html_payload = (
             _read_regular_at(raw, "graph.html") if manifest.track_html else None
         )
+        staged_files = frozenset(staged.files)
         document = _load_json(graph_payload)
         _reject_existing_wrapper_metadata(document)
-        nodes, edges = _native_shape(document)
-        _remove_empty_path_sentinels(nodes, edges)
-        try:
-            graph_health = analyze_graph(
-                nodes,
-                edges,
-                semantics=contract.semantics,
+        parsed_evidence: GraphEvidence | None = None
+        artifact_schema_version = 1
+        if evidence is None:
+            nodes, edges = _native_shape(document)
+            _remove_empty_path_sentinels(nodes, edges)
+            _canonicalize_node_source_aliases(nodes, staged_files)
+            try:
+                graph_health = analyze_graph(
+                    nodes,
+                    edges,
+                    semantics=contract.semantics,
+                )
+            except IntegrityError as error:
+                raise AdapterError("raw graph integrity is invalid") from error
+            if (
+                graph_health.dangling_endpoint_edges
+                or graph_health.missing_endpoint_edges
+            ):
+                raise AdapterError("raw graph has invalid edge endpoints")
+            if not graph_health.structurally_valid:
+                raise AdapterError("raw graph is structurally invalid")
+        else:
+            artifact_schema_version = 2
+            parsed_evidence = _validated_evidence(
+                evidence,
+                contract_version=contract.version,
+                adapter_id=contract.adapter_id,
+                source_digest=staged.source_digest,
+                projection_digest=staged.projection_digest,
+                project_uid=manifest.project_uid,
             )
-        except IntegrityError as error:
-            raise AdapterError("raw graph integrity is invalid") from error
-        if (
-            graph_health.dangling_endpoint_edges
-            or graph_health.missing_endpoint_edges
-        ):
-            raise AdapterError("raw graph has invalid edge endpoints")
-        if not graph_health.structurally_valid:
-            raise AdapterError("raw graph is structurally invalid")
-        staged_files = frozenset(staged.files)
+            try:
+                adapted_payload = adapter_for(contract).adapt_clustered_graph(
+                    CapturedArtifact.from_payload(
+                        PurePosixPath("clustered/graph.json"), graph_payload
+                    ),
+                    staged_files=staged_files,
+                )
+            except AdapterContractError as error:
+                raise AdapterError("raw clustered graph is invalid") from error
+            document = _load_json(adapted_payload)
+            nodes, edges = _native_shape(document)
+            try:
+                graph_health = validate_final_graph(document, contract.semantics)
+            except IntegrityError as error:
+                raise AdapterError("adapted graph integrity is invalid") from error
+            _require_final_evidence_match(document, parsed_evidence)
+
         represented = _represented_paths(nodes, edges, staged_files)
-        _canonicalize_node_source_aliases(nodes, staged_files)
         skipped = [
             {
                 "path": path.as_posix(),
-                "reason": f"not represented by Graphify {manifest.graphify_version}",
-                "approved": False,
+                "reason": (
+                    f"not represented by Graphify {manifest.graphify_version}"
+                    if parsed_evidence is None
+                    else _COVERAGE_REASON
+                ),
+                "approved": (
+                    False
+                    if parsed_evidence is None
+                    else omission_is_approved(
+                        path, _COVERAGE_REASON, staged, contract.adapter_id
+                    )
+                ),
             }
             for path in staged.files
             if path not in represented
@@ -124,9 +184,34 @@ def adapt_candidate(
                 },
             }
         )
+        if parsed_evidence is not None:
+            document.update(
+                {
+                    "artifact_schema_version": 2,
+                    "projection_digest": parsed_evidence.projection_digest,
+                    "evidence_digest": parsed_evidence.digest,
+                    "extraction_invocation_digest": (
+                        parsed_evidence.extraction_invocation_digest
+                    ),
+                }
+            )
         adapted_graph = (
             json.dumps(document, indent=2, ensure_ascii=False, sort_keys=True) + "\n"
         ).encode("utf-8")
+        if parsed_evidence is not None:
+            report_payload = _append_integrity_report(report_payload, parsed_evidence)
+
+        generated_artifacts = [
+            (PurePosixPath("graph.json"), adapted_graph),
+            (PurePosixPath("GRAPH_REPORT.md"), report_payload),
+        ]
+        if parsed_evidence is not None:
+            generated_artifacts.append(
+                (PurePosixPath("GRAPH_EVIDENCE.json"), parsed_evidence.payload)
+            )
+        if html_payload is not None:
+            generated_artifacts.append((PurePosixPath("graph.html"), html_payload))
+        generation_digest = _generation_digest(tuple(generated_artifacts))
 
         target_fd: int | None = None
         target_identity: tuple[int, int] | None = None
@@ -144,6 +229,10 @@ def adapt_candidate(
             os.fchmod(target_fd, 0o700)
             _write_new_at(target_fd, "graph.json", adapted_graph)
             _write_new_at(target_fd, "GRAPH_REPORT.md", report_payload)
+            if parsed_evidence is not None:
+                _write_new_at(
+                    target_fd, "GRAPH_EVIDENCE.json", parsed_evidence.payload
+                )
             if html_payload is not None:
                 _write_new_at(target_fd, "graph.html", html_payload)
             os.fsync(target_fd)
@@ -161,6 +250,7 @@ def adapt_candidate(
                         target.name,
                         target_identity,
                         include_html=html_payload is not None,
+                        include_evidence=parsed_evidence is not None,
                     )
             except (OSError, AdapterError) as failure:
                 cleanup_error = failure
@@ -183,11 +273,157 @@ def adapt_candidate(
 
     return AdaptedCandidate(
         root=target,
+        artifact_schema_version=artifact_schema_version,
         source_digest=staged.source_digest,
+        projection_digest=(
+            None if parsed_evidence is None else parsed_evidence.projection_digest
+        ),
+        evidence_digest=None if parsed_evidence is None else parsed_evidence.digest,
+        extraction_invocation_digest=(
+            None
+            if parsed_evidence is None
+            else parsed_evidence.extraction_invocation_digest
+        ),
+        generation_digest=generation_digest,
         node_count=len(nodes),
         edge_count=len(edges),
         skipped_count=len(skipped),
     )
+
+
+def _validated_evidence(
+    evidence: object,
+    *,
+    contract_version: str,
+    adapter_id: str,
+    source_digest: str,
+    projection_digest: str | None,
+    project_uid: object,
+) -> GraphEvidence:
+    if type(evidence) is not GraphEvidence:
+        raise AdapterError("graph evidence is invalid")
+    if project_uid is None or projection_digest is None:
+        raise AdapterError("artifact schema 2 requires manifest and projection identity")
+    try:
+        contract = resolve_graphify_compatibility(contract_version)
+        parsed = parse_graph_evidence(
+            evidence.payload, contract, expected_digest=evidence.digest
+        )
+    except (CompatibilityError, EvidenceError, AttributeError) as error:
+        raise AdapterError("graph evidence is invalid") from error
+    if parsed != evidence:
+        raise AdapterError("graph evidence descriptor is invalid")
+    if parsed.adapter_id != adapter_id or parsed.graphify_version != contract_version:
+        raise AdapterError("graph evidence adapter binding does not match")
+    if parsed.source_digest != source_digest:
+        raise AdapterError("graph evidence source digest does not match")
+    if parsed.projection_digest != projection_digest:
+        raise AdapterError("graph evidence projection digest does not match")
+    if parsed.extraction_invocation_digest != parsed.invocation.digest:
+        raise AdapterError("graph evidence invocation digest does not match")
+    return parsed
+
+
+def _require_final_evidence_match(
+    document: Mapping[str, Any], evidence: GraphEvidence
+) -> None:
+    try:
+        contract = resolve_graphify_compatibility(evidence.graphify_version)
+        integrity = validate_final_graph(document, contract.semantics)
+    except (CompatibilityError, IntegrityError) as error:
+        raise AdapterError("final graph evidence integrity does not match") from error
+    if integrity != evidence.final_integrity:
+        raise AdapterError("final graph evidence integrity does not match")
+    edge_member = "links" if "links" in document else "edges"
+    actual: dict[str, tuple[object, ...]] = {}
+    edge_values = document.get(edge_member)
+    if not isinstance(edge_values, list):
+        raise AdapterError("final graph evidence edges do not match")
+    for edge in edge_values:
+        if not isinstance(edge, Mapping):
+            raise AdapterError("final graph evidence edges do not match")
+        identifier = edge.get("atlasweaver_edge_id")
+        if type(identifier) is not str or identifier in actual:
+            raise AdapterError("final graph evidence edges do not match")
+        source_line, source_column = _edge_coordinates(edge)
+        actual[identifier] = (
+            edge.get(contract.semantics.source_field),
+            edge.get(contract.semantics.target_field),
+            edge.get("relation"),
+            edge.get("confidence"),
+            edge.get("source_file"),
+            source_line,
+            source_column,
+        )
+    expected = {
+        item.final_edge_id: (
+            item.source,
+            item.target,
+            item.relation,
+            item.confidence,
+            None if item.source_file is None else item.source_file.as_posix(),
+            item.source_line,
+            item.source_column,
+        )
+        for item in evidence.final_edges
+    }
+    if actual != expected:
+        raise AdapterError("final graph evidence edges do not match")
+
+
+def _edge_coordinates(edge: Mapping[str, Any]) -> tuple[object, object]:
+    location = edge.get("source_location")
+    if isinstance(location, str):
+        matched = re.fullmatch(r"L?([1-9][0-9]*)(?::([1-9][0-9]*))?", location)
+        if matched is None:
+            raise AdapterError("final graph evidence edges do not match")
+        return int(matched.group(1)), (
+            None if matched.group(2) is None else int(matched.group(2))
+        )
+    return edge.get("source_line"), edge.get("source_column")
+
+
+def _append_integrity_report(report: bytes, evidence: GraphEvidence) -> bytes:
+    try:
+        base = report.decode("utf-8").rstrip()
+    except UnicodeDecodeError as error:
+        raise AdapterError("Graphify report must be UTF-8") from error
+    repairs = ", ".join(
+        f"{item.code}={item.count}" for item in evidence.normalization_repairs
+    ) or "none"
+    quarantines = ", ".join(
+        f"{item.code}={item.count}" for item in evidence.normalization_quarantines
+    ) or "none"
+    limitations = ", ".join(evidence.limitations) or "none"
+    appendix = (
+        "## AtlasWeaver Integrity\n\n"
+        f"- Native observed nodes: {evidence.observed_post_dedup.node_count}\n"
+        f"- Native observed edges: {evidence.observed_post_dedup.edge_count}\n"
+        f"- Normalization repairs: {repairs}\n"
+        f"- Normalization quarantines: {quarantines}\n"
+        f"- Final nodes: {evidence.final_integrity.node_count}\n"
+        f"- Final edges: {evidence.final_integrity.edge_count}\n"
+        f"- Evidence SHA-256: `{evidence.digest}`\n"
+        f"- Impact limitations: {limitations}\n"
+    )
+    return f"{base}\n\n{appendix}".encode("utf-8")
+
+
+def _generation_digest(
+    artifacts: tuple[tuple[PurePosixPath, bytes], ...],
+) -> str:
+    descriptors = [
+        {
+            "path": path.as_posix(),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "byte_length": len(payload),
+        }
+        for path, payload in sorted(artifacts, key=lambda item: item[0].as_posix())
+    ]
+    canonical = json.dumps(
+        descriptors, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(_GENERATION_DOMAIN + canonical).hexdigest()
 
 
 def _reject_existing_wrapper_metadata(document: Mapping[str, Any]) -> None:
@@ -420,11 +656,13 @@ def _remove_created_candidate(
     expected: tuple[int, int],
     *,
     include_html: bool,
+    include_evidence: bool,
 ) -> None:
     if target_fd is not None:
         for artifact in (
             "graph.json",
             "GRAPH_REPORT.md",
+            *(("GRAPH_EVIDENCE.json",) if include_evidence else ()),
             *(("graph.html",) if include_html else ()),
         ):
             try:
