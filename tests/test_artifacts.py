@@ -159,6 +159,29 @@ def test_candidate_rejects_forged_graph_health_counter(
         validate_candidate(candidate, staged, manifest)
 
 
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("edge_count", True),
+        ("edge_count", 1.0),
+        ("structurally_valid", 1),
+    ],
+)
+def test_candidate_rejects_coercible_integrity_metadata_scalar_types(
+    candidate: Path,
+    staged: StagedInput,
+    manifest: ProjectManifest,
+    field: str,
+    value: object,
+) -> None:
+    document = json.loads((candidate / "graph.json").read_text())
+    document["graph_health"][field] = value
+    write(candidate / "graph.json", json.dumps(document))
+
+    with pytest.raises(ArtifactValidationError, match="graph health"):
+        validate_candidate(candidate, staged, manifest)
+
+
 def test_candidate_rejects_claimed_collapsed_edge_evidence_for_graphify_0948(
     candidate: Path, staged: StagedInput, manifest: ProjectManifest
 ) -> None:

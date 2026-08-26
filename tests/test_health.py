@@ -369,6 +369,42 @@ def test_inspection_recomputes_graph_integrity_instead_of_trusting_ownership(
     assert assess_health(inspected).issues == ("graph_invalid",)
 
 
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("edge_count", False),
+        ("edge_count", 0.0),
+        ("structurally_valid", 1),
+    ],
+)
+def test_inspection_rejects_coercible_integrity_metadata_scalar_types(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "src/app.py").write_text("current\n", encoding="utf-8")
+    _write_valid_graph_output(repo)
+    output = repo / "graphify-out"
+
+    graph_path = output / "graph.json"
+    graph = json.loads(graph_path.read_text(encoding="utf-8"))
+    graph["graph_health"][field] = value
+    graph_payload = json.dumps(graph).encode() + b"\n"
+    graph_path.write_bytes(graph_payload)
+
+    ownership_path = output / ".project-knowledge-ownership.json"
+    ownership = json.loads(ownership_path.read_text(encoding="utf-8"))
+    graph_digest = hashlib.sha256(graph_payload).hexdigest()
+    ownership["graph_digest"] = graph_digest
+    ownership["artifact_digests"]["graph.json"] = graph_digest
+    ownership_path.write_text(json.dumps(ownership), encoding="utf-8")
+
+    inspected = inspect_project_state(repo, manifest())
+
+    assert inspected.graph_valid is False
+    assert assess_health(inspected).issues == ("graph_invalid",)
+
+
 @pytest.mark.parametrize("cache_entry", ["unexpected", "nested"])
 def test_inspection_rejects_unknown_graphify_cache_entries(
     tmp_path: Path, cache_entry: str

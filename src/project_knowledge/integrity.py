@@ -75,6 +75,36 @@ class GraphIntegrity:
             "structurally_valid": self.structurally_valid,
         }
 
+    @classmethod
+    def from_dict(cls, document: object) -> GraphIntegrity:
+        """Parse the closed schema using exact scalar types."""
+        expected_fields = {
+            "schema_version",
+            "node_count",
+            "edge_count",
+            "missing_endpoint_edges",
+            "dangling_endpoint_edges",
+            "invalid_self_loop_edges",
+            "exact_duplicate_edges",
+            "conflicting_relation_edges",
+            "collapsed_edges",
+            "structurally_valid",
+        }
+        if not isinstance(document, Mapping) or set(document) != expected_fields:
+            raise IntegrityError("graph integrity schema is invalid")
+        return cls(
+            node_count=document["node_count"],
+            edge_count=document["edge_count"],
+            missing_endpoint_edges=document["missing_endpoint_edges"],
+            dangling_endpoint_edges=document["dangling_endpoint_edges"],
+            invalid_self_loop_edges=document["invalid_self_loop_edges"],
+            exact_duplicate_edges=document["exact_duplicate_edges"],
+            conflicting_relation_edges=document["conflicting_relation_edges"],
+            collapsed_edges=document["collapsed_edges"],
+            structurally_valid=document["structurally_valid"],
+            schema_version=document["schema_version"],
+        )
+
 
 def canonical_final_edge_id(
     edge: Mapping[str, Any], semantics: GraphSemantics

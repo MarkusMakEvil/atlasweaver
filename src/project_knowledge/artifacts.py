@@ -641,21 +641,14 @@ def _validate_graph_health(
     collapsed_evidence_available: bool,
 ) -> GraphIntegrity:
     recorded = document.get("graph_health")
-    expected_fields = {
-        "schema_version",
-        "node_count",
-        "edge_count",
-        "missing_endpoint_edges",
-        "dangling_endpoint_edges",
-        "invalid_self_loop_edges",
-        "exact_duplicate_edges",
-        "conflicting_relation_edges",
-        "collapsed_edges",
-        "structurally_valid",
-    }
-    if not isinstance(recorded, Mapping) or set(recorded) != expected_fields:
-        raise ArtifactValidationError("graph health is missing or invalid")
-    if not collapsed_evidence_available and recorded["collapsed_edges"] is not None:
+    try:
+        recorded_integrity = GraphIntegrity.from_dict(recorded)
+    except IntegrityError as error:
+        raise ArtifactValidationError("graph health is missing or invalid") from error
+    if (
+        not collapsed_evidence_available
+        and recorded_integrity.collapsed_edges is not None
+    ):
         raise ArtifactValidationError(
             "Graphify 0.9.48 collapsed edge evidence must remain unknown"
         )
@@ -664,11 +657,11 @@ def _validate_graph_health(
             nodes,
             edges,
             semantics=semantics,
-            collapsed_edges=recorded["collapsed_edges"],
+            collapsed_edges=recorded_integrity.collapsed_edges,
         )
     except (IntegrityError, TypeError) as error:
         raise ArtifactValidationError("graph health is invalid") from error
-    if dict(recorded) != computed.to_dict():
+    if recorded_integrity != computed:
         raise ArtifactValidationError("graph health does not match graph content")
     if not computed.structurally_valid:
         raise ArtifactValidationError("graph health contains structural defects")

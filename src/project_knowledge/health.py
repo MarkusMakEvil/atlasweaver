@@ -13,7 +13,7 @@ from typing import Any, Literal
 
 from .artifacts import OWNERSHIP_MANIFEST
 from .compatibility import GraphSemantics, resolve_graphify_compatibility
-from .integrity import IntegrityError, analyze_graph
+from .integrity import GraphIntegrity, IntegrityError, analyze_graph
 from .models import ProjectManifest
 from .privacy import effective_excludes, is_denied
 from .secrets_scan import load_secret_exceptions, scan_payload
@@ -431,32 +431,19 @@ def _validate_graph_integrity_metadata(
     ):
         raise ValueError("invalid graph shape")
     recorded = graph.get("graph_health")
-    expected_fields = {
-        "schema_version",
-        "node_count",
-        "edge_count",
-        "missing_endpoint_edges",
-        "dangling_endpoint_edges",
-        "invalid_self_loop_edges",
-        "exact_duplicate_edges",
-        "conflicting_relation_edges",
-        "collapsed_edges",
-        "structurally_valid",
-    }
-    if not isinstance(recorded, dict) or set(recorded) != expected_fields:
-        raise ValueError("invalid graph integrity metadata")
-    if recorded["collapsed_edges"] is not None:
-        raise ValueError("unsupported collapsed edge evidence")
     try:
+        recorded_integrity = GraphIntegrity.from_dict(recorded)
+        if recorded_integrity.collapsed_edges is not None:
+            raise ValueError("unsupported collapsed edge evidence")
         computed = analyze_graph(
             nodes,
             edges,
             semantics=semantics,
-            collapsed_edges=recorded["collapsed_edges"],
+            collapsed_edges=recorded_integrity.collapsed_edges,
         )
     except (IntegrityError, TypeError) as error:
         raise ValueError("invalid graph integrity metadata") from error
-    if recorded != computed.to_dict():
+    if recorded_integrity != computed:
         raise ValueError("graph integrity metadata mismatch")
     if not computed.structurally_valid:
         raise ValueError("invalid graph structure")
