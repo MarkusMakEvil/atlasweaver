@@ -300,6 +300,32 @@ def inspect_project_state(
         current_manifest = require_current_manifest(
             repo_root, manifest, repository_access=repository
         )
+        if (
+            registry is None
+            and registry_matches is None
+            and current_manifest.features.registry == "enabled"
+        ):
+            try:
+                from .registry import registry_status
+
+                current_registry = registry_status(
+                    repo_root,
+                    current_manifest,
+                    expected_repository_identity=repository.identity,
+                )
+                registry_feature = FeatureHealth(
+                    "available"
+                    if current_registry.status == "current"
+                    else "unavailable",
+                    ()
+                    if current_registry.status == "current"
+                    else (f"registry_{current_registry.status}",),
+                )
+            except Exception:
+                registry_feature = FeatureHealth(
+                    "unavailable", ("registry_inspection_failed",)
+                )
+            features = {**features, "registry": registry_feature}
         try:
             if current_manifest.schema_version == 2:
                 projection = inspect_projection(
