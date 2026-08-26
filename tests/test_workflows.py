@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 import re
@@ -18,6 +19,9 @@ class WorkflowLoader(yaml.SafeLoader):
     pass
 
 
+WorkflowLoader.yaml_implicit_resolvers = copy.deepcopy(
+    yaml.SafeLoader.yaml_implicit_resolvers
+)
 for first, resolvers in list(WorkflowLoader.yaml_implicit_resolvers.items()):
     WorkflowLoader.yaml_implicit_resolvers[first] = [
         item for item in resolvers if item[0] != "tag:yaml.org,2002:bool"
