@@ -115,3 +115,26 @@ def test_skill_documents_receipt_adapter_secret_and_integrity_contracts(skill_ro
     assert "impact_analysis_trusted" in combined
     assert "graph_integrity_degraded" in combined
     assert "non-bypassable" in lowered
+
+
+@pytest.mark.parametrize("skill_root", SKILL_ROOTS)
+def test_skill_prefers_high_level_safe_lifecycle_and_honest_query_trust(
+    skill_root,
+) -> None:
+    combined = skill_text(skill_root) + "\n" + skill_root.joinpath(
+        "references/workflow.md"
+    ).read_text(encoding="utf-8")
+    for command in (
+        "project-knowledge doctor",
+        "project-knowledge refresh",
+        "project-knowledge health",
+        "project-knowledge query",
+        "project-knowledge affected",
+        "project-knowledge registry-status",
+    ):
+        assert command in combined
+    lowered = combined.casefold()
+    assert "navigation" in lowered
+    assert "source verification" in lowered
+    assert "never point graphify at the repository root" in lowered
+    assert "never commit or push implicitly" in lowered

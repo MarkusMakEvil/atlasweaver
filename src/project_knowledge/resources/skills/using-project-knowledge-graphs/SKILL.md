@@ -17,6 +17,8 @@ Read-only detect, doctor, query, and health checks are allowed within the task. 
 
 `project-knowledge preflight` remains a read-only low-level recovery diagnostic;
 it is not a replacement for the ordinary doctor/refresh lifecycle.
+Never point Graphify at the repository root; only AtlasWeaver's private staged
+projection may be extracted.
 
 Use `project-knowledge scan-secrets` before an approved stage. Its findings are
 redacted fingerprints. High-confidence structured credentials are

@@ -84,3 +84,15 @@ def test_built_wheel_contains_managed_agent_skill_resources(tmp_path: Path) -> N
         "project_knowledge/resources/skills/using-project-knowledge-graphs/agents/openai.yaml",
         "project_knowledge/resources/skills/using-project-knowledge-graphs/references/workflow.md",
     } <= names
+
+
+def test_dogfood_and_example_manifests_are_v2_and_optional_by_default() -> None:
+    from project_knowledge.manifest import load_manifest
+
+    for root in (ROOT, ROOT / "examples"):
+        manifest = load_manifest(root / ".graphify-project.yaml", root)
+        assert manifest.schema_version == 2
+        assert manifest.project_uid is not None
+        assert manifest.features.atlas == "disabled"
+        assert manifest.features.registry == "disabled"
+        assert manifest.artifacts.provider == "none"
