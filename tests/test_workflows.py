@@ -26,6 +26,11 @@ for first, resolvers in list(WorkflowLoader.yaml_implicit_resolvers.items()):
     WorkflowLoader.yaml_implicit_resolvers[first] = [
         item for item in resolvers if item[0] != "tag:yaml.org,2002:bool"
     ]
+WorkflowLoader.add_implicit_resolver(
+    "tag:yaml.org,2002:bool",
+    re.compile(r"^(?:true|false)$", re.IGNORECASE),
+    list("tTfF"),
+)
 
 
 def load_workflow(name: str) -> dict[str, object]:
@@ -149,3 +154,65 @@ def test_reusable_workflow_uses_hard_pinned_trusted_tool_checkout() -> None:
     assert "github.workflow_sha" not in text
     assert '--project "$GITHUB_WORKSPACE/atlasweaver-tool"' in raw
     assert '--project "$GITHUB_WORKSPACE/consumer"' not in raw
+
+
+def test_publish_workflow_splits_privilege_and_serializes_release_identity() -> None:
+    workflow = load_workflow("atlasweaver-publish.yml")
+    jobs = workflow["jobs"]
+    assert set(jobs) == {"inspect", "build", "publish"}
+    assert jobs["inspect"]["permissions"] == {"contents": "read"}
+    assert jobs["build"]["permissions"] == {"contents": "read"}
+    assert jobs["publish"]["permissions"] == {
+        "attestations": "write",
+        "contents": "write",
+        "id-token": "write",
+    }
+    assert jobs["publish"]["runs-on"] == "ubuntu-24.04"
+    assert jobs["publish"]["concurrency"] == {
+        "cancel-in-progress": False,
+        "group": (
+            "atlasweaver-publish-${{ github.repository_id }}-"
+            "${{ needs.inspect.outputs.project_uid }}-"
+            "${{ needs.inspect.outputs.channel }}"
+        ),
+    }
+
+
+def test_publish_privileged_job_attests_before_verified_upload() -> None:
+    workflow = load_workflow("atlasweaver-publish.yml")
+    publish = workflow["jobs"]["publish"]
+    serialized = json.dumps(publish, sort_keys=True)
+    assert all(term not in serialized for term in (
+        "graphify extract", "project-knowledge refresh", "pytest",
+        "semantic_backend_token",
+    ))
+    names = [item.get("name", item.get("uses", "")) for item in publish["steps"]]
+    assert names.index("Attest release bundle") < names.index(
+        "Verify reusable-workflow signer"
+    ) < names.index("Upload verified rolling release asset")
+    token_steps = {
+        item["name"]
+        for item in publish["steps"]
+        if "GITHUB_TOKEN" in item.get("env", {})
+    }
+    assert token_steps == {
+        "Verify reusable-workflow signer",
+        "Upload verified rolling release asset",
+    }
+
+
+def test_publish_secret_is_confined_to_semantic_unprivileged_build() -> None:
+    workflow = load_workflow("atlasweaver-publish.yml")
+    hits = []
+    for job_name, job in workflow["jobs"].items():
+        for item in job["steps"]:
+            if "ATLASWEAVER_BACKEND_TOKEN" in json.dumps(item, sort_keys=True):
+                hits.append((job_name, item))
+    assert len(hits) == 1
+    job_name, semantic = hits[0]
+    assert job_name == "build"
+    assert semantic["name"] == "Refresh private graph"
+    assert semantic["if"] == "${{ inputs.backend != '' && inputs.model != '' }}"
+    assert semantic["env"]["ATLASWEAVER_BACKEND_TOKEN"] == (
+        "${{ secrets.semantic_backend_token }}"
+    )
