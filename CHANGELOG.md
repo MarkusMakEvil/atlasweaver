@@ -2,6 +2,11 @@
 
 All notable changes to AtlasWeaver are documented here.
 
+## 0.3.4 - 2026-08-27
+
+- Isolated GitHub CLI capability probes as well as attestation verification,
+  preventing device-state files from appearing in consumer repositories.
+
 ## 0.3.3 - 2026-08-26
 
 - Isolated all GitHub CLI config, cache, home, and state writes inside the

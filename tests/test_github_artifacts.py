@@ -280,7 +280,25 @@ class _Runner:
 
 
 class _ResolverRunner:
+    def __init__(self) -> None:
+        self.roots: list[Path] = []
+
     def run(self, argv, env, timeout_seconds, output_limit):
+        assert set(env) == {
+            "GH_CONFIG_DIR", "HOME", "LANG", "LC_ALL", "XDG_CACHE_HOME",
+            "XDG_CONFIG_HOME", "XDG_STATE_HOME",
+        }
+        root = Path(env["GH_CONFIG_DIR"]).parent
+        assert all(
+            Path(env[name]).parent == root
+            for name in (
+                "HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME",
+            )
+        )
+        state = Path(env["XDG_STATE_HOME"])
+        state.mkdir(exist_ok=True)
+        (state / "device-id").write_text("isolated", encoding="utf-8")
+        self.roots.append(root)
         if argv[-1] == "--version":
             return _Completed(0, "gh version 2.96.0 (test)\n")
         return _Completed(
@@ -305,11 +323,13 @@ def test_system_gh_resolver_accepts_safe_package_manager_symlink(
     candidate.symlink_to(target)
     resolver = github_artifacts._SystemGhResolver()
     monkeypatch.setattr(resolver, "_candidates", (candidate,))
-    monkeypatch.setattr(github_artifacts, "SUBPROCESS_GH_RUNNER", _ResolverRunner())
+    runner = _ResolverRunner()
+    monkeypatch.setattr(github_artifacts, "SUBPROCESS_GH_RUNNER", runner)
 
     resolved = resolver.resolve()
 
     assert resolved.path == target.resolve()
+    assert runner.roots and all(not root.exists() for root in runner.roots)
 
 
 def _resolved_gh(tmp_path: Path) -> ResolvedGhExecutable:

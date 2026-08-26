@@ -830,48 +830,86 @@ class GhToolResolver(Protocol):
     ) -> ResolvedGhExecutable: ...
 
 
+def _gh_sandbox(
+    prefix: str, *, token: str | None = None
+) -> tuple[Path, dict[str, str]]:
+    root = Path(tempfile.mkdtemp(prefix=prefix))
+    root.chmod(0o700)
+    config = root / "config"
+    config.mkdir(mode=0o700)
+    environment = {
+        "GH_CONFIG_DIR": str(config),
+        "HOME": str(root / "home"),
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "XDG_CACHE_HOME": str(root / "cache"),
+        "XDG_CONFIG_HOME": str(root / "xdg-config"),
+        "XDG_STATE_HOME": str(root / "state"),
+    }
+    if token is not None:
+        environment["GH_TOKEN"] = token
+    return root, environment
+
+
+def _remove_gh_sandbox(root: Path) -> None:
+    try:
+        import shutil
+
+        shutil.rmtree(root)
+    except OSError:
+        pass
+
+
 class _SystemGhResolver:
     _candidates = (Path("/usr/bin/gh"), Path("/opt/homebrew/bin/gh"))
 
     def resolve(
         self, *, before_exec: Callable[[], None] = _noop
     ) -> ResolvedGhExecutable:
-        for path in self._candidates:
-            try:
-                executable = path.resolve(strict=True)
-                resolved = _capture_gh(executable, version="pending")
-            except (OSError, RuntimeError, GithubArtifactError):
-                continue
-            environment = {"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"}
-            before_exec()
-            _revalidate_gh(resolved)
-            version_result = SUBPROCESS_GH_RUNNER.run(
-                (str(executable), "--version"), environment, GH_TIMEOUT_SECONDS, GH_OUTPUT_LIMIT
-            )
-            if version_result.returncode != 0:
-                continue
-            match = re.search(r"(?m)^gh version ([0-9]+(?:\.[0-9]+){1,3})\b", version_result.stdout)
-            if match is None:
-                continue
-            before_exec()
-            _revalidate_gh(resolved)
-            help_result = SUBPROCESS_GH_RUNNER.run(
-                (str(executable), "attestation", "verify", "--help"),
-                environment,
-                GH_TIMEOUT_SECONDS,
-                GH_OUTPUT_LIMIT,
-            )
-            required = (
-                "--hostname", "--repo", "--signer-workflow", "--signer-digest",
-                "--source-ref", "--source-digest", "--predicate-type",
-                "--deny-self-hosted-runners", "--format",
-            )
-            if help_result.returncode != 0 or any(flag not in help_result.stdout for flag in required):
-                continue
-            return ResolvedGhExecutable(
-                resolved.path, resolved.device, resolved.inode, resolved.sha256, match.group(1)
-            )
-        raise GithubArtifactError("github_gh_unavailable")
+        sandbox, environment = _gh_sandbox("atlasweaver-gh-probe-")
+        try:
+            for path in self._candidates:
+                try:
+                    executable = path.resolve(strict=True)
+                    resolved = _capture_gh(executable, version="pending")
+                except (OSError, RuntimeError, GithubArtifactError):
+                    continue
+                before_exec()
+                _revalidate_gh(resolved)
+                version_result = SUBPROCESS_GH_RUNNER.run(
+                    (str(executable), "--version"), environment,
+                    GH_TIMEOUT_SECONDS, GH_OUTPUT_LIMIT,
+                )
+                if version_result.returncode != 0:
+                    continue
+                match = re.search(
+                    r"(?m)^gh version ([0-9]+(?:\.[0-9]+){1,3})\b",
+                    version_result.stdout,
+                )
+                if match is None:
+                    continue
+                before_exec()
+                _revalidate_gh(resolved)
+                help_result = SUBPROCESS_GH_RUNNER.run(
+                    (str(executable), "attestation", "verify", "--help"),
+                    environment, GH_TIMEOUT_SECONDS, GH_OUTPUT_LIMIT,
+                )
+                required = (
+                    "--hostname", "--repo", "--signer-workflow", "--signer-digest",
+                    "--source-ref", "--source-digest", "--predicate-type",
+                    "--deny-self-hosted-runners", "--format",
+                )
+                if help_result.returncode != 0 or any(
+                    flag not in help_result.stdout for flag in required
+                ):
+                    continue
+                return ResolvedGhExecutable(
+                    resolved.path, resolved.device, resolved.inode,
+                    resolved.sha256, match.group(1),
+                )
+            raise GithubArtifactError("github_gh_unavailable")
+        finally:
+            _remove_gh_sandbox(sandbox)
 
 
 SYSTEM_GH_RESOLVER: GhToolResolver = _SystemGhResolver()
@@ -925,10 +963,9 @@ def verify_attestation_policy(
         raise GithubArtifactError("attestation_policy_invalid")
     policy.__post_init__()
     subject = _hash_regular_file(bundle)
-    config_root = Path(tempfile.mkdtemp(prefix="atlasweaver-gh-"))
-    config_root.chmod(0o700)
-    config_dir = config_root / "config"
-    config_dir.mkdir(mode=0o700)
+    config_root, environment = _gh_sandbox(
+        "atlasweaver-gh-", token=credentials.token
+    )
     argv = (
         str(gh.path), "attestation", "verify", str(bundle),
         "--hostname", "github.com", "--repo", policy.repository,
@@ -939,16 +976,6 @@ def verify_attestation_policy(
         "--predicate-type", policy.predicate_type,
         "--deny-self-hosted-runners", "--format", "json",
     )
-    environment = {
-        "GH_CONFIG_DIR": str(config_dir),
-        "GH_TOKEN": credentials.token,
-        "HOME": str(config_root / "home"),
-        "LANG": "C.UTF-8",
-        "LC_ALL": "C.UTF-8",
-        "XDG_CACHE_HOME": str(config_root / "cache"),
-        "XDG_CONFIG_HOME": str(config_root / "xdg-config"),
-        "XDG_STATE_HOME": str(config_root / "state"),
-    }
     try:
         before_exec()
         _revalidate_gh(gh)
@@ -975,16 +1002,7 @@ def verify_attestation_policy(
             raise GithubArtifactError("attestation_ambiguous")
         return next(iter(projected))
     finally:
-        try:
-            for child in config_root.iterdir():
-                if child.is_dir() and not child.is_symlink():
-                    import shutil
-                    shutil.rmtree(child)
-                else:
-                    child.unlink(missing_ok=True)
-            config_root.rmdir()
-        except OSError:
-            pass
+        _remove_gh_sandbox(config_root)
 
 
 def verify_attestation(
