@@ -125,7 +125,7 @@ remain separately authorized mutations.
 ## Universal fleet operation
 
 Fleet configuration contains only generic display IDs, relative repository
-paths, and bounded parallelism. It has no product-specific layout or defaults.
+paths, and bounded parallelism. It has no organization-specific layout or defaults.
 Run only the selected operation:
 
 ```sh

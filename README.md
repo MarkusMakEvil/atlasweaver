@@ -114,7 +114,7 @@ artifacts:
 ```
 
 Fleet mode is a universal coordinator over arbitrary schema-v2 repositories.
-It does not contain BrandMap-specific IDs, paths, defaults, or business logic:
+It contains no organization-specific IDs, paths, defaults, or business logic:
 
 ```yaml
 schema_version: 1
