@@ -1,6 +1,14 @@
 graphify-out/
 .project-knowledge/
+.atlasweaver-coverage.yaml
+.graphify-secret-exceptions.yaml
 .pytest_cache/
 .venv/
+.idea/
+.vscode/
+.DS_Store
 build/
 dist/
+.ruff_cache/
+.mypy_cache/
+.coverage

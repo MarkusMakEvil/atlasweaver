@@ -2,3 +2,12 @@
 drafts/
 private/
 runtime/
+graphify-out/
+.project-knowledge/
+.atlasweaver-coverage.yaml
+.graphify-secret-exceptions.yaml
+.idea/
+.vscode/
+.DS_Store
+build/
+dist/

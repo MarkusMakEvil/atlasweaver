@@ -1,11 +1,17 @@
-schema_version: 1
-project_id: demo-project
-display_name: Demo Project
+schema_version: 2
+project_id: "demo-project"
+project_uid: 77bb46f4-c44a-4fcb-884d-f8ea917f819b
+display_name: "Demo Project"
 include_roots:
-  - src
-  - docs
+  - "src"
+  - "docs"
 output_dir: graphify-out
-obsidian_namespace: Projects/demo-project/Generated
+obsidian_namespace: "Projects/demo-project/Generated"
 excludes: []
 track_html: false
-graphify_version: 0.9.48
+graphify_version: "0.9.48"
+features:
+  atlas: disabled
+  registry: disabled
+artifacts:
+  provider: none

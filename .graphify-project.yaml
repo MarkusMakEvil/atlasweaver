@@ -1,22 +1,28 @@
-schema_version: 1
-project_id: atlasweaver
-display_name: AtlasWeaver
+schema_version: 2
+project_id: "atlasweaver"
+project_uid: 1ed43f8e-e849-4f05-96aa-3d965723f4f9
+display_name: "AtlasWeaver"
 include_roots:
-  - src
-  - tests
-  - skills
-  - scripts
-  - docs
-  - config
-  - examples
-  - .github
-  - README.md
-  - SECURITY.md
-  - CONTRIBUTING.md
-  - CHANGELOG.md
-  - pyproject.toml
+  - "src"
+  - "tests"
+  - "skills"
+  - "scripts"
+  - "docs"
+  - "config"
+  - "examples"
+  - ".github"
+  - "README.md"
+  - "SECURITY.md"
+  - "CONTRIBUTING.md"
+  - "CHANGELOG.md"
+  - "pyproject.toml"
 output_dir: graphify-out
-obsidian_namespace: Projects/atlasweaver/Generated
+obsidian_namespace: "Projects/atlasweaver/Generated"
 excludes: []
 track_html: false
-graphify_version: 0.9.48
+graphify_version: "0.9.48"
+features:
+  atlas: disabled
+  registry: disabled
+artifacts:
+  provider: none
