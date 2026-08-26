@@ -44,6 +44,16 @@ _INVOCATION_DOMAIN = b"atlasweaver-graphify-pipeline-v1\0"
 _HEX_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _FINAL_EDGE_ID = re.compile(r"edge-[0-9a-f]{64}\Z")
 _SOURCE_LOCATION = re.compile(r"L?(?P<line>[1-9][0-9]*)(?::(?P<column>[1-9][0-9]*))?\Z")
+_PUBLIC_MODEL_IDENTIFIER = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}"
+    r"(?:/[A-Za-z0-9][A-Za-z0-9._-]{0,63})?"
+    r"(?::[A-Za-z0-9][A-Za-z0-9._-]{0,63})?\Z"
+)
+_SECRET_MODEL_COMPONENT = re.compile(
+    r"(?:^|[._:/-])(?:sk|secret|token|bearer|api[-_]?key|credential|password|passwd)"
+    r"(?:$|[._:/-])",
+    re.IGNORECASE,
+)
 _DIAGNOSIS_MAX_BYTES = 4_194_304
 _BASE_ENVIRONMENT_NAMES = ("HOME", "LANG", "LC_ALL", "PATH")
 _BASE_ARTIFACT_PATHS = frozenset(
@@ -56,6 +66,7 @@ _BASE_ARTIFACT_PATHS = frozenset(
     }
 )
 _HTML_ARTIFACT_PATH = PurePosixPath("clustered/graph.html")
+_FINAL_GRAPH_PATH = PurePosixPath("adapted/graph.json")
 
 
 @dataclass(frozen=True)
@@ -136,6 +147,103 @@ class ImpactTrust:
     limitations: tuple[str, ...]
 
 
+def _invocation_document(
+    contract: GraphifyCompatibility,
+    *,
+    executable_sha256: str,
+    capability_smoke_digest: str,
+    commands: tuple[tuple[str, ...], ...],
+    backend: str | None,
+    model: str | None,
+    configuration_sha256: str,
+    source_digest: str,
+    projection_digest: str,
+    environment_names: tuple[str, ...],
+    artifacts: tuple[ArtifactBinding, ...],
+) -> dict[str, object]:
+    operations = ("extract", "diagnose", "cluster")
+    if len(commands) != len(operations):
+        raise EvidenceError("invocation command order is invalid")
+    return {
+        "schema_version": 1,
+        "adapter_id": contract.adapter_id,
+        "graphify_version": contract.version,
+        "executable": {"sha256": executable_sha256, "version": contract.version},
+        "capability_smoke_digest": capability_smoke_digest,
+        "argv": [
+            {"operation": operation, "items": list(items)}
+            for operation, items in zip(operations, commands, strict=True)
+        ],
+        "backend": backend,
+        "model": model,
+        "configuration_sha256": configuration_sha256,
+        "source_digest": source_digest,
+        "projection_digest": projection_digest,
+        "environment_names": list(environment_names),
+        "artifacts": [
+            {
+                "path": item.path.as_posix(),
+                "sha256": item.sha256,
+                "byte_length": item.byte_length,
+            }
+            for item in artifacts
+        ],
+    }
+
+
+def _graph_evidence_document(
+    contract: GraphifyCompatibility,
+    *,
+    source_digest: str,
+    projection_digest: str,
+    invocation: ExtractionInvocation,
+    observed: GraphIntegrity,
+    pre_dedup: tuple[PreDedupEdgeEvidence, ...] | None,
+    repairs: tuple[ReasonCount, ...],
+    quarantines: tuple[ReasonCount, ...],
+    final_integrity: GraphIntegrity,
+    final_edges: tuple[FinalEdgeEvidence, ...],
+    evidence_complete: bool,
+    limitations: tuple[str, ...],
+) -> dict[str, object]:
+    invocation_document = _invocation_document(
+        contract,
+        executable_sha256=invocation.executable_sha256,
+        capability_smoke_digest=invocation.capability_smoke_digest,
+        commands=invocation.commands,
+        backend=invocation.backend,
+        model=invocation.model,
+        configuration_sha256=invocation.configuration_sha256,
+        source_digest=invocation.source_digest,
+        projection_digest=invocation.projection_digest,
+        environment_names=invocation.environment_names,
+        artifacts=invocation.artifacts,
+    )
+    return {
+        "schema_version": 1,
+        "graphify_version": contract.version,
+        "adapter_id": contract.adapter_id,
+        "source_digest": source_digest,
+        "projection_digest": projection_digest,
+        "extraction_invocation_digest": invocation.digest,
+        "extraction_invocation": invocation_document,
+        "observed_post_dedup": observed.to_dict(),
+        "pre_dedup": (
+            None
+            if pre_dedup is None
+            else [_pre_dedup_document(item) for item in pre_dedup]
+        ),
+        "normalization": {
+            "repairs": [_reason_document(item) for item in repairs],
+            "quarantines": [_reason_document(item) for item in quarantines],
+        },
+        "final_integrity": final_integrity.to_dict(),
+        "final_edges": [_final_edge_document(item) for item in final_edges],
+        "evidence_complete": evidence_complete,
+        "limitations": list(limitations),
+    }
+
+
 def build_extraction_invocation(
     contract: GraphifyCompatibility,
     *,
@@ -172,31 +280,19 @@ def build_extraction_invocation(
     )
     _require_environment_names(contract, backend, environment_names)
 
-    document = {
-        "schema_version": 1,
-        "adapter_id": contract.adapter_id,
-        "graphify_version": contract.version,
-        "executable": {"sha256": executable_sha256, "version": contract.version},
-        "capability_smoke_digest": capability_smoke_digest,
-        "argv": [
-            {"operation": command.operation, "items": list(command.canonical_argv)}
-            for command in commands
-        ],
-        "backend": backend,
-        "model": model,
-        "configuration_sha256": configuration_sha256,
-        "source_digest": source_digest,
-        "projection_digest": projection_digest,
-        "environment_names": list(environment_names),
-        "artifacts": [
-            {
-                "path": item.path.as_posix(),
-                "sha256": item.sha256,
-                "byte_length": item.byte_length,
-            }
-            for item in bindings
-        ],
-    }
+    document = _invocation_document(
+        contract,
+        executable_sha256=executable_sha256,
+        capability_smoke_digest=capability_smoke_digest,
+        commands=tuple(command.canonical_argv for command in commands),
+        backend=backend,
+        model=model,
+        configuration_sha256=configuration_sha256,
+        source_digest=source_digest,
+        projection_digest=projection_digest,
+        environment_names=environment_names,
+        artifacts=bindings,
+    )
     payload = _canonical_json(document)
     return ExtractionInvocation(
         adapter_id=contract.adapter_id,
@@ -227,6 +323,7 @@ def build_graph_evidence(
     normalization: NormalizationResult,
     clustered_graph: CapturedArtifact,
     final_graph: CapturedArtifact,
+    staged_files: frozenset[PurePosixPath],
 ) -> GraphEvidence:
     """Build safe evidence by reconciling official captures and adapter results."""
     _require_registered_contract(contract)
@@ -234,7 +331,13 @@ def build_graph_evidence(
     projection_digest = _require_digest(projection_digest)
     if type(normalization) is not NormalizationResult:
         raise EvidenceError("normalization result is invalid")
+    staged_files = _require_staged_files(staged_files)
+    _require_artifact_descriptor(clustered_graph)
     _require_artifact_descriptor(final_graph)
+    if len(clustered_graph.payload) > GRAPH_EVIDENCE_MAX_BYTES:
+        raise EvidenceError("clustered graph exceeds clustered graph size cap")
+    if len(final_graph.payload) > GRAPH_EVIDENCE_MAX_BYTES:
+        raise EvidenceError("final graph exceeds final graph size cap")
     parsed_invocation = _validate_invocation(invocation, contract)
     if parsed_invocation.source_digest != source_digest:
         raise EvidenceError("evidence source digest does not match invocation")
@@ -252,24 +355,36 @@ def build_graph_evidence(
     try:
         implementation = adapter_for(contract)
         parsed_native = implementation.parse_post_dedup(native_graph)
-        observed = implementation.normalize_for_cluster(parsed_native).observed_integrity
+        recomputed_normalization = implementation.normalize_for_cluster(parsed_native)
     except AdapterContractError as error:
         raise EvidenceError("captured native graph is invalid") from error
-    if normalization.observed_integrity != observed:
-        raise EvidenceError("normalization integrity does not match captured native graph")
+    if normalization != recomputed_normalization:
+        raise EvidenceError("normalization result does not match captured native graph")
+    observed = recomputed_normalization.observed_integrity
     repairs = _validate_reason_counts(
-        normalization.repairs, contract.normalization_reason_codes
+        recomputed_normalization.repairs, contract.normalization_reason_codes
     )
     quarantines = _validate_reason_counts(
-        normalization.quarantines, contract.normalization_reason_codes
+        recomputed_normalization.quarantines, contract.normalization_reason_codes
     )
     _validate_diagnosis(diagnosis, observed, contract)
 
-    final_document = _strict_json_object(final_graph.payload, "final graph")
+    try:
+        expected_final = CapturedArtifact.from_payload(
+            _FINAL_GRAPH_PATH,
+            implementation.adapt_clustered_graph(
+                clustered_graph, staged_files=staged_files
+            ),
+        )
+    except AdapterContractError as error:
+        raise EvidenceError("derived final graph is invalid") from error
+    if final_graph != expected_final:
+        raise EvidenceError("derived final graph descriptor does not match")
+    final_document = _strict_json_object(expected_final.payload, "final graph")
     try:
         final_integrity = validate_final_graph(final_document, contract.semantics)
     except IntegrityError as error:
-        raise EvidenceError("final graph integrity is invalid") from error
+        raise EvidenceError("derived final graph integrity is invalid") from error
     edge_member = "links" if "links" in final_document else "edges"
     final_edges = tuple(
         sorted(
@@ -283,25 +398,20 @@ def build_graph_evidence(
     limitations = _derive_evidence_limitations(
         contract, quarantines, final_edges, pre_dedup=None
     )
-    document = {
-        "schema_version": 1,
-        "graphify_version": contract.version,
-        "adapter_id": contract.adapter_id,
-        "source_digest": source_digest,
-        "projection_digest": projection_digest,
-        "extraction_invocation_digest": parsed_invocation.digest,
-        "extraction_invocation": json.loads(parsed_invocation.payload),
-        "observed_post_dedup": observed.to_dict(),
-        "pre_dedup": None,
-        "normalization": {
-            "repairs": [_reason_document(item) for item in repairs],
-            "quarantines": [_reason_document(item) for item in quarantines],
-        },
-        "final_integrity": final_integrity.to_dict(),
-        "final_edges": [_final_edge_document(item) for item in final_edges],
-        "evidence_complete": False,
-        "limitations": list(limitations),
-    }
+    document = _graph_evidence_document(
+        contract,
+        source_digest=source_digest,
+        projection_digest=projection_digest,
+        invocation=parsed_invocation,
+        observed=observed,
+        pre_dedup=None,
+        repairs=repairs,
+        quarantines=quarantines,
+        final_integrity=final_integrity,
+        final_edges=final_edges,
+        evidence_complete=False,
+        limitations=limitations,
+    )
     payload = _canonical_json(document)
     _bounded_evidence_payload(payload)
     return GraphEvidence(
@@ -408,7 +518,21 @@ def parse_graph_evidence(
     )
     if limitations != expected_limitations:
         raise EvidenceError("evidence limitations are inconsistent")
-    if _canonical_json(document) != payload:
+    reconstructed = _graph_evidence_document(
+        contract,
+        source_digest=source_digest,
+        projection_digest=projection_digest,
+        invocation=invocation,
+        observed=observed,
+        pre_dedup=pre_dedup,
+        repairs=repairs,
+        quarantines=quarantines,
+        final_integrity=final_integrity,
+        final_edges=final_edges,
+        evidence_complete=evidence_complete,
+        limitations=limitations,
+    )
+    if _canonical_json(reconstructed) != payload:
         raise EvidenceError("graph evidence JSON is not canonical")
 
     return GraphEvidence(
@@ -553,10 +677,23 @@ def _parse_invocation_document(
         backend=backend,
         model=model,
         track_html=_HTML_ARTIFACT_PATH in paths,
+        validate_actual=False,
     )
     _require_environment_names(contract, backend, environment_names)
 
-    document = dict(value)
+    document = _invocation_document(
+        contract,
+        executable_sha256=executable_digest,
+        capability_smoke_digest=capability_digest,
+        commands=tuple(item.canonical_argv for item in commands),
+        backend=backend,
+        model=model,
+        configuration_sha256=configuration_digest,
+        source_digest=source_digest,
+        projection_digest=projection_digest,
+        environment_names=environment_names,
+        artifacts=tuple(bindings),
+    )
     payload = _canonical_json(document)
     digest = hashlib.sha256(_INVOCATION_DOMAIN + payload).hexdigest()
     return ExtractionInvocation(
@@ -605,13 +742,29 @@ def _require_artifact_descriptor(
         if invocation
         else "evidence artifact binding"
     )
-    if type(artifact) is not CapturedArtifact or (
-        type(artifact.payload) is not bytes
-        or type(artifact.sha256) is not str
-        or _HEX_DIGEST.fullmatch(artifact.sha256) is None
-        or hashlib.sha256(artifact.payload).hexdigest() != artifact.sha256
-        or type(artifact.byte_length) is not int
-        or artifact.byte_length != len(artifact.payload)
+    if type(artifact) is not CapturedArtifact:
+        raise EvidenceError(f"{description} is invalid")
+    try:
+        logical_path = artifact.logical_path
+        payload = artifact.payload
+        digest = artifact.sha256
+        byte_length = artifact.byte_length
+    except AttributeError:
+        raise EvidenceError(f"{description} is invalid") from None
+    if type(logical_path) is not PurePosixPath:
+        raise EvidenceError(f"{description} is invalid")
+    try:
+        confined = _confined_path(logical_path.as_posix())
+    except EvidenceError:
+        raise EvidenceError(f"{description} is invalid") from None
+    if (
+        confined != logical_path
+        or type(payload) is not bytes
+        or type(digest) is not str
+        or _HEX_DIGEST.fullmatch(digest) is None
+        or hashlib.sha256(payload).hexdigest() != digest
+        or type(byte_length) is not int
+        or byte_length != len(payload)
     ):
         raise EvidenceError(f"{description} is invalid")
     return artifact
@@ -781,6 +934,22 @@ def _final_edge_document(item: FinalEdgeEvidence) -> dict[str, object]:
     }
 
 
+def _pre_dedup_document(item: PreDedupEdgeEvidence) -> dict[str, object]:
+    return {
+        "occurrence_id": item.occurrence_id,
+        "source": item.source,
+        "target": item.target,
+        "relation": item.relation,
+        "confidence": item.confidence,
+        "source_file": item.source_file.as_posix() if item.source_file else None,
+        "source_line": item.source_line,
+        "source_column": item.source_column,
+        "final_edge_id": item.final_edge_id,
+        "disposition": item.disposition,
+        "reason": item.reason,
+    }
+
+
 def _parse_pre_dedup(
     value: object, contract: GraphifyCompatibility
 ) -> tuple[PreDedupEdgeEvidence, ...] | None:
@@ -940,13 +1109,35 @@ def _confined_path(value: object) -> PurePosixPath:
         or value in {"", "."}
         or "\\" in value
         or "\x00" in value
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
         or re.match(r"^[A-Za-z]:/", value) is not None
     ):
         raise EvidenceError("evidence path is not confined")
     path = PurePosixPath(value)
-    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+    if (
+        path.is_absolute()
+        or path.as_posix() != value
+        or any(part in {"", ".", ".."} for part in path.parts)
+    ):
         raise EvidenceError("evidence path is not confined")
     return path
+
+
+def _require_staged_files(
+    staged_files: object,
+) -> frozenset[PurePosixPath]:
+    if type(staged_files) is not frozenset:
+        raise EvidenceError("staged files must be an exact confined path set")
+    for item in staged_files:
+        if type(item) is not PurePosixPath:
+            raise EvidenceError("staged files must be an exact confined path set")
+        try:
+            confined = _confined_path(item.as_posix())
+        except EvidenceError:
+            raise EvidenceError("staged files must be an exact confined path set") from None
+        if confined != item:
+            raise EvidenceError("staged files must be an exact confined path set")
+    return staged_files
 
 
 def _nonempty_string(value: object, description: str) -> str:
@@ -1031,12 +1222,38 @@ def _require_canonical_commands(
     backend: str | None,
     model: str | None,
     track_html: bool,
+    validate_actual: bool = True,
 ) -> None:
-    if type(commands) is not tuple or tuple(
-        command.operation if type(command) is RenderedCommand else None
-        for command in commands
-    ) != ("extract", "diagnose", "cluster"):
+    if type(commands) is not tuple or len(commands) != 3:
         raise EvidenceError("invocation command order is invalid")
+    for command in commands:
+        if type(command) is not RenderedCommand:
+            raise EvidenceError("invocation command shape is invalid")
+        try:
+            operation = command.operation
+            argv = command.argv
+            canonical_argv = command.canonical_argv
+        except AttributeError:
+            raise EvidenceError("invocation command shape is invalid") from None
+        if (
+            type(operation) is not str
+            or type(argv) is not tuple
+            or len(argv) < 5
+            or type(canonical_argv) is not tuple
+            or any(type(token) is not str or not token for token in argv)
+            or any(
+                type(token) is not str or not token
+                for token in canonical_argv
+            )
+        ):
+            raise EvidenceError("invocation command shape is invalid")
+    if tuple(command.operation for command in commands) != (
+        "extract",
+        "diagnose",
+        "cluster",
+    ):
+        raise EvidenceError("invocation command order is invalid")
+    _require_public_model_identifier(backend, model)
 
     binary = Path("/logical/graphify")
     source = Path("/logical/source")
@@ -1055,7 +1272,7 @@ def _require_canonical_commands(
                     code_only=True,
                 )
             ]
-        elif isinstance(backend, str) and isinstance(model, str):
+        elif type(backend) is str and type(model) is str:
             extract_variants = [
                 render_graphify_argv(
                     contract,
@@ -1091,28 +1308,136 @@ def _require_canonical_commands(
     except CompatibilityError as error:
         raise EvidenceError("invocation canonical command is invalid") from error
 
-    if commands[0].canonical_argv not in {
-        item.canonical_argv for item in extract_variants
-    } or commands[1].canonical_argv != expected_diagnose.canonical_argv or commands[
-        2
-    ].canonical_argv != expected_cluster.canonical_argv:
-        raise EvidenceError("invocation canonical command is invalid")
-    for command, path_indexes in zip(
-        commands,
-        ({0, 2, 4}, {0, 4}, {0, 2, 4}),
-        strict=True,
+    selected_extract = next(
+        (
+            item
+            for item in extract_variants
+            if commands[0].canonical_argv == item.canonical_argv
+        ),
+        None,
+    )
+    if (
+        selected_extract is None
+        or commands[1].canonical_argv != expected_diagnose.canonical_argv
+        or commands[2].canonical_argv != expected_cluster.canonical_argv
     ):
-        if (
-            type(command.argv) is not tuple
-            or len(command.argv) != len(command.canonical_argv)
-            or any(type(token) is not str or not token for token in command.argv)
-            or any(
-                command.argv[index] != command.canonical_argv[index]
-                for index in range(len(command.argv))
-                if index not in path_indexes
-            )
-        ):
-            raise EvidenceError("invocation actual command disagrees with canonical argv")
+        raise EvidenceError("invocation canonical command is invalid")
+    if validate_actual:
+        _require_actual_command_binding(
+            contract,
+            commands,
+            backend=backend,
+            model=model,
+            deep="--mode" in selected_extract.canonical_argv,
+            track_html=track_html,
+        )
+
+
+def _require_public_model_identifier(
+    backend: str | None, model: str | None
+) -> None:
+    if backend is None and model is None:
+        return
+    if type(backend) is not str or not backend or type(model) is not str:
+        raise EvidenceError("invocation backend and model are inconsistent")
+    if (
+        not model
+        or len(model) > 128
+        or _PUBLIC_MODEL_IDENTIFIER.fullmatch(model) is None
+        or _SECRET_MODEL_COMPONENT.search(model) is not None
+    ):
+        raise EvidenceError("invocation requires a public model identifier")
+
+
+def _require_actual_command_binding(
+    contract: GraphifyCompatibility,
+    commands: tuple[RenderedCommand, ...],
+    *,
+    backend: str | None,
+    model: str | None,
+    deep: bool,
+    track_html: bool,
+) -> None:
+    extract, diagnose, cluster = commands
+    extract_binary = _actual_command_path(extract.argv[0])
+    extract_source = _actual_command_path(extract.argv[2])
+    extract_output = _actual_command_path(extract.argv[4])
+    diagnose_binary = _actual_command_path(diagnose.argv[0])
+    diagnose_graph = _actual_command_path(diagnose.argv[4])
+    cluster_binary = _actual_command_path(cluster.argv[0])
+    cluster_source = _actual_command_path(cluster.argv[2])
+    cluster_graph = _actual_command_path(cluster.argv[4])
+    if not (extract_binary == diagnose_binary == cluster_binary):
+        raise EvidenceError("invocation commands require one binary identity")
+    if diagnose_graph != extract_output / "graphify-out" / "graph.json":
+        raise EvidenceError("invocation command path relationship is invalid")
+    if cluster_graph != cluster_source / "graphify-out" / "graph.json":
+        raise EvidenceError("invocation command path relationship is invalid")
+    if len({extract_binary, extract_source, extract_output}) != 3 or len(
+        {cluster_binary, cluster_source, cluster_graph}
+    ) != 3:
+        raise EvidenceError("invocation command path relationship is invalid")
+
+    try:
+        expected_extract = render_graphify_argv(
+            contract,
+            "extract",
+            binary=extract_binary,
+            source=extract_source,
+            output=extract_output,
+            backend=backend,
+            model=model,
+            code_only=backend is None,
+            deep=deep,
+        )
+        expected_diagnose = render_graphify_argv(
+            contract,
+            "diagnose",
+            binary=diagnose_binary,
+            source=extract_source,
+            output=extract_output,
+            graph=diagnose_graph,
+        )
+        expected_cluster = render_graphify_argv(
+            contract,
+            "cluster",
+            binary=cluster_binary,
+            source=cluster_source,
+            output=cluster_source,
+            graph=cluster_graph,
+            track_html=track_html,
+        )
+    except CompatibilityError:
+        raise EvidenceError("invocation actual command is invalid") from None
+    if (
+        extract.argv != expected_extract.argv
+        or diagnose.argv != expected_diagnose.argv
+        or cluster.argv != expected_cluster.argv
+    ):
+        raise EvidenceError("invocation actual command disagrees with canonical argv")
+
+
+def _actual_command_path(value: object) -> Path:
+    if (
+        type(value) is not str
+        or not value
+        or len(value) > 4_096
+        or value.startswith("-")
+        or not value.startswith("/")
+        or value.startswith("//")
+        or "\\" in value
+        or "\x00" in value
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        raise EvidenceError("invocation actual command path is invalid")
+    path = PurePosixPath(value)
+    if (
+        not path.is_absolute()
+        or path.as_posix() != value
+        or any(part in {"", ".", ".."} for part in path.parts)
+    ):
+        raise EvidenceError("invocation actual command path is invalid")
+    return Path(value)
 
 
 def _require_environment_names(

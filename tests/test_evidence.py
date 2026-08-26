@@ -27,6 +27,7 @@ from project_knowledge.evidence import (
     build_graph_evidence,
     parse_graph_evidence,
 )
+from project_knowledge.integrity import canonical_final_edge_id
 
 
 def canonical_json(value: object) -> bytes:
@@ -50,7 +51,7 @@ def rendered_commands(
     binary = Path("/Users/private/bin/graphify")
     source = Path("/Users/private/staged/sk-live-secret")
     output = Path("/Users/private/raw")
-    native = output / "graph.json"
+    native = output / "graphify-out/graph.json"
     return (
         render_graphify_argv(
             selected,
@@ -73,9 +74,9 @@ def rendered_commands(
             selected,
             "cluster",
             binary=binary,
-            source=Path("/Users/private/cluster-workspace"),
+            source=Path("/Users/private/cluster"),
             output=Path("/Users/private/clustered"),
-            graph=Path("/Users/private/cluster-input/graph.json"),
+            graph=Path("/Users/private/cluster/graphify-out/graph.json"),
             track_html=track_html,
         ),
     )
@@ -290,6 +291,136 @@ def test_invocation_rejects_actual_nonpath_tokens_that_disagree_with_canonical()
         invocation_factory(commands=forged)
 
 
+@pytest.mark.parametrize(
+    "forged_extract",
+    [
+        lambda command: replace(command, argv=list(command.argv)),
+        lambda command: replace(command, argv=command.argv[:4]),
+        lambda command: replace(command, canonical_argv=list(command.canonical_argv)),
+        lambda command: replace(
+            command,
+            canonical_argv=(command.canonical_argv[0], ["extract"], *command.canonical_argv[2:]),
+        ),
+        lambda command: RenderedCommand(
+            {"operation": "extract"}, command.argv, command.canonical_argv
+        ),
+        lambda command: object.__new__(RenderedCommand),
+    ],
+)
+def test_invocation_rejects_nonexact_rendered_command_shapes(forged_extract) -> None:
+    commands = rendered_commands()
+    forged = (forged_extract(commands[0]), *commands[1:])
+
+    with pytest.raises(EvidenceError, match="command"):
+        invocation_factory(commands=forged)
+
+
+def mutate_actual_token(
+    commands: tuple[RenderedCommand, ...],
+    command_index: int,
+    token_index: int,
+    replacement: str,
+) -> tuple[RenderedCommand, ...]:
+    changed = list(commands)
+    command = changed[command_index]
+    argv = list(command.argv)
+    argv[token_index] = replacement
+    changed[command_index] = replace(command, argv=tuple(argv))
+    return tuple(changed)
+
+
+@pytest.mark.parametrize(
+    ("command_index", "token_index", "replacement"),
+    [
+        (0, 2, "--backend"),
+        (0, 2, "relative/source"),
+        (0, 4, "/Users/private/raw/../escape"),
+        (0, 4, "/Users/private//raw"),
+        (1, 4, "/Users/private/raw/./graph.json"),
+        (2, 4, "/Users/private/cluster-input/graph.json/"),
+        (2, 2, "/Users/private/cluster\nworkspace"),
+        (2, 4, "/Users/private/cluster\x00input/graph.json"),
+    ],
+)
+def test_invocation_rejects_unsafe_actual_path_operands(
+    command_index: int, token_index: int, replacement: str
+) -> None:
+    commands = mutate_actual_token(
+        rendered_commands(), command_index, token_index, replacement
+    )
+
+    with pytest.raises(EvidenceError, match="actual command path") as captured:
+        invocation_factory(commands=commands)
+    assert replacement not in str(captured.value)
+
+
+def test_invocation_requires_one_binary_identity_across_all_commands() -> None:
+    commands = mutate_actual_token(
+        rendered_commands(), 1, 0, "/opt/other/bin/graphify"
+    )
+
+    with pytest.raises(EvidenceError, match="binary"):
+        invocation_factory(commands=commands)
+
+
+def test_invocation_binds_diagnosis_to_the_extraction_output_graph() -> None:
+    commands = mutate_actual_token(
+        rendered_commands(), 1, 4, "/Users/private/other/graph.json"
+    )
+
+    with pytest.raises(EvidenceError, match="path relationship"):
+        invocation_factory(commands=commands)
+
+
+def test_invocation_binds_cluster_input_to_the_cluster_workspace() -> None:
+    commands = mutate_actual_token(
+        rendered_commands(), 2, 4, "/Users/private/other/graph.json"
+    )
+
+    with pytest.raises(EvidenceError, match="path relationship"):
+        invocation_factory(commands=commands)
+
+
+def test_invocation_rejects_an_option_in_the_cluster_graph_path_role() -> None:
+    commands = mutate_actual_token(rendered_commands(), 2, 4, "--graph")
+
+    with pytest.raises(EvidenceError, match="actual command path"):
+        invocation_factory(commands=commands)
+
+
+@pytest.mark.parametrize(
+    "model",
+    ["gpt-4.1-mini", "llama3.2:latest", "public-org/model-v2"],
+)
+def test_invocation_accepts_bounded_public_model_identifiers(model: str) -> None:
+    invocation = invocation_factory(model=model)
+
+    assert json.loads(invocation.payload)["model"] == model
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "/Users/private/model",
+        r"private\model",
+        "../private/model",
+        "sk-live-proof-token",
+        "Bearer proof-token",
+        "OPENAI_API_KEY=proof-token",
+        "model token",
+        "model\nname",
+        "secret:model",
+        "m" * 129,
+    ],
+)
+def test_invocation_rejects_private_or_secret_shaped_models_without_echo(
+    model: str,
+) -> None:
+    with pytest.raises(EvidenceError, match="public model identifier") as captured:
+        invocation_factory(model=model)
+    assert model not in str(captured.value)
+
+
 def fixture_document() -> dict[str, object]:
     payload = resources.files("project_knowledge.compatibility_fixtures").joinpath(
         "graphify_0_9_48.json"
@@ -299,7 +430,6 @@ def fixture_document() -> dict[str, object]:
 
 def fixture_pipeline(
     *,
-    normalization_quarantines: tuple[ReasonCount, ...] | None = None,
     remove_source_location: bool = False,
     diagnosis_mutation=None,
 ):
@@ -316,10 +446,6 @@ def fixture_pipeline(
     normalization = implementation.normalize_for_cluster(
         implementation.parse_post_dedup(native)
     )
-    if normalization_quarantines is not None:
-        normalization = replace(
-            normalization, quarantines=normalization_quarantines
-        )
     normalized = json.loads(normalization.cluster_input.payload)
     raw_clustered_document = {
         "directed": False,
@@ -334,7 +460,7 @@ def fixture_pipeline(
         "clustered/graph.json", canonical_json(raw_clustered_document)
     )
     final = artifact(
-        "clustered/graph.json",
+        "adapted/graph.json",
         implementation.adapt_clustered_graph(
             raw_clustered,
             staged_files=frozenset({PurePosixPath("fixture.py")}),
@@ -379,6 +505,55 @@ def build_fixture_evidence(**pipeline_overrides: object):
         normalization=normalization,
         clustered_graph=raw_clustered,
         final_graph=final,
+        staged_files=frozenset({PurePosixPath("fixture.py")}),
+    )
+
+
+def rebind_pipeline_invocation(
+    native: CapturedArtifact,
+    diagnosis_item: CapturedArtifact,
+    normalization: NormalizationResult,
+    raw_clustered: CapturedArtifact,
+):
+    return invocation_factory(
+        artifacts=(
+            native,
+            diagnosis_item,
+            normalization.cluster_input,
+            raw_clustered,
+            artifact("clustered/GRAPH_REPORT.md", b"# Graph report\n"),
+        )
+    )
+
+
+def build_from_pipeline(
+    pipeline,
+    *,
+    invocation=None,
+    normalization=None,
+    raw_clustered=None,
+    final=None,
+    staged_files=frozenset({PurePosixPath("fixture.py")}),
+):
+    (
+        original_invocation,
+        native,
+        diagnosis_item,
+        original_normalization,
+        original_clustered,
+        original_final,
+    ) = pipeline
+    return build_graph_evidence(
+        contract(),
+        source_digest="c" * 64,
+        projection_digest="d" * 64,
+        invocation=invocation or original_invocation,
+        native_graph=native,
+        diagnosis=diagnosis_item,
+        normalization=normalization or original_normalization,
+        clustered_graph=raw_clustered or original_clustered,
+        final_graph=final or original_final,
+        staged_files=staged_files,
     )
 
 
@@ -446,6 +621,151 @@ def test_evidence_parser_round_trips_identical_canonical_bytes() -> None:
     assert parsed.invocation.digest == built.extraction_invocation_digest
 
 
+def test_builder_rejects_a_valid_but_unrelated_final_graph() -> None:
+    pipeline = fixture_pipeline()
+    document = json.loads(pipeline[-1].payload)
+    edge = document["links"][0]
+    edge["relation"] = "unrelated_relation"
+    identity_input = {
+        key: value for key, value in edge.items() if key != "atlasweaver_edge_id"
+    }
+    edge["atlasweaver_edge_id"] = canonical_final_edge_id(
+        identity_input, contract().semantics
+    )
+    unrelated = artifact("adapted/graph.json", canonical_json(document))
+
+    with pytest.raises(EvidenceError, match="derived final graph"):
+        build_from_pipeline(pipeline, final=unrelated)
+
+
+def test_builder_rejects_unstaged_private_provenance_in_clustered_bytes() -> None:
+    pipeline = fixture_pipeline()
+    _, native, diagnosis_item, normalization, raw_clustered, final = pipeline
+    document = json.loads(raw_clustered.payload)
+    document["links"][0]["source_file"] = "private/.env"
+    private_clustered = artifact("clustered/graph.json", canonical_json(document))
+    invocation = rebind_pipeline_invocation(
+        native, diagnosis_item, normalization, private_clustered
+    )
+
+    with pytest.raises(EvidenceError, match="derived final graph") as captured:
+        build_from_pipeline(
+            pipeline,
+            invocation=invocation,
+            raw_clustered=private_clustered,
+            final=final,
+        )
+    assert "private/.env" not in str(captured.value)
+
+
+def test_builder_requires_the_fixed_final_graph_logical_path() -> None:
+    pipeline = fixture_pipeline()
+    wrong_path = artifact("clustered/graph.json", pipeline[-1].payload)
+
+    with pytest.raises(EvidenceError, match="derived final graph"):
+        build_from_pipeline(pipeline, final=wrong_path)
+
+
+@pytest.mark.parametrize(
+    "staged_files",
+    [
+        {PurePosixPath("fixture.py")},
+        frozenset({"fixture.py"}),
+        frozenset({Path("fixture.py")}),
+        frozenset({PurePosixPath("/private/fixture.py")}),
+        frozenset({PurePosixPath(".")}),
+    ],
+)
+def test_builder_requires_exact_confined_staged_files(staged_files: object) -> None:
+    with pytest.raises(EvidenceError, match="staged files"):
+        build_from_pipeline(fixture_pipeline(), staged_files=staged_files)
+
+
+def test_builder_rejects_oversized_final_before_any_json_parse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pipeline = fixture_pipeline()
+    oversized = artifact(
+        "clustered/graph.json", b" " * (GRAPH_EVIDENCE_MAX_BYTES + 1)
+    )
+
+    def must_not_parse(*args, **kwargs):
+        raise AssertionError("JSON parser must not run")
+
+    monkeypatch.setattr(json, "loads", must_not_parse)
+    with pytest.raises(EvidenceError, match="final graph size cap"):
+        build_from_pipeline(pipeline, final=oversized)
+
+
+def test_builder_rejects_oversized_clustered_before_any_json_parse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pipeline = fixture_pipeline()
+    _, native, diagnosis_item, normalization, _, final = pipeline
+    oversized = artifact(
+        "clustered/graph.json", b" " * (GRAPH_EVIDENCE_MAX_BYTES + 1)
+    )
+    invocation = rebind_pipeline_invocation(
+        native, diagnosis_item, normalization, oversized
+    )
+
+    def must_not_parse(*args, **kwargs):
+        raise AssertionError("JSON parser must not run")
+
+    monkeypatch.setattr(json, "loads", must_not_parse)
+    with pytest.raises(EvidenceError, match="clustered graph size cap"):
+        build_from_pipeline(
+            pipeline,
+            invocation=invocation,
+            raw_clustered=oversized,
+            final=final,
+        )
+
+
+def mutate_normalization_cluster_input(
+    normalization: NormalizationResult,
+) -> NormalizationResult:
+    document = json.loads(normalization.cluster_input.payload)
+    document["input_tokens"] = 1
+    return replace(
+        normalization,
+        cluster_input=artifact("cluster-input/graph.json", canonical_json(document)),
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda value: replace(
+            value,
+            observed_integrity=replace(
+                value.observed_integrity,
+                node_count=value.observed_integrity.node_count + 1,
+            ),
+        ),
+        mutate_normalization_cluster_input,
+        lambda value: replace(
+            value, repairs=(ReasonCount("unique_exact_node_alias", 1),)
+        ),
+        lambda value: replace(value, quarantines=()),
+    ],
+)
+def test_builder_rejects_every_caller_mutation_of_normalization(mutation) -> None:
+    pipeline = fixture_pipeline()
+    _, native, diagnosis_item, normalization, raw_clustered, _ = pipeline
+    mutated = mutation(normalization)
+    invocation = rebind_pipeline_invocation(
+        native, diagnosis_item, mutated, raw_clustered
+    )
+
+    with pytest.raises(EvidenceError, match="normalization result"):
+        build_from_pipeline(
+            pipeline,
+            invocation=invocation,
+            normalization=mutated,
+        )
+
+
 @pytest.mark.parametrize(
     "field",
     [
@@ -480,40 +800,32 @@ def test_diagnosis_requires_false_effective_directed() -> None:
         build_fixture_evidence(diagnosis_mutation=mutation)
 
 
-@pytest.mark.parametrize(
-    ("overrides", "expected"),
-    [
-        (
-            {"normalization_quarantines": ()},
-            ("pre_dedup_edge_projection_unavailable",),
-        ),
-        (
-            {
-                "normalization_quarantines": (
-                    ReasonCount("dangling_endpoint", 1),
-                )
-            },
-            (
-                "pre_dedup_edge_projection_unavailable",
-                "raw_endpoint_unresolved",
-            ),
-        ),
-        (
-            {
-                "normalization_quarantines": (),
-                "remove_source_location": True,
-            },
-            (
-                "impact_edge_provenance_incomplete",
-                "pre_dedup_edge_projection_unavailable",
-            ),
-        ),
-    ],
-)
-def test_evidence_limitations_are_independently_derived_sorted_and_unique(
-    overrides: dict[str, object], expected: tuple[str, ...]
-) -> None:
-    assert build_fixture_evidence(**overrides).limitations == expected
+def test_evidence_limitations_are_independently_derived_sorted_and_unique() -> None:
+    evidence = build_fixture_evidence()
+    complete_edges = evidence.final_edges
+    missing_provenance = (
+        replace(complete_edges[0], source_line=None),
+        *complete_edges[1:],
+    )
+
+    assert evidence_module._derive_evidence_limitations(
+        contract(), (), complete_edges, pre_dedup=None
+    ) == ("pre_dedup_edge_projection_unavailable",)
+    assert evidence_module._derive_evidence_limitations(
+        contract(),
+        (ReasonCount("dangling_endpoint", 1),),
+        complete_edges,
+        pre_dedup=None,
+    ) == (
+        "pre_dedup_edge_projection_unavailable",
+        "raw_endpoint_unresolved",
+    )
+    assert evidence_module._derive_evidence_limitations(
+        contract(), (), missing_provenance, pre_dedup=None
+    ) == (
+        "impact_edge_provenance_incomplete",
+        "pre_dedup_edge_projection_unavailable",
+    )
 
 
 def mutate_evidence(mutator) -> bytes:
@@ -608,6 +920,103 @@ def test_evidence_parser_rejects_alternate_json_encoding() -> None:
         parse_graph_evidence(payload, contract())
 
 
+@pytest.mark.parametrize(
+    "source_file",
+    ["dir//x.py", "dir/./x.py", "fixture.py/"],
+)
+def test_evidence_parser_rejects_noncanonical_final_source_paths(
+    source_file: str,
+) -> None:
+    payload = mutate_evidence(
+        lambda value: value["final_edges"][0].update(source_file=source_file)
+    )
+
+    with pytest.raises(EvidenceError, match="path"):
+        parse_graph_evidence(payload, contract())
+
+
+@pytest.mark.parametrize(
+    ("canonical", "alias"),
+    [
+        ("cluster-input/graph.json", "cluster-input//graph.json"),
+        ("cluster-input/graph.json", "cluster-input/./graph.json"),
+        ("cluster-input/graph.json", "cluster-input/graph.json/"),
+        ("clustered/GRAPH_REPORT.md", "clustered//GRAPH_REPORT.md"),
+        ("clustered/GRAPH_REPORT.md", "clustered/./GRAPH_REPORT.md"),
+        ("clustered/GRAPH_REPORT.md", "clustered/GRAPH_REPORT.md/"),
+        ("clustered/graph.json", "clustered//graph.json"),
+        ("clustered/graph.json", "clustered/./graph.json"),
+        ("clustered/graph.json", "clustered/graph.json/"),
+        ("raw/diagnose.json", "raw//diagnose.json"),
+        ("raw/diagnose.json", "raw/./diagnose.json"),
+        ("raw/diagnose.json", "raw/diagnose.json/"),
+        ("raw/graph.json", "raw//graph.json"),
+        ("raw/graph.json", "raw/./graph.json"),
+        ("raw/graph.json", "raw/graph.json/"),
+    ],
+)
+def test_evidence_parser_rejects_noncanonical_invocation_artifact_paths(
+    canonical: str, alias: str
+) -> None:
+    document = json.loads(build_fixture_evidence().payload)
+    bindings = document["extraction_invocation"]["artifacts"]
+    selected = next(item for item in bindings if item["path"] == canonical)
+    selected["path"] = alias
+    invocation_payload = canonical_json(document["extraction_invocation"])
+    document["extraction_invocation_digest"] = hashlib.sha256(
+        b"atlasweaver-graphify-pipeline-v1\0" + invocation_payload
+    ).hexdigest()
+    payload = canonical_json(document)
+
+    with pytest.raises(EvidenceError, match="path"):
+        parse_graph_evidence(payload, contract())
+
+
+def forged_artifact_descriptor(**changes: object) -> CapturedArtifact:
+    baseline = artifact("raw/graph.json", b"proof\n")
+    forged = object.__new__(CapturedArtifact)
+    values = {
+        "logical_path": baseline.logical_path,
+        "payload": baseline.payload,
+        "sha256": baseline.sha256,
+        "byte_length": baseline.byte_length,
+    }
+    values.update(changes)
+    for name, value in values.items():
+        object.__setattr__(forged, name, value)
+    return forged
+
+
+@pytest.mark.parametrize(
+    "forged",
+    [
+        forged_artifact_descriptor(logical_path="private-proof/graph.json"),
+        forged_artifact_descriptor(logical_path=Path("raw/graph.json")),
+        forged_artifact_descriptor(logical_path=PurePosixPath("/private-proof/graph.json")),
+        forged_artifact_descriptor(payload=bytearray(b"proof\n")),
+        forged_artifact_descriptor(sha256="A" * 64),
+        forged_artifact_descriptor(sha256="0" * 64),
+        forged_artifact_descriptor(byte_length=True),
+        forged_artifact_descriptor(byte_length=999),
+    ],
+)
+def test_artifact_descriptor_boundary_rejects_forgery_without_details(
+    forged: CapturedArtifact,
+) -> None:
+    with pytest.raises(EvidenceError, match="artifact binding") as captured:
+        evidence_module._require_artifact_descriptor(forged)
+    assert captured.value.__cause__ is None
+    assert "private-proof" not in str(captured.value)
+
+
+def test_artifact_descriptor_boundary_sanitizes_missing_fields() -> None:
+    forged = object.__new__(CapturedArtifact)
+
+    with pytest.raises(EvidenceError, match="artifact binding") as captured:
+        evidence_module._require_artifact_descriptor(forged)
+    assert captured.value.__cause__ is None
+
+
 def test_graph_evidence_size_boundary_is_checked_before_json_allocation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -664,6 +1073,7 @@ def test_diagnosis_is_rejected_above_its_cap_before_parsing() -> None:
             normalization=normalization,
             clustered_graph=raw_clustered,
             final_graph=final,
+            staged_files=frozenset({PurePosixPath("fixture.py")}),
         )
 
 
@@ -688,6 +1098,7 @@ def test_builder_rejects_unbound_source_projection_and_artifacts() -> None:
             normalization=normalization,
             clustered_graph=raw_clustered,
             final_graph=final,
+            staged_files=frozenset({PurePosixPath("fixture.py")}),
         )
     with pytest.raises(EvidenceError, match="artifact binding"):
         build_graph_evidence(
@@ -700,4 +1111,5 @@ def test_builder_rejects_unbound_source_projection_and_artifacts() -> None:
             normalization=normalization,
             clustered_graph=artifact("clustered/graph.json", b"different\n"),
             final_graph=final,
+            staged_files=frozenset({PurePosixPath("fixture.py")}),
         )
