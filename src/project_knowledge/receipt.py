@@ -16,9 +16,13 @@ from .models import ProjectManifest
 from .staging import StagedInput
 
 
-_FIELDS = frozenset(
+_V1_FIELDS = frozenset(
     {"schema_version", "project_id", "graphify_version", "source_digest", "files"}
 )
+_V2_FIELDS = frozenset({
+    "schema_version", "project_id", "project_uid", "graphify_version",
+    "source_digest", "projection_digest", "files", "reason_counts",
+})
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 
 
@@ -34,6 +38,10 @@ class StagingReceipt:
     graphify_version: str
     source_digest: str
     files: tuple[PurePosixPath, ...]
+    schema_version: int = 1
+    project_uid: str | None = None
+    projection_digest: str | None = None
+    reason_counts: tuple[tuple[str, int], ...] = ()
 
 
 def write_staging_receipt(
@@ -76,19 +84,34 @@ def _write_staging_receipt_at(
     """Write through an already-bound parent directory descriptor."""
     if name in {"", ".", ".."} or "/" in name or "\\" in name:
         raise ReceiptError("staging receipt name is invalid")
+    schema_version = 2 if manifest.schema_version == 2 else 1
+    if schema_version == 2 and (
+        manifest.project_uid is None or staged.projection_digest is None
+    ):
+        raise ReceiptError("staging receipt projection is required")
     receipt = StagingReceipt(
         project_id=manifest.project_id,
         graphify_version=manifest.graphify_version,
         source_digest=staged.source_digest,
         files=staged.files,
+        schema_version=schema_version,
+        project_uid=(None if manifest.project_uid is None else str(manifest.project_uid)),
+        projection_digest=staged.projection_digest,
+        reason_counts=staged.reason_counts,
     )
-    document = {
-        "schema_version": 1,
+    document: dict[str, object] = {
+        "schema_version": schema_version,
         "project_id": receipt.project_id,
         "graphify_version": receipt.graphify_version,
         "source_digest": receipt.source_digest,
         "files": [item.as_posix() for item in receipt.files],
     }
+    if schema_version == 2:
+        document.update({
+            "project_uid": receipt.project_uid,
+            "projection_digest": receipt.projection_digest,
+            "reason_counts": dict(receipt.reason_counts),
+        })
     payload = (
         json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n"
     ).encode("utf-8")
@@ -154,9 +177,12 @@ def load_staging_receipt(path: Path, manifest: ProjectManifest) -> StagingReceip
         raise
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ReceiptError("staging receipt is invalid") from error
-    if not isinstance(document, Mapping) or set(document) != _FIELDS:
+    if not isinstance(document, Mapping):
         raise ReceiptError("staging receipt schema is invalid")
-    if type(document["schema_version"]) is not int or document["schema_version"] != 1:
+    schema_version = document.get("schema_version")
+    if type(schema_version) is not int or schema_version not in {1, 2}:
+        raise ReceiptError("staging receipt schema is invalid")
+    if set(document) != (_V1_FIELDS if schema_version == 1 else _V2_FIELDS):
         raise ReceiptError("staging receipt schema is invalid")
     if document["project_id"] != manifest.project_id:
         raise ReceiptError("staging receipt project mismatch")
@@ -171,11 +197,34 @@ def load_staging_receipt(path: Path, manifest: ProjectManifest) -> StagingReceip
     files = tuple(_confined_path(item) for item in raw_files)
     if list(raw_files) != sorted(set(raw_files)):
         raise ReceiptError("staging receipt files must be sorted and unique")
+    project_uid: str | None = None
+    projection_digest: str | None = None
+    reason_counts: tuple[tuple[str, int], ...] = ()
+    if schema_version == 2:
+        project_uid = document["project_uid"]
+        if manifest.project_uid is None or project_uid != str(manifest.project_uid):
+            raise ReceiptError("staging receipt project mismatch")
+        projection_digest = document["projection_digest"]
+        if type(projection_digest) is not str or _DIGEST.fullmatch(projection_digest) is None:
+            raise ReceiptError("staging receipt projection digest is invalid")
+        raw_counts = document["reason_counts"]
+        if type(raw_counts) is not dict or any(
+            type(name) is not str or type(count) is not int or count < 0
+            for name, count in raw_counts.items()
+        ):
+            raise ReceiptError("staging receipt reason counts are invalid")
+        if list(raw_counts) != sorted(raw_counts):
+            raise ReceiptError("staging receipt reason counts are invalid")
+        reason_counts = tuple(raw_counts.items())
     return StagingReceipt(
         project_id=manifest.project_id,
         graphify_version=manifest.graphify_version,
         source_digest=source_digest,
         files=files,
+        schema_version=schema_version,
+        project_uid=project_uid,
+        projection_digest=projection_digest,
+        reason_counts=reason_counts,
     )
 
 
@@ -192,7 +241,11 @@ def verify_staged_input(root: Path, receipt: StagingReceipt) -> StagedInput:
     value = digest.hexdigest()
     if value != receipt.source_digest:
         raise ReceiptError("staged input does not match receipt")
-    return StagedInput(root=stage, source_digest=value, files=paths)
+    return StagedInput(
+        root=stage, source_digest=value, files=paths,
+        projection_digest=receipt.projection_digest,
+        reason_counts=receipt.reason_counts,
+    )
 
 
 def _capture_tree(root: Path) -> tuple[tuple[PurePosixPath, bytes], ...]:

@@ -36,6 +36,9 @@ class StagedInput:
     root: Path
     source_digest: str
     files: tuple[PurePosixPath, ...]
+    projection_digest: str | None = None
+    reason_counts: tuple[tuple[str, int], ...] = ()
+    coverage_approvals: tuple[str, ...] = ()
 
 
 def stage_input(
