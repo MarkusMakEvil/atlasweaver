@@ -23,6 +23,10 @@ on:
         type: boolean
         required: false
         default: false
+      require-impact-trust:
+        type: boolean
+        required: false
+        default: false
     secrets:
       semantic_backend_token:
         required: false
@@ -127,6 +131,7 @@ jobs:
       - name: Refresh private graph (code-only)
         if: ${{ inputs.backend == '' && inputs.model == '' && !inputs.deep-mode }}
         env:
+          ATLASWEAVER_REQUIRE_IMPACT_TRUST: ${{ inputs.require-impact-trust }}
           ATLASWEAVER_REPO_ROOT: ${{ inputs.repo-root }}
         run: >-
           uv run --project "$GITHUB_WORKSPACE/atlasweaver-tool"
@@ -143,6 +148,7 @@ jobs:
           ATLASWEAVER_BACKEND_TOKEN: ${{ secrets.semantic_backend_token }}
           ATLASWEAVER_DEEP: ${{ inputs.deep-mode }}
           ATLASWEAVER_MODEL: ${{ inputs.model }}
+          ATLASWEAVER_REQUIRE_IMPACT_TRUST: ${{ inputs.require-impact-trust }}
           ATLASWEAVER_REPO_ROOT: ${{ inputs.repo-root }}
         run: >-
           uv run --project "$GITHUB_WORKSPACE/atlasweaver-tool"
