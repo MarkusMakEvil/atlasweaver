@@ -66,10 +66,12 @@ def run_cli(
     )
 
 
-def payload(result: subprocess.CompletedProcess[str]) -> dict[str, object]:
+def payload(
+    result: subprocess.CompletedProcess[str], *, schema_version: int = SCHEMA_VERSION
+) -> dict[str, object]:
     assert result.stderr == ""
     value = json.loads(result.stdout)
-    assert value["schema_version"] == SCHEMA_VERSION
+    assert value["schema_version"] == schema_version
     return value
 
 
@@ -687,7 +689,7 @@ def test_health_reports_source_drift_without_atlas_path_or_sensitive_names(
     )
 
     assert result.returncode == 0
-    document = payload(result)
+    document = payload(result, schema_version=2)
     assert document["command"] == "health"
     assert document["status"] == "missing"
     assert document["issues"] == ["graph_missing"]
