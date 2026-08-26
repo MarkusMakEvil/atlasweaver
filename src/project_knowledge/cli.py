@@ -31,6 +31,7 @@ from .graphify import (
 )
 from .health import assess_health, inspect_project_state, safe_input_snapshot
 from .manifest import ManifestError, load_manifest
+from .locking import repository_lifecycle_lock
 from .models import ProjectManifest
 from .privacy import PrivacyError
 from .receipt import ReceiptError, load_staging_receipt, verify_staged_input
@@ -343,8 +344,9 @@ def _promote(
     with tempfile.TemporaryDirectory(prefix="project-knowledge-promote-") as temporary:
         clone = _clone_graph_candidate(arguments.candidate, Path(temporary) / "candidate")
         validated = validate_candidate(clone, staged, manifest)
-        _require_current_input(repo, manifest, staged)
-        promoted = promote_graph(validated, repo)
+        with repository_lifecycle_lock(repo):
+            _require_current_input(repo, manifest, staged)
+            promoted = promote_graph(validated, repo)
         return _success(
             "promote",
             "promoted",
