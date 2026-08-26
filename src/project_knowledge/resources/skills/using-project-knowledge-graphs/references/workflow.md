@@ -103,6 +103,43 @@ visible mutations.
 
 Refresh only after architecture, module-boundary, schema, public-interface, or substantial documentation changes. Skip it for trivial copy, formatting, comments, and isolated one-line edits.
 
+## Bundles, pull, and agent resources
+
+Packing and local installation are explicit and must bind the same current safe
+projection. A GitHub Release bundle cannot be installed through the offline
+path; use the verified same-process pull boundary:
+
+```sh
+project-knowledge artifact pack --repo <repo> --output <bundle.zip> --json
+project-knowledge artifact install --repo <matching-clone> --bundle <bundle.zip> --json
+project-knowledge pull --repo <repo> --json
+project-knowledge install-agent --platform codex --json
+```
+
+Remote pull is networked and requires separate approval. It validates the
+repository numeric identity, immutable commit, exact release asset, signer
+workflow/digest, attestation, and bundle identity before promotion. Registry
+sync is still separate. Hooks, Obsidian export, publication, commits, and pushes
+remain separately authorized mutations.
+
+## Universal fleet operation
+
+Fleet configuration contains only generic display IDs, relative repository
+paths, and bounded parallelism. It has no product-specific layout or defaults.
+Run only the selected operation:
+
+```sh
+project-knowledge fleet health --workspace <fleet.yaml> --json
+project-knowledge fleet refresh --workspace <fleet.yaml> --code-only --json
+project-knowledge fleet registry-sync --workspace <fleet.yaml> --json
+project-knowledge fleet query --workspace <fleet.yaml> query <term> --json
+```
+
+Fleet output preserves configuration order. A failed repository does not roll
+back another completed repository. Fleet query reads one atomic verified
+registry snapshot and never performs an implicit sync. Treat Graphify 0.9.48
+fleet query results as navigation and source-verify every impact conclusion.
+
 ## Obsidian export
 
 Graphify writes only to a staged atlas candidate. Never point it at the live atlas.
@@ -126,5 +163,10 @@ Stop without mutation when any of these occurs:
 - the graph is stale and the user has not approved refresh;
 - `Generated/` contains an unknown or unmanaged entry;
 - the requested mutation or destination lacks exact approval.
+- a local install is asked to accept a GitHub-provider bundle, attestation or
+  immutable release identity cannot be proven, or a redirect leaves the fixed
+  GitHub host allowlist;
+- fleet repositories alias, nest, share a Git worktree common directory, or
+  change identity/manifest after admission;
 
 Never install hooks, edit project instructions, alter human notes, expose secrets, publish, send messages, commit, or push unless that exact action is separately in scope.

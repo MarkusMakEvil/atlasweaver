@@ -20,6 +20,12 @@ it is not a replacement for the ordinary doctor/refresh lifecycle.
 Never point Graphify at the repository root; only AtlasWeaver's private staged
 projection may be extracted.
 
+Local bundle pack/install, verified remote pull, agent-resource installation,
+fleet refresh/pull/registry synchronization, and workflow publication are
+separate explicit mutations. Never infer one from permission to run another.
+There is no local publish command; publication is available only through the
+reviewed split-privilege reusable workflow.
+
 Use `project-knowledge scan-secrets` before an approved stage. Its findings are
 redacted fingerprints. High-confidence structured credentials are
 non-bypassable; only an exact reviewed contextual false positive may be

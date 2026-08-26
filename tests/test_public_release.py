@@ -130,7 +130,16 @@ def test_workflows_have_no_floating_official_actions_or_write_permissions() -> N
     for path in workflows:
         text = path.read_text(encoding="utf-8")
         assert re.search(r"actions/[^@\s]+@v[0-9]+", text) is None, path
-        assert re.search(r"(?m)^\s+[a-z-]+:\s*write\s*$", text) is None, path
+        writes = re.findall(r"(?m)^\s+([a-z-]+):\s*write\s*$", text)
+        if path.name == "atlasweaver-publish.yml":
+            assert sorted(writes) == ["attestations", "contents", "id-token"]
+        elif path.name == "atlasweaver-self-publish.yml":
+            assert sorted(writes) == [
+                "attestations", "attestations", "contents", "contents",
+                "id-token", "id-token",
+            ]
+        else:
+            assert writes == [], path
 
 
 def test_primary_ci_resolves_graphify_from_registry_and_keeps_adoption_gates() -> None:

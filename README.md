@@ -78,6 +78,70 @@ Disabled optional features do not lower core health. Query operations are
 immutable, bounded snapshots. A `navigation` trust result is useful for finding
 code, but every consequential impact claim still needs source verification.
 
+## Portable bundles and universal fleets
+
+An exact validated generation can be moved to a matching clean clone without
+re-running Graphify:
+
+```sh
+project-knowledge artifact pack --repo <repo> --output graph.zip --json
+project-knowledge artifact install --repo <matching-clone> --bundle graph.zip --json
+project-knowledge pull --repo <repo> --json
+project-knowledge install-agent --platform codex --json
+```
+
+Local installation accepts only `provider: none`. `pull` is the explicit
+networked path for `github-release`: it binds the GitHub repository numeric ID,
+commit, tag, asset digest, workflow signer, attestation, source digest, and
+privacy projection before promotion. AtlasWeaver follows at most three HTTPS
+redirects across its fixed GitHub host allowlist and never forwards API
+authorization across hosts. Bundles are deterministic uncompressed ZIPs capped
+at 256 MiB total, 255 MiB aggregate payload, and 128 MiB per entry. There is no
+local publish command.
+
+The optional provider block is project-owned and contains no product defaults:
+
+```yaml
+artifacts:
+  provider: github-release
+  host: github.com
+  repository: owner/repository
+  repository_id: 123456789
+  channel: main
+  source_ref: refs/heads/main
+  signer_workflow: owner/atlasweaver/.github/workflows/atlasweaver-publish.yml
+  signer_digest: 0123456789abcdef0123456789abcdef01234567
+```
+
+Fleet mode is a universal coordinator over arbitrary schema-v2 repositories.
+It does not contain BrandMap-specific IDs, paths, defaults, or business logic:
+
+```yaml
+schema_version: 1
+projects:
+  - id: api
+    repository: repos/api
+  - id: documentation
+    repository: repos/documentation
+defaults:
+  max_parallel: 2
+```
+
+```sh
+project-knowledge fleet health --workspace fleet.yaml --json
+project-knowledge fleet refresh --workspace fleet.yaml --code-only --json
+project-knowledge fleet registry-sync --workspace fleet.yaml --json
+project-knowledge fleet query --workspace fleet.yaml query ProjectManifest --limit 20 --json
+```
+
+Fleet ordering follows configuration order, parallelism is bounded to 1–8,
+and one repository's failure never rolls back another completed repository.
+The registry key is always `atlasweaver/<project_uid>`; display IDs are never
+authority. Registry synchronization remains a separate explicit mutation.
+Reusable check and split-privilege publication workflows are opt-in. Rolling
+publication retains the 20 newest digest-addressed assets only after the new
+asset has been remotely verified.
+
 ### Low-level recovery
 
 Use the manual pipeline only when diagnosing or recovering a failed lifecycle:
