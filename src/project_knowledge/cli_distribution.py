@@ -213,6 +213,7 @@ def _dispatch_fleet(
         expected_admissions=admissions,
     )
     document = result.to_dict()
+    document.pop("operation", None)
     document["command"] = f"fleet {operation}"
     return DistributionResponse(document, 0 if result.status == "ok" else 1)
 
@@ -295,7 +296,7 @@ def _fleet_query_request(arguments: argparse.Namespace) -> RegistryQueryRequest:
 
 
 def _install_document(command: str, result: object) -> dict[str, object]:
-    return _success(
+    document = _success(
         command,
         result.status,
         project_id=result.project_id,
@@ -304,8 +305,10 @@ def _install_document(command: str, result: object) -> dict[str, object]:
         generation_digest=result.generation_digest,
         build_epoch=result.build_epoch,
         changed=result.changed,
-        recovery_id=result.recovery_id,
     )
+    if result.recovery_id is not None:
+        document["recovery_id"] = result.recovery_id
+    return document
 
 
 def _success(command: str, status: str, **fields: object) -> dict[str, object]:
