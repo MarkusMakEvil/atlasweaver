@@ -1629,9 +1629,15 @@ def _map_distribution_error(error: Exception) -> CliFailure | None:
         (FleetConfigError, FLEET_PUBLIC_ERRORS, (1, "fleet_invalid", "fleet request is invalid")),
     )
     for family, table, fallback in families:
-        if type(error) is not family:
+        if not isinstance(error, family):
             continue
+        if type(error) is not family:
+            exit_code, code, message = fallback
+            return CliFailure(code, message, exit_code)
         raw_code = getattr(error, "code", None)
+        if type(raw_code) is not str:
+            exit_code, code, message = fallback
+            return CliFailure(code, message, exit_code)
         selected = table.get(raw_code)
         if selected is None:
             exit_code, code, message = fallback
