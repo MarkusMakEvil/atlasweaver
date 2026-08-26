@@ -2,21 +2,53 @@
 
 from __future__ import annotations
 
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import dataclass, field
 import hashlib
+import fcntl
 import json
 import math
 import os
 from pathlib import Path, PurePosixPath
 import re
+import secrets
 import shutil
 import stat
 import struct
 import tempfile
-from typing import Any, Literal
+import threading
+import time
+from typing import Any, Iterator, Literal, TYPE_CHECKING
 from uuid import UUID
 import zlib
+
+from .artifacts import (
+    ArtifactValidationError,
+    GitIdentity as ArtifactGitIdentity,
+    ValidatedGraph,
+    promote_graph,
+    validate_candidate,
+    validate_owned_graph,
+)
+from .compatibility import resolve_graphify_compatibility
+from .evidence import GRAPH_EVIDENCE_MAX_BYTES, parse_graph_evidence
+from .locking import (
+    RepositoryIdentity,
+    capture_lifecycle_repository,
+    repository_lifecycle_lock,
+)
+from .manifest import (
+    ManifestError,
+    assert_current_manifest_unchanged,
+    inspect_init_journal,
+    load_manifest,
+    require_current_manifest,
+)
+from .models import ProjectManifest
+from .staging import StagedInput, StagingError, stage_input
+
+if TYPE_CHECKING:
+    from .github_artifacts import DownloadReceipt, VerifiedAttestation
 
 
 ARTIFACT_SCHEMA_VERSION = 1
@@ -796,9 +828,730 @@ def _nofollow() -> int:
     return getattr(os, "O_NOFOLLOW", 0)
 
 
+# -- Atomic install and same-process pull authorization -------------------
+
+
+@dataclass(frozen=True)
+class InstallResult:
+    project_id: str
+    project_uid: str
+    graph_digest: str | None
+    generation_digest: str | None
+    build_epoch: int | None
+    changed: bool | None
+    status: Literal["installed", "already_current", "promoted_but_stale"]
+    recovery_id: str | None = None
+
+    def __post_init__(self) -> None:
+        complete = (
+            self.graph_digest is not None
+            and self.generation_digest is not None
+            and self.build_epoch is not None
+        )
+        if (
+            type(self.project_id) is not str
+            or not self.project_id
+            or type(self.project_uid) is not str
+            or self.status not in {"installed", "already_current", "promoted_but_stale"}
+            or (self.status in {"installed", "already_current"} and not complete)
+            or (self.status in {"installed", "already_current"} and self.recovery_id is not None)
+            or (self.status == "installed" and self.changed is not True)
+            or (self.status == "already_current" and self.changed is not False)
+            or (self.recovery_id is not None and _RECOVERY.fullmatch(self.recovery_id) is None)
+        ):
+            raise BundleError("bundle_invalid")
+        if complete:
+            _require_digest(self.graph_digest)
+            _require_digest(self.generation_digest)
+            if type(self.build_epoch) is not int or self.build_epoch <= 0:
+                raise BundleError("bundle_invalid")
+        elif any(value is not None for value in (
+            self.graph_digest, self.generation_digest, self.build_epoch, self.changed
+        )):
+            raise BundleError("bundle_invalid")
+
+
+@dataclass(frozen=True)
+class _InstallExecution:
+    result: InstallResult
+    promotion_committed: bool
+
+
+@dataclass
+class _InstallCommitState:
+    promotion_committed: bool = False
+    project_id: str | None = None
+    project_uid: str | None = None
+    installed: ValidatedGraph | None = None
+
+
+class OperationTempCleanupError(RuntimeError):
+    def __init__(self, operation: str, recovery_id: str) -> None:
+        if operation not in {"pack", "install", "pull", "publication"}:
+            raise ValueError("operation is invalid")
+        if _RECOVERY.fullmatch(recovery_id) is None:
+            raise ValueError("recovery ID is invalid")
+        self.operation = operation
+        self.recovery_id = recovery_id
+        super().__init__("private operation cleanup failed")
+
+
+@dataclass
+class ManagedOperationTempRoot:
+    path: Path
+    cleanup_failed: bool = False
+
+
+class OperationTempFileSystem:
+    def checkpoint(self, operation: str) -> None:
+        del operation
+
+    def remove_tree(self, path: Path) -> None:
+        shutil.rmtree(path)
+
+
+REAL_OPERATION_TEMP_FS = OperationTempFileSystem()
+
+
+@contextmanager
+def managed_operation_temp_root(
+    operation: str,
+    recovery_id: str,
+    *,
+    fs: OperationTempFileSystem = REAL_OPERATION_TEMP_FS,
+) -> Iterator[ManagedOperationTempRoot]:
+    if operation not in {"pack", "install", "pull", "publication"} or _RECOVERY.fullmatch(recovery_id) is None:
+        raise ValueError("managed operation identity is invalid")
+    try:
+        path = Path(tempfile.mkdtemp(prefix=f"atlasweaver-{operation}-"))
+        path.chmod(0o700)
+    except OSError:
+        raise OperationTempCleanupError(operation, recovery_id) from None
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path, os.O_RDONLY | os.O_DIRECTORY | _nofollow() | os.O_CLOEXEC
+        )
+        opened = os.fstat(descriptor)
+    except OSError:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            shutil.rmtree(path)
+        except OSError:
+            pass
+        raise OperationTempCleanupError(operation, recovery_id) from None
+    managed = ManagedOperationTempRoot(path)
+    pending: BaseException | None = None
+    try:
+        yield managed
+    except BaseException as error:
+        pending = error
+        raise
+    finally:
+        try:
+            fs.checkpoint(f"{operation}-cleanup")
+            named = path.stat(follow_symlinks=False)
+            current = os.fstat(descriptor)
+            if (
+                not stat.S_ISDIR(named.st_mode)
+                or (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino)
+                or (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino)
+            ):
+                raise OSError("temporary root identity changed")
+            fs.remove_tree(path)
+        except Exception:
+            managed.cleanup_failed = True
+            if pending is not None and isinstance(pending, Exception):
+                raise OperationTempCleanupError(operation, recovery_id) from None
+        finally:
+            try:
+                os.close(descriptor)
+            except OSError:
+                managed.cleanup_failed = True
+
+
+@dataclass(frozen=True)
+class _PullAuthorization:
+    nonce: str
+
+
+_AUTHORIZED_PULLS: dict[int, tuple[_PullAuthorization, str, int, int]] = {}
+_AUTHORIZED_PULLS_LOCK = threading.Lock()
+
+
+def active_pull_authorization_count() -> int:
+    with _AUTHORIZED_PULLS_LOCK:
+        return len(_AUTHORIZED_PULLS)
+
+
+@contextmanager
+def registered_pull_authorization(
+    bundle: Path,
+    receipt: "DownloadReceipt",
+    verified: "VerifiedAttestation",
+    manifest: ProjectManifest,
+) -> Iterator[_PullAuthorization]:
+    authorization = _new_bound_pull_authorization(
+        bundle, receipt, verified, manifest
+    )
+    entry = (
+        authorization,
+        receipt.archive_sha256,
+        receipt.archive_size,
+        receipt.identity.asset_id,
+    )
+    try:
+        with _AUTHORIZED_PULLS_LOCK:
+            if id(authorization) in _AUTHORIZED_PULLS:
+                raise BundleError("bundle_unattested")
+            _AUTHORIZED_PULLS[id(authorization)] = entry
+        _after_pull_authorization_insert_checkpoint()
+        yield authorization
+    finally:
+        _discard_pull_authorization(authorization)
+
+
+def _after_pull_authorization_insert_checkpoint() -> None:
+    pass
+
+
+def _new_bound_pull_authorization(
+    bundle: Path,
+    receipt: "DownloadReceipt",
+    verified: "VerifiedAttestation",
+    manifest: ProjectManifest,
+) -> _PullAuthorization:
+    from .github_artifacts import DownloadReceipt, VerifiedAttestation
+
+    if (
+        type(receipt) is not DownloadReceipt
+        or type(verified) is not VerifiedAttestation
+        or type(manifest) is not ProjectManifest
+    ):
+        raise BundleError("bundle_unattested")
+    digest, size = _hash_stable_bundle(bundle)
+    artifact = inspect_bundle_manifest(bundle)
+    transport = artifact.transport
+    config = manifest.artifacts
+    if (
+        digest != receipt.archive_sha256
+        or size != receipt.archive_size
+        or verified.subject_sha256 != digest
+        or receipt.identity.asset_digest != digest
+        or receipt.identity.asset_size != size
+        or artifact.generation_digest != receipt.identity.generation_digest
+        or artifact.git is None
+        or artifact.git.commit_oid != receipt.identity.source_commit_oid
+        or receipt.artifact_git_commit_oid != receipt.identity.source_commit_oid
+        or not isinstance(transport, GithubTransport)
+        or config.provider != "github-release"
+        or transport.host != config.host
+        or transport.repository != config.repository
+        or transport.repository_id != config.repository_id
+        or transport.channel != config.channel
+        or transport.source_ref != config.source_ref
+        or verified.signer_workflow != config.signer_workflow
+        or verified.signer_digest != config.signer_digest
+        or verified.source_ref != config.source_ref
+        or verified.source_digest != receipt.identity.source_commit_oid
+    ):
+        raise BundleError("bundle_unattested")
+    return _PullAuthorization(secrets.token_hex(32))
+
+
+def _discard_pull_authorization(authorization: _PullAuthorization) -> None:
+    with _AUTHORIZED_PULLS_LOCK:
+        entry = _AUTHORIZED_PULLS.get(id(authorization))
+        if entry is not None and entry[0] is authorization:
+            _AUTHORIZED_PULLS.pop(id(authorization), None)
+
+
+def _consume_pull_authorization(
+    bundle: Path, authorization: _PullAuthorization
+) -> None:
+    if type(authorization) is not _PullAuthorization:
+        raise BundleError("bundle_unattested")
+    with _AUTHORIZED_PULLS_LOCK:
+        entry = _AUTHORIZED_PULLS.get(id(authorization))
+        if entry is None or entry[0] is not authorization:
+            raise BundleError("bundle_unattested")
+        _AUTHORIZED_PULLS.pop(id(authorization), None)
+    digest, size = _hash_stable_bundle(bundle)
+    if digest != entry[1] or size != entry[2]:
+        raise BundleError("bundle_unattested")
+
+
+def install_local_bundle(
+    repo_root: Path,
+    bundle: Path,
+    *,
+    expected_repository_identity: RepositoryIdentity | None = None,
+    expected_manifest: ProjectManifest | None = None,
+) -> InstallResult:
+    return _install_bundle(
+        repo_root,
+        bundle,
+        None,
+        expected_repository_identity=expected_repository_identity,
+        expected_manifest=expected_manifest,
+    ).result
+
+
+def _install_verified_pull(
+    repo_root: Path,
+    bundle: Path,
+    authorization: _PullAuthorization,
+    *,
+    expected_repository_identity: RepositoryIdentity | None = None,
+    expected_manifest: ProjectManifest | None = None,
+    recovery_id: str | None = None,
+) -> InstallResult:
+    return _install_verified_pull_execution(
+        repo_root,
+        bundle,
+        authorization,
+        expected_repository_identity=expected_repository_identity,
+        expected_manifest=expected_manifest,
+        recovery_id=recovery_id,
+    ).result
+
+
+def _install_verified_pull_execution(
+    repo_root: Path,
+    bundle: Path,
+    authorization: _PullAuthorization,
+    *,
+    expected_repository_identity: RepositoryIdentity | None = None,
+    expected_manifest: ProjectManifest | None = None,
+    recovery_id: str | None = None,
+) -> _InstallExecution:
+    try:
+        return _install_bundle(
+            repo_root,
+            bundle,
+            authorization,
+            expected_repository_identity=expected_repository_identity,
+            expected_manifest=expected_manifest,
+            recovery_id=recovery_id,
+            record_state=False,
+        )
+    finally:
+        _discard_pull_authorization(authorization)
+
+
+def _install_bundle(
+    repo_root: Path,
+    bundle: Path,
+    authorization: _PullAuthorization | None,
+    *,
+    expected_repository_identity: RepositoryIdentity | None = None,
+    expected_manifest: ProjectManifest | None = None,
+    recovery_id: str | None = None,
+    record_state: bool = True,
+) -> _InstallExecution:
+    recovery_id = recovery_id or secrets.token_hex(16)
+    if _RECOVERY.fullmatch(recovery_id) is None:
+        raise BundleError("bundle_invalid")
+    commit_state = _InstallCommitState()
+    try:
+        return _install_bundle_scoped(
+            repo_root,
+            bundle,
+            authorization,
+            expected_repository_identity=expected_repository_identity,
+            expected_manifest=expected_manifest,
+            recovery_id=recovery_id,
+            commit_state=commit_state,
+            record_state=record_state,
+        )
+    except OperationTempCleanupError:
+        if commit_state.promotion_committed:
+            return _postcommit_install_execution(commit_state, recovery_id=recovery_id)
+        raise BundleError(
+            "bundle_cleanup_failed", "private install cleanup failed", recovery_id
+        ) from None
+    except Exception:
+        if commit_state.promotion_committed:
+            return _postcommit_install_execution(commit_state)
+        raise
+
+
+def _install_bundle_scoped(
+    repo_root: Path,
+    bundle: Path,
+    authorization: _PullAuthorization | None,
+    *,
+    expected_repository_identity: RepositoryIdentity | None,
+    expected_manifest: ProjectManifest | None,
+    recovery_id: str,
+    commit_state: _InstallCommitState,
+    record_state: bool,
+) -> _InstallExecution:
+    started = time.monotonic()
+    with repository_lifecycle_lock(
+        repo_root, expected_repository_identity=expected_repository_identity
+    ), capture_lifecycle_repository(repo_root) as repository:
+        if inspect_init_journal(repo_root, repository_access=repository) != "none":
+            raise BundleError("init_recovery_required")
+        if expected_manifest is None:
+            manifest = load_manifest(
+                repo_root / ".graphify-project.yaml",
+                repo_root,
+                repository_access=repository,
+            )
+            manifest = require_current_manifest(
+                repo_root, manifest, repository_access=repository
+            )
+        else:
+            manifest = require_current_manifest(
+                repo_root, expected_manifest, repository_access=repository
+            )
+        with managed_operation_temp_root("install", recovery_id) as temporary, ExitStack() as parsed_scope:
+            private = temporary.path
+            before = stage_input(
+                repo_root,
+                manifest,
+                private / "source-before",
+                repository_access=repository,
+            )
+            parsed = parsed_scope.enter_context(
+                parse_bundle(bundle, private / "candidate")
+            )
+            _require_transport_authority(bundle, parsed, manifest, authorization)
+            _require_project_snapshot_identity(parsed.artifact, manifest, before)
+            compatibility = resolve_graphify_compatibility(manifest.graphify_version)
+            evidence_path = PurePosixPath("graphify-out/GRAPH_EVIDENCE.json")
+            evidence_binding = next(
+                (item for item in parsed.payloads if item.path == evidence_path), None
+            )
+            if evidence_binding is None:
+                raise BundleError("bundle_identity_mismatch")
+            try:
+                parse_graph_evidence(
+                    parsed.read_payload(evidence_path, GRAPH_EVIDENCE_MAX_BYTES),
+                    compatibility,
+                    expected_digest=evidence_binding.sha256,
+                )
+                validated = validate_candidate(
+                    parsed.root,
+                    before,
+                    manifest,
+                    expected_projection_digest=before.projection_digest,
+                    expected_evidence_digest=evidence_binding.sha256,
+                    build_epoch=parsed.artifact.build_epoch,
+                    git_identity=(
+                        None
+                        if parsed.artifact.git is None
+                        else ArtifactGitIdentity(
+                            parsed.artifact.git.commit_oid,
+                            parsed.artifact.git.algorithm,
+                        )
+                    ),
+                )
+            except Exception as error:
+                if isinstance(error, BundleError):
+                    raise
+                raise BundleError("bundle_identity_mismatch") from None
+            if (
+                validated.graph_digest != parsed.artifact.graph_digest
+                or validated.generation_digest != parsed.artifact.generation_digest
+                or validated.build_epoch != parsed.artifact.build_epoch
+                or validated.adapter_id != parsed.artifact.adapter_id
+                or str(validated.project_uid) != parsed.artifact.project_uid
+            ):
+                raise BundleError("bundle_identity_mismatch")
+            immediately_before = stage_input(
+                repo_root,
+                manifest,
+                private / "source-immediately-before",
+                repository_access=repository,
+            )
+            if not _same_validation_projection(before, immediately_before):
+                raise BundleError("bundle_source_drift")
+            assert_current_manifest_unchanged(
+                repo_root, manifest, repository_access=repository
+            )
+            promoted = promote_graph(
+                validated, repo_root, repository_access=repository
+            )
+            promotion_committed = promoted.changed is True
+            if promotion_committed:
+                commit_state.promotion_committed = True
+                commit_state.project_id = manifest.project_id
+                commit_state.project_uid = str(manifest.project_uid)
+            installed = _revalidate_installed_generation(
+                repo_root, manifest, repository
+            )
+            if promotion_committed and installed is not None:
+                commit_state.installed = installed
+            installed_identity_matches = (
+                installed is not None
+                and promoted.digest == installed.graph_digest
+                and promoted.generation_digest == installed.generation_digest
+                and promoted.build_epoch == installed.build_epoch
+                and installed.graph_digest == validated.graph_digest
+                and installed.generation_digest == validated.generation_digest
+                and (not promoted.changed or installed.build_epoch == validated.build_epoch)
+            )
+            try:
+                after = stage_input(
+                    repo_root,
+                    manifest,
+                    private / "source-after",
+                    repository_access=repository,
+                )
+                assert_current_manifest_unchanged(
+                    repo_root, manifest, repository_access=repository
+                )
+                current = installed_identity_matches and _same_validation_projection(before, after)
+            except (StagingError, ManifestError):
+                current = False
+            if current:
+                assert installed is not None
+                result = InstallResult(
+                    manifest.project_id,
+                    str(manifest.project_uid),
+                    installed.graph_digest,
+                    installed.generation_digest,
+                    installed.build_epoch,
+                    promoted.changed,
+                    "installed" if promoted.changed else "already_current",
+                )
+            else:
+                result = InstallResult(
+                    manifest.project_id,
+                    str(manifest.project_uid),
+                    None if installed is None else installed.graph_digest,
+                    None if installed is None else installed.generation_digest,
+                    None if installed is None else installed.build_epoch,
+                    promoted.changed if installed_identity_matches else None,
+                    "promoted_but_stale",
+                )
+        if temporary.cleanup_failed:
+            if promotion_committed:
+                return _postcommit_install_execution(commit_state, recovery_id=recovery_id)
+            raise BundleError(
+                "bundle_cleanup_failed", "private install cleanup failed", recovery_id
+            )
+        if record_state:
+            _record_install_outcome(
+                repo_root,
+                repository,
+                manifest,
+                before,
+                result,
+                duration_ms=max(0, int((time.monotonic() - started) * 1000)),
+                operation="artifact_install",
+            )
+        return _InstallExecution(result, promotion_committed)
+
+
+def _postcommit_install_execution(
+    state: _InstallCommitState, *, recovery_id: str | None = None
+) -> _InstallExecution:
+    assert state.promotion_committed
+    assert state.project_id is not None and state.project_uid is not None
+    installed = state.installed
+    return _InstallExecution(
+        InstallResult(
+            state.project_id,
+            state.project_uid,
+            None if installed is None else installed.graph_digest,
+            None if installed is None else installed.generation_digest,
+            None if installed is None else installed.build_epoch,
+            None if installed is None else True,
+            "promoted_but_stale",
+            recovery_id,
+        ),
+        True,
+    )
+
+
+def _require_transport_authority(
+    bundle: Path,
+    parsed: ParsedBundle,
+    manifest: ProjectManifest,
+    authorization: _PullAuthorization | None,
+) -> None:
+    if isinstance(parsed.artifact.transport, LocalTransport):
+        if authorization is not None:
+            raise BundleError("bundle_unattested")
+        return
+    if not isinstance(parsed.artifact.transport, GithubTransport):
+        raise BundleError("bundle_invalid")
+    if authorization is None:
+        raise BundleError("bundle_pull_required")
+    _consume_pull_authorization(bundle, authorization)
+    config = manifest.artifacts
+    transport = parsed.artifact.transport
+    if (
+        config.provider != "github-release"
+        or transport.host != config.host
+        or transport.repository != config.repository
+        or transport.repository_id != config.repository_id
+        or transport.channel != config.channel
+        or transport.source_ref != config.source_ref
+    ):
+        raise BundleError("bundle_unattested")
+
+
+def _require_project_snapshot_identity(
+    artifact: ArtifactManifest,
+    manifest: ProjectManifest,
+    staged: StagedInput,
+) -> None:
+    compatibility = resolve_graphify_compatibility(manifest.graphify_version)
+    expected_payloads = {
+        PurePosixPath("graphify-out/GRAPH_EVIDENCE.json"),
+        PurePosixPath("graphify-out/GRAPH_REPORT.md"),
+        PurePosixPath("graphify-out/graph.json"),
+    }
+    if manifest.track_html:
+        expected_payloads.add(PurePosixPath("graphify-out/graph.html"))
+    if (
+        manifest.schema_version != 2
+        or manifest.project_uid is None
+        or staged.projection_digest is None
+        or artifact.project_id != manifest.project_id
+        or artifact.project_uid != str(manifest.project_uid)
+        or artifact.graphify_version != manifest.graphify_version
+        or artifact.adapter_id != compatibility.adapter_id
+        or artifact.source_digest != staged.source_digest
+        or artifact.projection_digest != staged.projection_digest
+        or {item.path for item in artifact.payloads} != expected_payloads
+    ):
+        code = (
+            "bundle_stale"
+            if artifact.source_digest != staged.source_digest
+            or artifact.projection_digest != staged.projection_digest
+            else "bundle_identity_mismatch"
+        )
+        raise BundleError(code)
+
+
+def _same_validation_projection(left: StagedInput, right: StagedInput) -> bool:
+    return (
+        left.source_digest == right.source_digest
+        and left.projection_digest == right.projection_digest
+        and left.files == right.files
+        and left.projection_files == right.projection_files
+        and left.reason_counts == right.reason_counts
+        and left.coverage_approvals == right.coverage_approvals
+    )
+
+
+def _revalidate_installed_generation(
+    repo_root: Path,
+    manifest: ProjectManifest,
+    repository: Any,
+) -> ValidatedGraph | None:
+    try:
+        root = _path_for_descriptor(repository.descriptor)
+        return validate_owned_graph(
+            root / manifest.output_dir,
+            manifest,
+            repository_access=repository,
+        )
+    except Exception:
+        return None
+
+
+def _path_for_descriptor(descriptor: int) -> Path:
+    try:
+        if hasattr(fcntl, "F_GETPATH"):
+            payload = fcntl.fcntl(descriptor, fcntl.F_GETPATH, b"\0" * 1024)
+            encoded = payload.split(b"\0", 1)[0]
+            return Path(os.fsdecode(encoded))
+        return Path(os.readlink(f"/proc/self/fd/{descriptor}"))
+    except OSError:
+        raise BundleError("bundle_source_drift") from None
+
+
+def _hash_stable_bundle(bundle: Path) -> tuple[str, int]:
+    descriptor = -1
+    try:
+        descriptor = os.open(bundle, os.O_RDONLY | _nofollow() | os.O_CLOEXEC)
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > V1_LIMITS.total_bytes:
+            raise OSError
+        digest = hashlib.sha256()
+        total = 0
+        while True:
+            chunk = os.read(descriptor, _CHUNK)
+            if not chunk:
+                break
+            total += len(chunk)
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+        if (
+            (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+        ):
+            raise OSError
+        return digest.hexdigest(), total
+    except OSError:
+        raise BundleError("bundle_invalid") from None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _record_install_outcome(
+    repo_root: Path,
+    repository: Any,
+    manifest: ProjectManifest,
+    staged: StagedInput,
+    result: InstallResult,
+    *,
+    duration_ms: int,
+    operation: Literal["artifact_install", "artifact_pull"],
+) -> None:
+    from .operation_state import (
+        CoverageMetrics,
+        FailureRecord,
+        SuccessfulOperation,
+        record_failure,
+        record_success,
+    )
+
+    if result.graph_digest is not None:
+        represented = max(0, len(staged.files) - len(staged.coverage_approvals))
+        record_success(
+            repo_root,
+            SuccessfulOperation(
+                operation=operation,
+                duration_ms=duration_ms,
+                safe_file_count=len(staged.files),
+                coverage=CoverageMetrics(
+                    represented=represented,
+                    approved_omissions=len(staged.coverage_approvals),
+                    denied=sum(count for key, count in staged.reason_counts if key.startswith("deny:")),
+                ),
+                source_digest=staged.source_digest,
+                projection_digest=staged.projection_digest or "",
+                graph_digest=result.graph_digest,
+                generation_digest=result.generation_digest,
+                build_epoch=result.build_epoch,
+                artifact_channel=manifest.artifacts.channel,
+            ),
+            repository_access=repository,
+        )
+    if result.status == "promoted_but_stale":
+        record_failure(
+            repo_root,
+            FailureRecord(operation, "bundle_source_drift"),
+            repository_access=repository,
+        )
+
+
 __all__ = [
     "ALLOWED_PAYLOADS", "ARTIFACT_SCHEMA_VERSION", "ArchiveLimits",
     "ArtifactManifest", "BundleError", "GithubTransport", "GitIdentity",
     "LocalTransport", "ParsedBundle", "PayloadBinding", "PayloadDescriptor",
-    "V1_LIMITS", "inspect_bundle_manifest", "parse_bundle",
+    "InstallResult", "ManagedOperationTempRoot", "OperationTempCleanupError",
+    "OperationTempFileSystem", "REAL_OPERATION_TEMP_FS",
+    "V1_LIMITS", "active_pull_authorization_count", "inspect_bundle_manifest",
+    "install_local_bundle", "managed_operation_temp_root", "parse_bundle",
+    "registered_pull_authorization",
 ]
