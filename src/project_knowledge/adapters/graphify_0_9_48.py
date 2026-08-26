@@ -23,6 +23,7 @@ from project_knowledge.integrity import (
     canonical_final_edge_id,
     validate_final_graph,
 )
+from project_knowledge.privacy import GLOBAL_DENY_PATTERNS, is_denied
 
 from .base import (
     AdapterContractError,
@@ -343,10 +344,15 @@ def _source_path(value: object) -> PurePosixPath:
 
 
 def _require_staged_files(staged_files: frozenset[PurePosixPath]) -> None:
-    if not isinstance(staged_files, frozenset):
+    if type(staged_files) is not frozenset:
         raise AdapterContractError("staged files must be an immutable path set")
     for path in staged_files:
+        if type(path) is not PurePosixPath:
+            raise AdapterContractError("staged files contain an invalid path")
         try:
-            _source_path(path.as_posix() if isinstance(path, PurePosixPath) else path)
-        except AdapterContractError as error:
-            raise AdapterContractError("staged files contain an invalid path") from error
+            confined = _source_path(path.as_posix())
+            denied = is_denied(confined, GLOBAL_DENY_PATTERNS)
+        except Exception:
+            raise AdapterContractError("staged files contain an invalid path") from None
+        if denied:
+            raise AdapterContractError("staged files contain an invalid path")

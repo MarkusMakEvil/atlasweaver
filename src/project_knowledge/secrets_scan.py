@@ -29,11 +29,20 @@ _STRUCTURED_RULES = (
     ),
     ("aws_access_key", re.compile(rb"\bAKIA[0-9A-Z]{16}\b")),
     ("github_token", re.compile(rb"\bgh[pousr]_[A-Za-z0-9]{20,}\b")),
+    ("google_api_key", re.compile(rb"\bAIza[A-Za-z0-9_-]{35}\b")),
+    ("stripe_live_key", re.compile(rb"\b[rs]k_live_[A-Za-z0-9]{16,}\b")),
     ("slack_token", re.compile(rb"\bxox[baprs]-[A-Za-z0-9-]{20,}\b")),
+    (
+        "jwt",
+        re.compile(
+            rb"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"
+        ),
+    ),
     (
         "bearer_token",
         re.compile(
-            rb"(?i)\bauthorization\b\s*[:=]\s*[\"']?Bearer\s+[A-Za-z0-9._~+/=-]{20,}"
+            rb"(?i)(?:\bauthorization\b\s*[:=]\s*[\"']?)?"
+            rb"\bBearer\s+[A-Za-z0-9._~+/=-]{20,}"
         ),
     ),
     (
@@ -44,6 +53,11 @@ _STRUCTURED_RULES = (
 _ASSIGNMENT = re.compile(
     rb"(?i)\b(?:password|passwd|client_secret|aws_secret_access_key|"
     rb"access_token|api_key)\b\s*[:=]\s*(?P<value>[^\r\n]+)"
+)
+_SECRET_COMPONENT = re.compile(
+    rb"(?:^|[._:/-])(?:sk|secret|token|bearer|api[-_]?key|credential|password|passwd)"
+    rb"(?:$|[._:/-])",
+    re.IGNORECASE,
 )
 _PLACEHOLDER = re.compile(rb"\$\{[A-Za-z_][A-Za-z0-9_]*\}\Z")
 _ENV_REFERENCE = re.compile(
@@ -73,6 +87,17 @@ class SecretFinding:
     line: int
     fingerprint: str
     bypassable: bool
+
+
+def has_secret_shape(payload: bytes) -> bool:
+    """Return whether bytes have a credential shape unsafe for persistence."""
+    if type(payload) is not bytes:
+        return True
+    return (
+        any(pattern.search(payload) is not None for _, pattern in _STRUCTURED_RULES)
+        or _ASSIGNMENT.search(payload) is not None
+        or _SECRET_COMPONENT.search(payload) is not None
+    )
 
 
 def scan_payload(path: PurePosixPath, payload: bytes) -> tuple[SecretFinding, ...]:

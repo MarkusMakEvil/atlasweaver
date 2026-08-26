@@ -32,6 +32,8 @@ from project_knowledge.integrity import (
     IntegrityError,
     validate_final_graph,
 )
+from project_knowledge.privacy import GLOBAL_DENY_PATTERNS, is_denied
+from project_knowledge.secrets_scan import has_secret_shape
 
 
 class EvidenceError(ValueError):
@@ -48,11 +50,6 @@ _PUBLIC_MODEL_IDENTIFIER = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}"
     r"(?:/[A-Za-z0-9][A-Za-z0-9._-]{0,63})?"
     r"(?::[A-Za-z0-9][A-Za-z0-9._-]{0,63})?\Z"
-)
-_SECRET_MODEL_COMPONENT = re.compile(
-    r"(?:^|[._:/-])(?:sk|secret|token|bearer|api[-_]?key|credential|password|passwd)"
-    r"(?:$|[._:/-])",
-    re.IGNORECASE,
 )
 _DIAGNOSIS_MAX_BYTES = 4_194_304
 _BASE_ENVIRONMENT_NAMES = ("HOME", "LANG", "LC_ALL", "PATH")
@@ -329,8 +326,12 @@ def build_graph_evidence(
     _require_registered_contract(contract)
     source_digest = _require_digest(source_digest)
     projection_digest = _require_digest(projection_digest)
-    if type(normalization) is not NormalizationResult:
-        raise EvidenceError("normalization result is invalid")
+    (
+        supplied_cluster_input,
+        supplied_observed,
+        supplied_repairs,
+        supplied_quarantines,
+    ) = _normalization_components(normalization)
     staged_files = _require_staged_files(staged_files)
     _require_artifact_descriptor(clustered_graph)
     _require_artifact_descriptor(final_graph)
@@ -346,7 +347,7 @@ def build_graph_evidence(
     _require_bound_artifact(parsed_invocation, native_graph, "raw/graph.json")
     _require_bound_artifact(parsed_invocation, diagnosis, "raw/diagnose.json")
     _require_bound_artifact(
-        parsed_invocation, normalization.cluster_input, "cluster-input/graph.json"
+        parsed_invocation, supplied_cluster_input, "cluster-input/graph.json"
     )
     _require_bound_artifact(
         parsed_invocation, clustered_graph, "clustered/graph.json"
@@ -358,7 +359,16 @@ def build_graph_evidence(
         recomputed_normalization = implementation.normalize_for_cluster(parsed_native)
     except AdapterContractError as error:
         raise EvidenceError("captured native graph is invalid") from error
-    if normalization != recomputed_normalization:
+    try:
+        normalization_matches = (
+            supplied_cluster_input == recomputed_normalization.cluster_input
+            and supplied_observed == recomputed_normalization.observed_integrity
+            and supplied_repairs == recomputed_normalization.repairs
+            and supplied_quarantines == recomputed_normalization.quarantines
+        )
+    except Exception:
+        raise EvidenceError("normalization result is invalid") from None
+    if not normalization_matches:
         raise EvidenceError("normalization result does not match captured native graph")
     observed = recomputed_normalization.observed_integrity
     repairs = _validate_reason_counts(
@@ -435,11 +445,18 @@ def build_graph_evidence(
 
 
 def parse_graph_evidence(
-    payload: bytes, contract: GraphifyCompatibility
+    payload: bytes,
+    contract: GraphifyCompatibility,
+    *,
+    expected_digest: str,
 ) -> GraphEvidence:
-    """Parse the recursively closed evidence schema and require byte identity."""
+    """Parse externally anchored, recursively closed canonical evidence."""
     _require_registered_contract(contract)
     payload = _bounded_evidence_payload(payload)
+    expected_digest = _require_digest(expected_digest)
+    actual_digest = hashlib.sha256(payload).hexdigest()
+    if actual_digest != expected_digest:
+        raise EvidenceError("graph evidence digest does not match expected digest")
     document = _strict_json_object(payload, "graph evidence")
     _require_exact_keys(
         document,
@@ -551,7 +568,7 @@ def parse_graph_evidence(
         evidence_complete=evidence_complete,
         limitations=limitations,
         payload=payload,
-        digest=hashlib.sha256(payload).hexdigest(),
+        digest=actual_digest,
     )
 
 
@@ -568,11 +585,54 @@ def _validate_invocation(
 ) -> ExtractionInvocation:
     if type(invocation) is not ExtractionInvocation:
         raise EvidenceError("extraction invocation is invalid")
-    document = _strict_json_object(invocation.payload, "extraction invocation")
-    parsed = _parse_invocation_document(document, contract)
-    if parsed != invocation:
+    try:
+        payload = invocation.payload
+    except AttributeError:
+        raise EvidenceError("extraction invocation is invalid") from None
+    try:
+        document = _strict_json_object(payload, "extraction invocation")
+        parsed = _parse_invocation_document(document, contract)
+        matches = parsed == invocation
+    except EvidenceError:
+        raise EvidenceError("extraction invocation is invalid") from None
+    except Exception:
+        raise EvidenceError("extraction invocation is invalid") from None
+    if not matches:
         raise EvidenceError("extraction invocation descriptor is invalid")
     return parsed
+
+
+def _normalization_components(
+    normalization: object,
+) -> tuple[
+    CapturedArtifact,
+    GraphIntegrity,
+    tuple[ReasonCount, ...],
+    tuple[ReasonCount, ...],
+]:
+    if type(normalization) is not NormalizationResult:
+        raise EvidenceError("normalization result is invalid")
+    try:
+        cluster_input = normalization.cluster_input
+        observed = normalization.observed_integrity
+        repairs = normalization.repairs
+        quarantines = normalization.quarantines
+    except AttributeError:
+        raise EvidenceError("normalization result is invalid") from None
+    if (
+        type(cluster_input) is not CapturedArtifact
+        or type(observed) is not GraphIntegrity
+        or type(repairs) is not tuple
+        or type(quarantines) is not tuple
+        or any(type(item) is not ReasonCount for item in repairs)
+        or any(type(item) is not ReasonCount for item in quarantines)
+    ):
+        raise EvidenceError("normalization result is invalid")
+    try:
+        _require_artifact_descriptor(cluster_input)
+    except EvidenceError:
+        raise EvidenceError("normalization result is invalid") from None
+    return cluster_input, observed, repairs, quarantines
 
 
 def _parse_invocation_document(
@@ -754,11 +814,12 @@ def _require_artifact_descriptor(
     if type(logical_path) is not PurePosixPath:
         raise EvidenceError(f"{description} is invalid")
     try:
-        confined = _confined_path(logical_path.as_posix())
-    except EvidenceError:
+        rendered_path = logical_path.as_posix()
+        confined = _confined_path(rendered_path)
+    except Exception:
         raise EvidenceError(f"{description} is invalid") from None
     if (
-        confined != logical_path
+        confined.as_posix() != rendered_path
         or type(payload) is not bytes
         or type(digest) is not str
         or _HEX_DIGEST.fullmatch(digest) is None
@@ -1132,10 +1193,13 @@ def _require_staged_files(
         if type(item) is not PurePosixPath:
             raise EvidenceError("staged files must be an exact confined path set")
         try:
-            confined = _confined_path(item.as_posix())
-        except EvidenceError:
+            rendered = item.as_posix()
+            confined = _confined_path(rendered)
+        except Exception:
             raise EvidenceError("staged files must be an exact confined path set") from None
-        if confined != item:
+        if confined.as_posix() != rendered or is_denied(
+            confined, GLOBAL_DENY_PATTERNS
+        ):
             raise EvidenceError("staged files must be an exact confined path set")
     return staged_files
 
@@ -1344,7 +1408,7 @@ def _require_public_model_identifier(
         not model
         or len(model) > 128
         or _PUBLIC_MODEL_IDENTIFIER.fullmatch(model) is None
-        or _SECRET_MODEL_COMPONENT.search(model) is not None
+        or has_secret_shape(model.encode("ascii"))
     ):
         raise EvidenceError("invocation requires a public model identifier")
 
@@ -1468,9 +1532,12 @@ def _require_environment_names(
 def _require_registered_contract(contract: GraphifyCompatibility) -> None:
     try:
         registered = resolve_graphify_compatibility(contract.version)
-    except (AttributeError, CompatibilityError) as error:
-        raise EvidenceError("evidence requires a registered compatibility contract") from error
-    if contract != registered:
+        matches = contract == registered
+    except Exception:
+        raise EvidenceError(
+            "evidence requires a registered compatibility contract"
+        ) from None
+    if not matches:
         raise EvidenceError("evidence requires a registered compatibility contract")
 
 

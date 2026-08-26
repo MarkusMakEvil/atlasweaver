@@ -1891,6 +1891,7 @@ def refresh_project(
                 native_graph=native, diagnosis=diagnosis,
                 normalization=normalization, clustered_graph=clustered_graph,
                 final_graph=final_graph,
+                staged_files=frozenset(staged.files),
             )
 
             fs.checkpoint("adapt")

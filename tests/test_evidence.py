@@ -23,11 +23,12 @@ from project_knowledge.compatibility import (
 from project_knowledge.evidence import (
     GRAPH_EVIDENCE_MAX_BYTES,
     EvidenceError,
+    ExtractionInvocation,
     build_extraction_invocation,
     build_graph_evidence,
     parse_graph_evidence,
 )
-from project_knowledge.integrity import canonical_final_edge_id
+from project_knowledge.integrity import GraphIntegrity, canonical_final_edge_id
 
 
 def canonical_json(value: object) -> bytes:
@@ -35,6 +36,15 @@ def canonical_json(value: object) -> bytes:
         json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         + "\n"
     ).encode("utf-8")
+
+
+def parse_semantic_evidence(payload: bytes):
+    """Self-anchor test bytes only when exercising post-anchor semantics."""
+    return parse_graph_evidence(
+        payload,
+        contract(),
+        expected_digest=hashlib.sha256(payload).hexdigest(),
+    )
 
 
 def contract():
@@ -410,15 +420,36 @@ def test_invocation_accepts_bounded_public_model_identifiers(model: str) -> None
         "model token",
         "model\nname",
         "secret:model",
+        "gh" + "p_" + "a" * 36,
+        "gh" + "o_" + "a" * 36,
+        "gh" + "u_" + "a" * 36,
+        "gh" + "s_" + "a" * 36,
+        "gh" + "r_" + "a" * 36,
+        "AK" + "IA" + "A" * 16,
+        "AI" + "za" + "A" * 35,
+        "sk" + "_live_" + "a" * 24,
+        "rk" + "_live_" + "a" * 24,
+        "xox" + "b-" + "1" * 12 + "-" + "a" * 24,
+        "eyJ" + "a" * 12 + "." + "b" * 16 + "." + "c" * 16,
         "m" * 129,
     ],
 )
 def test_invocation_rejects_private_or_secret_shaped_models_without_echo(
     model: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    serialized: list[str] = []
+    canonicalize = evidence_module._canonical_json
+
+    def record_serialization(value: object) -> bytes:
+        serialized.append(repr(value))
+        return canonicalize(value)
+
+    monkeypatch.setattr(evidence_module, "_canonical_json", record_serialization)
     with pytest.raises(EvidenceError, match="public model identifier") as captured:
         invocation_factory(model=model)
     assert model not in str(captured.value)
+    assert all(model not in value for value in serialized)
 
 
 def fixture_document() -> dict[str, object]:
@@ -612,13 +643,75 @@ def test_evidence_excludes_context_and_retains_only_safe_provenance() -> None:
 
 def test_evidence_parser_round_trips_identical_canonical_bytes() -> None:
     built = build_fixture_evidence()
-    parsed = parse_graph_evidence(built.payload, contract())
+    parsed = parse_graph_evidence(
+        built.payload,
+        contract(),
+        expected_digest=built.digest,
+    )
 
     assert parsed == built
     assert parsed.payload is built.payload or parsed.payload == built.payload
     assert parsed.digest == hashlib.sha256(parsed.payload).hexdigest()
     assert parsed.invocation.payload == built.invocation.payload
     assert parsed.invocation.digest == built.extraction_invocation_digest
+
+
+def test_evidence_parser_requires_a_keyword_only_external_digest() -> None:
+    built = build_fixture_evidence()
+
+    with pytest.raises(TypeError):
+        parse_graph_evidence(built.payload, contract())
+    parsed = parse_graph_evidence(
+        built.payload,
+        contract(),
+        expected_digest=built.digest,
+    )
+    assert parsed == built
+
+
+@pytest.mark.parametrize("expected_digest", [None, True, "A" * 64, "0" * 63])
+def test_evidence_parser_rejects_invalid_external_digest_before_json(
+    expected_digest: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def must_not_parse(*args, **kwargs):
+        raise AssertionError("JSON parser must not run")
+
+    monkeypatch.setattr(json, "loads", must_not_parse)
+    with pytest.raises(EvidenceError, match="digest") as captured:
+        parse_graph_evidence(
+            b"{}\n",
+            contract(),
+            expected_digest=expected_digest,
+        )
+    assert captured.value.__cause__ is None
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda document: document["final_edges"][0].update(relation="forged"),
+        lambda document: document["final_edges"][0].update(
+            source_file="other.py"
+        ),
+    ],
+)
+def test_evidence_parser_rejects_canonical_payload_mutation_against_trusted_digest(
+    mutation,
+) -> None:
+    built = build_fixture_evidence()
+    document = json.loads(built.payload)
+    mutation(document)
+    mutated = canonical_json(document)
+
+    with pytest.raises(EvidenceError, match="digest") as captured:
+        parse_graph_evidence(
+            mutated,
+            contract(),
+            expected_digest=built.digest,
+        )
+    assert captured.value.__cause__ is None
+    assert built.digest not in str(captured.value)
 
 
 def test_builder_rejects_a_valid_but_unrelated_final_graph() -> None:
@@ -679,6 +772,27 @@ def test_builder_requires_the_fixed_final_graph_logical_path() -> None:
 def test_builder_requires_exact_confined_staged_files(staged_files: object) -> None:
     with pytest.raises(EvidenceError, match="staged files"):
         build_from_pipeline(fixture_pipeline(), staged_files=staged_files)
+
+
+@pytest.mark.parametrize(
+    "denied",
+    [
+        ".env",
+        "private/.env",
+        "config/auth-token.yaml",
+        "workspace/runtime/state.json",
+    ],
+)
+def test_builder_reapplies_immutable_privacy_denies_to_staged_files(
+    denied: str,
+) -> None:
+    staged_files = frozenset(
+        {PurePosixPath("fixture.py"), PurePosixPath(denied)}
+    )
+
+    with pytest.raises(EvidenceError, match="staged files") as captured:
+        build_from_pipeline(fixture_pipeline(), staged_files=staged_files)
+    assert denied not in str(captured.value)
 
 
 def test_builder_rejects_oversized_final_before_any_json_parse(
@@ -849,7 +963,7 @@ def test_evidence_parser_rejects_duplicate_keys_and_nonfinite_numbers(
     payload: bytes,
 ) -> None:
     with pytest.raises(EvidenceError, match="duplicate|non-finite"):
-        parse_graph_evidence(payload, contract())
+        parse_semantic_evidence(payload)
 
 
 @pytest.mark.parametrize(
@@ -909,7 +1023,7 @@ def test_evidence_parser_rejects_closed_schema_and_consistency_mutations(
     mutator, match: str
 ) -> None:
     with pytest.raises(EvidenceError, match=match):
-        parse_graph_evidence(mutate_evidence(mutator), contract())
+        parse_semantic_evidence(mutate_evidence(mutator))
 
 
 def test_evidence_parser_rejects_alternate_json_encoding() -> None:
@@ -917,7 +1031,7 @@ def test_evidence_parser_rejects_alternate_json_encoding() -> None:
     payload = json.dumps(document, ensure_ascii=False, indent=2).encode() + b"\n"
 
     with pytest.raises(EvidenceError, match="canonical"):
-        parse_graph_evidence(payload, contract())
+        parse_semantic_evidence(payload)
 
 
 @pytest.mark.parametrize(
@@ -932,7 +1046,7 @@ def test_evidence_parser_rejects_noncanonical_final_source_paths(
     )
 
     with pytest.raises(EvidenceError, match="path"):
-        parse_graph_evidence(payload, contract())
+        parse_semantic_evidence(payload)
 
 
 @pytest.mark.parametrize(
@@ -969,7 +1083,7 @@ def test_evidence_parser_rejects_noncanonical_invocation_artifact_paths(
     payload = canonical_json(document)
 
     with pytest.raises(EvidenceError, match="path"):
-        parse_graph_evidence(payload, contract())
+        parse_semantic_evidence(payload)
 
 
 def forged_artifact_descriptor(**changes: object) -> CapturedArtifact:
@@ -985,6 +1099,16 @@ def forged_artifact_descriptor(**changes: object) -> CapturedArtifact:
     for name, value in values.items():
         object.__setattr__(forged, name, value)
     return forged
+
+
+def uninitialized_pure_posix_path() -> PurePosixPath:
+    return object.__new__(PurePosixPath)
+
+
+def staged_set_with_forged_pure_posix_path() -> frozenset[PurePosixPath]:
+    path = object.__new__(PurePosixPath)
+    object.__setattr__(path, "_hash", 1)
+    return frozenset({path})
 
 
 @pytest.mark.parametrize(
@@ -1017,6 +1141,67 @@ def test_artifact_descriptor_boundary_sanitizes_missing_fields() -> None:
     assert captured.value.__cause__ is None
 
 
+def test_artifact_descriptor_sanitizes_uninitialized_pure_posix_path() -> None:
+    forged = forged_artifact_descriptor(
+        logical_path=uninitialized_pure_posix_path()
+    )
+
+    with pytest.raises(EvidenceError, match="artifact binding") as captured:
+        evidence_module._require_artifact_descriptor(forged)
+    assert captured.value.__cause__ is None
+
+
+def test_staged_files_sanitize_forged_exact_pure_posix_path() -> None:
+    staged_files = staged_set_with_forged_pure_posix_path()
+
+    with pytest.raises(EvidenceError, match="staged files") as captured:
+        build_from_pipeline(fixture_pipeline(), staged_files=staged_files)
+    assert captured.value.__cause__ is None
+
+
+def test_builder_sanitizes_uninitialized_extraction_invocation() -> None:
+    forged = object.__new__(ExtractionInvocation)
+
+    with pytest.raises(EvidenceError, match="invocation") as captured:
+        build_from_pipeline(fixture_pipeline(), invocation=forged)
+    assert captured.value.__cause__ is None
+
+
+def test_builder_sanitizes_uninitialized_normalization_result() -> None:
+    forged = object.__new__(NormalizationResult)
+
+    with pytest.raises(EvidenceError, match="normalization") as captured:
+        build_from_pipeline(fixture_pipeline(), normalization=forged)
+    assert captured.value.__cause__ is None
+
+
+def test_builder_sanitizes_nested_uninitialized_integrity() -> None:
+    pipeline = fixture_pipeline()
+    normalization = pipeline[3]
+    forged = replace(
+        normalization,
+        observed_integrity=object.__new__(GraphIntegrity),
+    )
+
+    with pytest.raises(EvidenceError, match="normalization") as captured:
+        build_from_pipeline(pipeline, normalization=forged)
+    assert captured.value.__cause__ is None
+
+
+def test_parser_sanitizes_nested_forged_registered_contract() -> None:
+    built = build_fixture_evidence()
+    forged = object.__new__(type(contract()))
+    object.__setattr__(forged, "version", "0.9.48")
+
+    with pytest.raises(EvidenceError, match="registered") as captured:
+        parse_graph_evidence(
+            built.payload,
+            forged,
+            expected_digest=built.digest,
+        )
+    assert captured.value.__cause__ is None
+
+
 def test_graph_evidence_size_boundary_is_checked_before_json_allocation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1028,7 +1213,11 @@ def test_graph_evidence_size_boundary_is_checked_before_json_allocation(
 
     monkeypatch.setattr(json, "loads", must_not_parse)
     with pytest.raises(EvidenceError, match="size cap"):
-        parse_graph_evidence(at_cap + b"x", contract())
+        parse_graph_evidence(
+            at_cap + b"x",
+            contract(),
+            expected_digest="0" * 64,
+        )
 
 
 def test_graph_evidence_cap_has_one_production_assignment() -> None:

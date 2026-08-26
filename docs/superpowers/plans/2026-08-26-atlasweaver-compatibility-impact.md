@@ -401,10 +401,13 @@ def build_graph_evidence(
     normalization: NormalizationResult,
     clustered_graph: CapturedArtifact,
     final_graph: CapturedArtifact,
+    staged_files: frozenset[PurePosixPath],
 ) -> GraphEvidence: ...
 def parse_graph_evidence(
     payload: bytes,
     contract: GraphifyCompatibility,
+    *,
+    expected_digest: str,
 ) -> GraphEvidence: ...
 def index_final_edge_evidence(
     evidence: GraphEvidence,
@@ -1185,6 +1188,10 @@ git commit -m "feat: add Graphify 0.9.48 adapter evidence boundary"
 **Files:**
 - Create: `src/project_knowledge/evidence.py`
 - Create: `tests/test_evidence.py`
+- Modify: `src/project_knowledge/secrets_scan.py`
+- Test: `tests/test_secrets_scan.py`
+- Modify: `src/project_knowledge/adapters/graphify_0_9_48.py`
+- Test: `tests/test_graphify_0_9_48_adapter.py`
 
 **Interfaces:**
 - Consumes: `RenderedCommand`, `GraphifyCompatibility`, `CapturedArtifact`, `NormalizationResult`, `GraphIntegrity`, and `validate_final_graph()`.
@@ -1347,6 +1354,10 @@ document = {
 The parser must enforce `GRAPH_EVIDENCE_MAX_BYTES` while reading, then exact key sets recursively, plain integers but not booleans, finite numeric confidence only if a future adapter declares it, sorted unique limitations/reason counts/edge IDs, 64-character lowercase hex digests, confined POSIX paths, and registry capability consistency. A non-null `pre_dedup` list maps exactly to `PreDedupEdgeEvidence`: occurrence IDs are unique non-empty UTF-8 strings capped at 256 bytes; disposition is one of `kept/rewritten/dropped`; kept/rewritten require a final ID and no drop reason; dropped requires a reason from `contract.lineage_reason_codes` and no final ID. Re-serialize the parsed value canonically and require byte equality so alternate encodings cannot have the same semantic acceptance.
 
 `ExtractionInvocation.payload` is canonical JSON of the invocation body without a self-digest; `digest` is domain-separated over those bytes. The evidence parser reconstructs it from the embedded closed object and requires the recomputed digest to equal the top-level `extraction_invocation_digest`. This lets later candidate/owned validators verify the orchestration binding rather than trusting an orphan 64-hex string. `GraphEvidence.payload` is the canonical bytes and `GraphEvidence.digest` is ordinary SHA-256 of those bytes. Do not include the evidence digest inside its own payload.
+
+`parse_graph_evidence(payload, contract, *, expected_digest)` requires an external lowercase SHA-256 anchor. Enforce the byte cap, validate `expected_digest`, and compare it with SHA-256 of the exact payload before JSON parsing or semantic admission. Tests pass `built.digest` for a builder-produced descriptor; semantic-malformation tests independently hash their controlled fixture bytes only to reach post-anchor validation; and a canonical relation/source-path mutation must fail when paired with the original trusted digest. Production callers must pass the SHA-256 already bound by their captured payload descriptor or bundle artifact metadata, never hash an untrusted payload and present that result as trust.
+
+`build_graph_evidence(..., staged_files=frozenset(...))` requires the exact staged projection path set. Both this evidence boundary and `Graphify0948Adapter.adapt_clustered_graph()` reapply `GLOBAL_DENY_PATTERNS` through `is_denied`, even when a denied path appears in the caller's set. The final descriptor is recomputed at `adapted/graph.json` from invocation-bound clustered bytes plus that deny-clean staged set.
 
 - [ ] **Step 8: Run evidence and full regressions**
 

@@ -143,7 +143,10 @@ from project_knowledge.graphify import (
 
 def resolve_graphify_compatibility(version: str) -> GraphifyCompatibility: ...
 def parse_graph_evidence(
-    payload: bytes, contract: GraphifyCompatibility
+    payload: bytes,
+    contract: GraphifyCompatibility,
+    *,
+    expected_digest: str,
 ) -> GraphEvidence: ...
 @dataclass(frozen=True)
 class AgentInstallContract:
@@ -418,7 +421,7 @@ The canonical manifest dictionary has exactly these keys: `adapter_id`, `atlaswe
 2. take the lifecycle lock;
 3. call `inspect_projection`, validate the live owned generation against both current digests, descriptor-capture its ownership plus the closed approved artifacts into a mode-0700 temporary snapshot, validate the captured generation again, and call `inspect_projection` again;
 4. require before/owned/after source and projection digests to be identical;
-5. read evidence only from the captured payload descriptor, validate it through `parse_graph_evidence(payload, resolve_graphify_compatibility(manifest.graphify_version))`, and require schema-v2 evidence even when trust is navigation;
+5. select evidence only from the immutable `CapturedGeneration.payloads` descriptor, read its descriptor-captured bytes, validate them through `parse_graph_evidence(payload, resolve_graphify_compatibility(manifest.graphify_version), expected_digest=evidence_capture.sha256)`, and require schema-v2 evidence even when trust is navigation; `evidence_capture.sha256` comes from the no-follow, double-digest generation capture, never from hashing caller bytes at the parser call site;
 6. release the lock only after the copied snapshot validates as one generation;
 7. call `_pack_captured_generation` to build exclusively from the snapshot, writing `artifact.json` first and approved payloads in `ALLOWED_PAYLOADS` order;
 8. fsync an exclusive mode-0600 sibling temporary, atomically `linkat` that inode to the absent destination (or use a capability-probed `renameat2(RENAME_NOREPLACE)` equivalent), fsync the parent, unlink the temporary name, fsync again, and return its SHA-256/length.
@@ -502,6 +505,8 @@ git commit -m "feat: add deterministic graph bundle packing"
 - Produces: `ParsedBundle(root: Path, artifact: ArtifactManifest, payloads: tuple[PayloadBinding, ...], archive_sha256: str, archive_size: int)` with `read_payload(path: PurePosixPath, max_bytes: int) -> bytes` that reopens through the bound directory descriptor and revalidates inode/digest/length.
 - Produces: `parse_bundle(bundle: Path, destination: Path) -> ParsedBundle`.
 - Produces: `inspect_bundle_manifest(bundle: Path) -> ArtifactManifest`, which validates archive structure and reads only bounded `artifact.json`.
+
+For every later evidence parse, `expected_digest` is the matched `PayloadBinding.sha256`. `parse_bundle()` obtains that value from the closed `artifact.json` payload descriptor and verifies it against the captured archive bytes before returning; `read_payload()` revalidates the same binding. Consumers must not hash the bytes returned by `read_payload()` and use that self-derived value as an authority.
 
 - [ ] **Step 1: Write a mutation matrix against local headers, central records, and EOCD**
 
@@ -652,12 +657,17 @@ def _install_bundle(repo_root: Path, bundle: Path, authorization: _PullAuthoriza
             _require_transport_authority(parsed, manifest, authorization)
             _require_project_snapshot_identity(parsed.artifact, manifest, before)
             compatibility = resolve_graphify_compatibility(manifest.graphify_version)
+            evidence_path = PurePosixPath("graphify-out/GRAPH_EVIDENCE.json")
+            evidence_binding = next(
+                item for item in parsed.payloads if item.path == evidence_path
+            )
             parse_graph_evidence(
                 parsed.read_payload(
-                    PurePosixPath("graphify-out/GRAPH_EVIDENCE.json"),
+                    evidence_path,
                     GRAPH_EVIDENCE_MAX_BYTES,
                 ),
                 compatibility,
+                expected_digest=evidence_binding.sha256,
             )
             validated = validate_candidate(
                 parsed.root, before, manifest,
@@ -1273,12 +1283,17 @@ with repository_lifecycle_lock(repo_root):
         staged = stage_input(repo_root, manifest, private / "source")
         parsed = parse_bundle(build_bundle, private / "candidate")
         _require_publication_identity(parsed.artifact, manifest, staged, context)
+        evidence_path = PurePosixPath("graphify-out/GRAPH_EVIDENCE.json")
+        evidence_binding = next(
+            item for item in parsed.payloads if item.path == evidence_path
+        )
         parse_graph_evidence(
             parsed.read_payload(
-                PurePosixPath("graphify-out/GRAPH_EVIDENCE.json"),
+                evidence_path,
                 GRAPH_EVIDENCE_MAX_BYTES,
             ),
             resolve_graphify_compatibility(manifest.graphify_version),
+            expected_digest=evidence_binding.sha256,
         )
         validated = validate_candidate(
             parsed.root,

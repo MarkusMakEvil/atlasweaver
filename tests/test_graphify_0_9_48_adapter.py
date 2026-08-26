@@ -555,6 +555,30 @@ def test_adapt_clustered_graph_rejects_unconfined_staged_paths(
 
 
 @pytest.mark.parametrize(
+    "denied",
+    [
+        ".env",
+        "private/.env",
+        "config/auth-token.yaml",
+        "workspace/runtime/state.json",
+    ],
+)
+def test_adapt_clustered_graph_reapplies_immutable_privacy_denies(
+    denied: str,
+) -> None:
+    staged_files = frozenset(
+        {PurePosixPath("src/pkg/a.py"), PurePosixPath(denied)}
+    )
+
+    with pytest.raises(AdapterContractError, match="staged files") as captured:
+        adapter().adapt_clustered_graph(
+            clustered_artifact(valid_clustered_document()),
+            staged_files=staged_files,
+        )
+    assert denied not in str(captured.value)
+
+
+@pytest.mark.parametrize(
     "mutation",
     [
         lambda value: value.update(edges=value.pop("links")),
