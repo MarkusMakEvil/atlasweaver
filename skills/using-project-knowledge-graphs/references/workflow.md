@@ -5,7 +5,10 @@ Read only the section for the active mode. Commands use explicit paths; inspect 
 ## Detect and query
 
 1. Run `project-knowledge detect --repo <repo> --json`.
-2. If opted in and healthy, read `graphify-out/GRAPH_REPORT.md`, then use the official `$graphify` query workflow for relationship/path questions.
+2. Run `project-knowledge doctor --repo <repo> --json`, then
+   `project-knowledge health --repo <repo> --json`. If admitted, use
+   `project-knowledge query`, `path`, `explain`, or `affected`; do not query
+   opaque native output directly.
 3. Open only the source files needed to verify decisive or inferred claims. Report provenance as `Graphify-extracted`, `Graphify-inferred`, or `source-verified`.
 4. If missing or stale, disclose that state. Do not silently rebuild.
 
@@ -18,9 +21,9 @@ project-knowledge health --repo <repo> --json
 ```
 
 Supply `--atlas <atlas>` only when that local state is in scope. Treat source-digest mismatch as authoritative freshness evidence; registry matching is an internal health input, not a CLI path argument.
-Treat `impact_analysis_trusted:false` and `graph_integrity_degraded` as a hard
-boundary on impact claims: navigation remains useful, but source verification
-is mandatory.
+Disabled optional features do not make core health partial. Treat
+`trust.impact:navigation` and its limitations as a hard boundary on impact
+claims: navigation remains useful, but source verification is mandatory.
 
 ## Secret triage
 
@@ -42,39 +45,61 @@ If `project-knowledge` is unavailable, run the reviewed repository onboarding
 command once: `python3 scripts/install-project-knowledge-tool`. Then verify
 `command -v project-knowledge` before continuing.
 
-Before mutation, show the repository, include roots, immutable global deny set, staged destination, project output, and atlas namespace. Obtain exact approval for the proposed mutation and paths.
+Before mutation, show the repository, include roots, immutable global deny set,
+project output, and optional destinations. Obtain exact approval for the
+proposed mutation and paths.
 
-1. Run the read-only check:
-
-   ```sh
-   project-knowledge preflight --repo <repo> --json
-   ```
-
-2. Create a private temporary destination and stage only sanitized input:
+1. Initialize or migrate only through preview then explicit apply:
 
    ```sh
-   project-knowledge stage --repo <repo> --destination <staged-input> --receipt <staging-receipt> --json
+   project-knowledge init --repo <repo> --project-id <id> --include-root src --json
+   project-knowledge init --repo <repo> --project-id <id> --include-root src --apply --json
+   project-knowledge manifest-migrate --repo <repo> --json
    ```
 
-3. Invoke the official `$graphify` skill on `<staged-input>`, never the unsanitized repository. Direct native output to a private raw candidate. Use only capabilities discovered from the pinned installation and official skill; do not guess shell flags.
-4. Verify the receipt and adapt raw Graphify output into a separate wrapper candidate:
+2. Run the read-only doctor, then the authorized high-level refresh:
 
    ```sh
-   project-knowledge adapt --repo <repo> --staged-input <staged-input> --receipt <staging-receipt> --raw-candidate <raw-graph-candidate> --destination <graph-candidate> --json
+   project-knowledge doctor --repo <repo> --json
+   project-knowledge refresh --repo <repo> --code-only --json
    ```
 
-   `adapt` does not modify the raw candidate. It fails if source or staged bytes
-   drift, if final edge endpoints are missing/dangling, or if wrapper metadata
-   is already present.
-
-5. Validate, then promote the same adapted candidate through the wrapper:
+   Semantic mode must declare both backend and public model ID; credentials
+   come only from the compatibility allowlist:
 
    ```sh
-   project-knowledge validate --repo <repo> --candidate <graph-candidate> --json
-   project-knowledge promote --repo <repo> --candidate <graph-candidate> --json
+   project-knowledge refresh --repo <repo> --backend <backend> --model <model> --deep --json
    ```
 
-6. Run health again. Registry synchronization and any Git commit remain separate, visible mutations.
+3. Run health and bounded queries. Treat exit status 3 after promotion as
+   post-promotion source drift, not success.
+
+   ```sh
+   project-knowledge health --repo <repo> --json
+   project-knowledge query --repo <repo> <term> --json
+   project-knowledge affected --repo <repo> <node-id> --json
+   project-knowledge registry-status --json
+   ```
+
+Stable JSON error codes are the automation contract; never parse exception
+text or absolute paths. Registry synchronization is an explicit opt-in
+mutation and is never implied by refresh.
+
+### Low-level recovery
+
+Only for diagnosis/recovery, create a private stage, invoke the official
+`$graphify` skill against that stage (never the repository root), then adapt,
+validate, and promote the exact candidate:
+
+```sh
+project-knowledge stage --repo <repo> --destination <staged-input> --receipt <staging-receipt> --json
+project-knowledge adapt --repo <repo> --staged-input <staged-input> --receipt <staging-receipt> --raw-candidate <raw-graph-candidate> --destination <graph-candidate> --json
+project-knowledge validate --repo <repo> --candidate <graph-candidate> --json
+project-knowledge promote --repo <repo> --candidate <graph-candidate> --json
+```
+
+Run health again. Registry synchronization and any Git commit remain separate,
+visible mutations.
 
 Refresh only after architecture, module-boundary, schema, public-interface, or substantial documentation changes. Skip it for trivial copy, formatting, comments, and isolated one-line edits.
 

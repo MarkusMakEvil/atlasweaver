@@ -4,6 +4,16 @@ All notable changes to AtlasWeaver are documented here.
 
 ## Unreleased
 
+- Added manifest schema v2 with recoverable initialization and explicit v1
+  migration previews.
+- Added descriptor-bound lifecycle authority, privacy projection digests,
+  tracked extraction-coverage approvals, and content-free operation state.
+- Added evidence-bound refresh foundations, core-vs-optional health semantics,
+  immutable bounded queries, and an opt-in project-agnostic registry/fleet
+  model.
+- Added packaged agent resources, a bounded upstream Graphify compatibility
+  probe, and artifact transport/workflow foundations.
+
 ## 0.2.2 - 2026-08-25
 
 - Normalized Graphify's empty source-path sentinels and package-relative module

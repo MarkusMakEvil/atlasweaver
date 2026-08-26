@@ -9,11 +9,14 @@ Use the project graph as a privacy-safe navigation layer, not as automatic proof
 
 ## Route by relevance
 
-- For architecture, dependency, impact, onboarding, design, or substantial project documentation, run read-only `project-knowledge detect --repo . --json`, then prefer `GRAPH_REPORT.md` and graph query before broad source traversal.
+- For architecture, dependency, impact, onboarding, design, or substantial project documentation, run read-only `project-knowledge detect --repo . --json`, then `project-knowledge doctor --repo . --json` before substantive graph use. Prefer AtlasWeaver's bounded `project-knowledge query`, `path`, `explain`, and `affected` commands before broad source traversal.
 - For a trivial copy, formatting, comment, or isolated one-line edit, skip graph work.
 - Read `references/workflow.md` before bootstrap, refresh, export, promotion, health diagnosis, or when the graph is absent, stale, or partial. It contains the exact command choreography.
 
-Read-only detect, query, and health checks are allowed within the task. Begin any proposed bootstrap or refresh with read-only `project-knowledge preflight`; the reference supplies its full invocation. Bootstrap, staging, refresh, export, atlas promotion, registry changes, hooks, instruction edits, and generated-file commits require exact approval for that mutation and destination. Never commit or push implicitly.
+Read-only detect, doctor, query, and health checks are allowed within the task. Begin any proposed bootstrap or refresh with read-only `project-knowledge doctor`; the reference supplies its full invocation. Bootstrap, refresh, export, atlas promotion, registry changes, hooks, instruction edits, and generated-file commits require exact approval for that mutation and destination. Never refresh, register, or publish implicitly. Never commit or push implicitly.
+
+`project-knowledge preflight` remains a read-only low-level recovery diagnostic;
+it is not a replacement for the ordinary doctor/refresh lifecycle.
 
 Use `project-knowledge scan-secrets` before an approved stage. Its findings are
 redacted fingerprints. High-confidence structured credentials are
@@ -24,9 +27,10 @@ excepted. Never request or print the matching source literal.
 
 Label decisive claims as `Graphify-extracted`, `Graphify-inferred`, or `source-verified`. Verify inferred or decisive claims against current source. If health reports stale or source drift, say so; do not present the graph as current fact.
 
-If health returns `impact_analysis_trusted:false` or the
-`graph_integrity_degraded` issue, use the graph for navigation only and verify
-every impact conclusion against current source.
+If health or a query returns `navigation` trust, use the graph for navigation
+only and verify every impact conclusion against current source. Absence of a
+path is never proof of no impact. Legacy JSON exposes the same boundary as
+`impact_analysis_trusted:false` and `graph_integrity_degraded`.
 
 Refresh at checkpoints after architecture, module boundary, schema, public interface, or substantial documentation changes. Do not rebuild for trivial edits.
 

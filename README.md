@@ -42,15 +42,45 @@ scripts/install-project-knowledge-skill --codex-home "${CODEX_HOME:-$HOME/.codex
 
 ## Add a project
 
-Copy and edit the two files under `examples/`, then run the read-only preflight:
+Initialize each repository so it receives its own UUID; do not copy the
+`project_uid` from the example manifest. The ordinary safe lifecycle is:
 
 ```sh
-cp examples/.graphify-project.yaml /path/to/project/.graphify-project.yaml
-cp examples/.graphifyignore /path/to/project/.graphifyignore
-project-knowledge preflight --repo /path/to/project --json
+project-knowledge init --repo /path/to/project --project-id my-project --include-root src --apply --json
+project-knowledge doctor --repo /path/to/project --json
+project-knowledge refresh --repo /path/to/project --code-only --json
+project-knowledge health --repo /path/to/project --json
+project-knowledge query --repo /path/to/project "authentication" --json
 ```
 
-The safe refresh sequence is deliberately explicit:
+`init` and `manifest-migrate` are preview-only unless `--apply` is explicit.
+Code-only refresh needs no model or credential. Semantic refresh requires a
+declared backend and public model identifier:
+
+```sh
+project-knowledge refresh --repo /path/to/project --backend <declared-backend> --model <public-model-id> --deep --json
+```
+
+Credentials are read only from the selected compatibility entry's environment
+allowlist. AtlasWeaver has no implicit backend or model. Sensitive source names
+are scanned; sensitive data names are denied without reading their content.
+Known extractor omissions require an exact path/content/adapter/reason approval
+in `.atlasweaver-coverage.yaml`; a byte change invalidates that approval.
+
+Registry use is optional and universal across unrelated repositories:
+
+```sh
+project-knowledge registry-status --json
+project-knowledge registry-sync --repo /path/to/project --apply --json
+```
+
+Disabled optional features do not lower core health. Query operations are
+immutable, bounded snapshots. A `navigation` trust result is useful for finding
+code, but every consequential impact claim still needs source verification.
+
+### Low-level recovery
+
+Use the manual pipeline only when diagnosing or recovering a failed lifecycle:
 
 ```sh
 project-knowledge scan-secrets --repo /path/to/project --json
@@ -60,6 +90,9 @@ project-knowledge adapt --repo /path/to/project --staged-input "$PRIVATE_STAGE" 
 project-knowledge validate --repo /path/to/project --candidate "$GRAPH_CANDIDATE" --json
 project-knowledge promote --repo /path/to/project --candidate "$GRAPH_CANDIDATE" --json
 ```
+
+Never point Graphify at the repository root. AtlasWeaver never commits or
+pushes implicitly.
 
 `adapt` never mutates Graphify's raw output. It verifies the staged receipt,
 copies only the policy-approved artifacts into a separate candidate, and adds
@@ -86,10 +119,12 @@ into a live vault.
 ## Health and trust
 
 ```sh
-project-knowledge health --repo /path/to/project --atlas "$OBSIDIAN_ATLAS" --json
+project-knowledge doctor --repo /path/to/project --json
+project-knowledge health --repo /path/to/project --json
 ```
 
-- `source_matches:false` means the graph is stale.
+- `source_matches:false` or `projection_matches:false` means the graph is stale;
+  successful promotion followed by immediate drift exits with status 3.
 - `atlas_available:false` means strict generated-namespace ownership failed.
 - `registry_matches:false` means the global graph copy differs.
 - `partial` can be an honest accepted state when approved files are bound into
