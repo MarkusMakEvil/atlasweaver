@@ -158,7 +158,7 @@ else:
     return executable, calls
 
 
-def test_parser_exposes_only_the_ten_workflow_commands() -> None:
+def test_parser_exposes_the_high_level_and_retained_workflow_commands() -> None:
     """A missing or accidental extra command would break the skill contract."""
     from project_knowledge.cli import build_parser
 
@@ -169,6 +169,22 @@ def test_parser_exposes_only_the_ten_workflow_commands() -> None:
         if isinstance(action, __import__("argparse")._SubParsersAction)
     )
     assert set(choices) == {
+        "init",
+        "manifest-migrate",
+        "doctor",
+        "refresh",
+        "query",
+        "path",
+        "explain",
+        "affected",
+        "coverage",
+        "registry-status",
+        "registry-sync",
+        "artifact",
+        "pull",
+        "install-agent",
+        "uninstall-agent",
+        "fleet",
         "detect",
         "preflight",
         "stage",
@@ -221,10 +237,11 @@ def test_preflight_json_is_non_mutating_and_probes_exact_graphify_argv(
         "schema_version": 1,
         "command": "preflight",
         "status": "ready",
-        "project_id": "demo",
         "graphify_version": "0.9.48",
-        "safe_file_count": 1,
-        "obsidian_export": False,
+        "backend": None,
+        "model": None,
+        "deep": False,
+        "credential_bound": False,
     }
     assert tree_snapshot(repo) == before
     assert not (repo / ".project-knowledge").exists()
@@ -534,12 +551,14 @@ def test_adapt_removes_candidate_when_source_drifts_after_write(
     real_check = cli_module._require_current_input
     checks = 0
 
-    def drift_after_write(repo_path: Path, manifest: object, expected: object) -> None:
+    def drift_after_write(
+        repo_path: Path, manifest: object, expected: object, **options: object
+    ) -> None:
         nonlocal checks
         checks += 1
         if checks == 2:
             raise StagingError("simulated post-adapt source drift")
-        real_check(repo_path, manifest, expected)  # type: ignore[arg-type]
+        real_check(repo_path, manifest, expected, **options)  # type: ignore[arg-type]
 
     monkeypatch.setattr(cli_module, "_require_current_input", drift_after_write)
 
@@ -722,7 +741,7 @@ def test_operational_errors_have_stable_sanitized_json_and_exit_code(
         "status": "error",
         "error": {
             "code": "artifact_invalid",
-            "message": "graph candidate validation failed",
+            "message": "graph artifact is invalid",
         },
     }
     assert result.stderr == ""
@@ -757,7 +776,7 @@ def test_console_entrypoint_is_declared_only_with_the_working_module() -> None:
     )
 
     assert result.returncode == 0
-    assert "{detect,preflight,stage,adapt,scan-secrets,validate,promote,atlas-prepare,atlas-promote,health}" in result.stdout
+    assert "{init,manifest-migrate,doctor,refresh,query,path,explain,affected,coverage,registry-status,registry-sync,detect,preflight,stage,adapt,scan-secrets,validate,promote,atlas-prepare,atlas-promote,health,artifact,pull,install-agent,uninstall-agent,fleet}" in result.stdout
     assert "Traceback" not in result.stderr
 
 
