@@ -6,7 +6,10 @@ from collections.abc import Callable
 from dataclasses import dataclass
 import hashlib
 from importlib import resources
-from importlib.resources.abc import Traversable
+try:  # Python 3.11+
+    from importlib.resources.abc import Traversable
+except ImportError:  # Python 3.10
+    from importlib.abc import Traversable
 import json
 import os
 from pathlib import Path, PurePosixPath
