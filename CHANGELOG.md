@@ -2,6 +2,11 @@
 
 All notable changes to AtlasWeaver are documented here.
 
+## 0.3.3 - 2026-08-26
+
+- Isolated all GitHub CLI config, cache, home, and state writes inside the
+  verified-pull private temporary directory.
+
 ## 0.3.2 - 2026-08-26
 
 - Allowed securely resolved package-manager symlinks for the GitHub CLI while

@@ -267,6 +267,14 @@ class _Runner:
         assert config.is_dir()
         assert stat.S_IMODE(config.stat().st_mode) == 0o700
         assert list(config.iterdir()) == []
+        sandbox = config.parent
+        assert Path(env["HOME"]).parent == sandbox
+        assert Path(env["XDG_CONFIG_HOME"]).parent == sandbox
+        assert Path(env["XDG_CACHE_HOME"]).parent == sandbox
+        state = Path(env["XDG_STATE_HOME"])
+        assert state.parent == sandbox
+        state.mkdir()
+        (state / "device-id").write_text("isolated", encoding="utf-8")
         self.calls.append((argv, dict(env), timeout_seconds, output_limit, config))
         return self.result
 
@@ -363,7 +371,10 @@ def test_attestation_uses_exact_argv_minimal_environment_and_cleans(tmp_path: Pa
         "--predicate-type", policy.predicate_type,
         "--deny-self-hosted-runners", "--format", "json",
     )
-    assert set(env) == {"GH_CONFIG_DIR", "GH_TOKEN", "LANG", "LC_ALL"}
+    assert set(env) == {
+        "GH_CONFIG_DIR", "GH_TOKEN", "HOME", "LANG", "LC_ALL",
+        "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME",
+    }
     assert timeout == 60.0 and limit == 256 * 1024
     assert not config_dir.exists()
     assert verified.subject_sha256 == digest

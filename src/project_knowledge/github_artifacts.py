@@ -927,6 +927,8 @@ def verify_attestation_policy(
     subject = _hash_regular_file(bundle)
     config_root = Path(tempfile.mkdtemp(prefix="atlasweaver-gh-"))
     config_root.chmod(0o700)
+    config_dir = config_root / "config"
+    config_dir.mkdir(mode=0o700)
     argv = (
         str(gh.path), "attestation", "verify", str(bundle),
         "--hostname", "github.com", "--repo", policy.repository,
@@ -938,10 +940,14 @@ def verify_attestation_policy(
         "--deny-self-hosted-runners", "--format", "json",
     )
     environment = {
-        "GH_CONFIG_DIR": str(config_root),
+        "GH_CONFIG_DIR": str(config_dir),
         "GH_TOKEN": credentials.token,
+        "HOME": str(config_root / "home"),
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
+        "XDG_CACHE_HOME": str(config_root / "cache"),
+        "XDG_CONFIG_HOME": str(config_root / "xdg-config"),
+        "XDG_STATE_HOME": str(config_root / "state"),
     }
     try:
         before_exec()
