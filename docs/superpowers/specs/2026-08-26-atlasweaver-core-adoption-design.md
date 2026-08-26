@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-26
 
-**Status:** Approved design, awaiting implementation plan
+**Status:** Approved design; implementation plan complete
 
 **Scope:** Privacy policy v2, manifest v2, high-level lifecycle commands,
 health semantics, and the unified read-only query surface.
@@ -99,6 +99,13 @@ compatibility registry, including `extract --no-cluster`, `cluster-only`, and
 For 0.9.48 the registry requires `diagnose multigraph --undirected --json` to
 match `cluster-only` semantics. Community-label generation is a future explicit
 feature with its own pinned backend/model and credential boundary.
+Preflight resolves the Graphify launcher once into its canonical regular path,
+device, inode, and SHA-256 identity. The shared process boundary reopens and
+revalidates that immutable identity immediately before every Graphify child; a
+replacement, in-place mutation, symlink swap, or read failure aborts before
+spawn with `graphify_executable_changed`. No public command accepts a Graphify
+binary override; explicit executable paths exist only as injected library-test
+seams.
 
 The command exposes Graphify backend/model/deep-mode options as validated argv
 items. It never forwards `--allow-partial`, `--global`, database introspection,
@@ -215,7 +222,7 @@ artifact intent:
 ```yaml
 schema_version: 2
 project_id: demo-project
-project_uid: 4ed9af24-5aa2-5eac-8d0a-3f622cc74948
+project_uid: 4ed9af24-5aa2-4eac-8d0a-3f622cc74948
 display_name: Demo Project
 include_roots: [src, docs]
 output_dir: graphify-out
@@ -391,6 +398,8 @@ by failure-injection tests.
 - CLI contract tests for preview/apply, doctor, refresh, query, and stable error
   codes.
 - Failure-injection tests at every lifecycle boundary and cleanup point.
+- Executable-identity tests for path replacement, in-place launcher mutation,
+  symlink swap, and mutation between consecutive Graphify subprocesses.
 - Real Graphify 0.9.48 lifecycle tests for code-only and semantic-backend
   preflight behavior.
 - Compatibility tests for all legacy low-level commands and health fields.

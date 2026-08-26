@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-26
 
-**Status:** Approved design, awaiting implementation plan
+**Status:** Approved design; implementation plan complete
 
 **Scope:** Versioned Graphify adapters, raw diagnostic evidence, and honest
 impact-trust promotion.
@@ -50,12 +50,27 @@ queries, workflows, and tests. No second hard-coded version allowlist is
 permitted. A registry consistency test scans all public version touchpoints and
 fails if they do not resolve through this API.
 
+Executable resolution produces one immutable `ResolvedGraphifyExecutable`
+containing the canonical resolved regular path, `st_dev`, `st_ino`, and the
+launcher SHA-256 captured with no-follow descriptor checks. Immediately before
+every Graphify subprocess—including version/help/capability smoke, extraction,
+diagnosis, clustering, registry projection, agent installation, and query
+commands—the shared runner reopens that exact path with no-follow semantics and
+requires the same device, inode, and launcher digest. Any reopen, identity, or
+digest mismatch fails closed as `graphify_executable_changed` before the runner
+is invoked. High-level/public commands expose no binary-path override; an
+explicit path is permitted only as an injected library-test or maintainer
+fixture-capture seam.
+
 `GraphifyAdapter` owns only version-specific native-output normalization. The
 existing AtlasWeaver validator, ownership, freshness, policy, and promotion
 contracts remain version-independent.
 
 Refresh records an `extraction_invocation_digest` using the domain prefix
-`atlasweaver-graphify-pipeline-v1\0` and canonical UTF-8 JSON. Its payload binds
+`atlasweaver-graphify-pipeline-v1\0` and canonical UTF-8 JSON. The same closed,
+sanitized invocation payload is embedded in `GRAPH_EVIDENCE.json` alongside that
+digest so validators can reconstruct the canonical bytes and verify the binding
+instead of trusting an orphan hash. Its payload binds
 the adapter ID, Graphify executable SHA-256/version, the ordered argv arrays for
 extract/diagnose/cluster (including directedness, `--no-label`, and visualization
 policy), backend/model
@@ -106,6 +121,27 @@ monkeypatch hooks are not an accepted production capture boundary.
   "source_digest": "...",
   "projection_digest": "...",
   "extraction_invocation_digest": "...",
+  "extraction_invocation": {
+    "schema_version": 1,
+    "adapter_id": "graphify-0.9.48",
+    "graphify_version": "0.9.48",
+    "executable": {"sha256": "...", "version": "0.9.48"},
+    "capability_smoke_digest": "...",
+    "argv": [
+      {"operation": "extract", "items": ["<graphify>", "extract", "<staged-root>", "..."]},
+      {"operation": "diagnose", "items": ["<graphify>", "diagnose", "multigraph", "..."]},
+      {"operation": "cluster", "items": ["<graphify>", "cluster-only", "<cluster-workspace>", "..."]}
+    ],
+    "backend": "openai",
+    "model": "...",
+    "configuration_sha256": "...",
+    "source_digest": "...",
+    "projection_digest": "...",
+    "environment_names": ["HOME", "LANG", "LC_ALL", "OPENAI_API_KEY", "PATH"],
+    "artifacts": [
+      {"path": "raw/graph.json", "sha256": "...", "byte_length": 123}
+    ]
+  },
   "observed_post_dedup": {
     "node_count": 969,
     "edge_count": 3290,
@@ -117,6 +153,14 @@ monkeypatch hooks are not an accepted production capture boundary.
   "limitations": ["pre_dedup_edge_projection_unavailable"]
 }
 ```
+
+`extraction_invocation` is the exact canonical invocation body without a
+self-digest. Its recursively closed schema permits only canonical logical argv,
+environment-variable names, and digest/length artifact bindings—never actual
+paths or secret values. Evidence parsing canonicalizes this object, recomputes
+the domain-separated digest, and requires equality with
+`extraction_invocation_digest`; unknown keys, alternate encodings, or an object
+whose binding differs are rejected.
 
 Counts are recomputed during adaptation rather than copied blindly from native
 metadata. Lifecycle owns the handoff: it descriptor-captures native artifacts,
