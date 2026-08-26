@@ -67,6 +67,39 @@ def test_global_sensitive_and_runtime_paths_are_denied(
     assert is_denied(PurePosixPath(path), effective_excludes(manifest))
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        "tokens/config.py",
+        "a/token-store/file.py",
+        "credentials/config.py",
+        "creds/config.py",
+        "secrets/config.py",
+        "foo/secret-cache/a.py",
+        "TOKENS/config.py",
+        "a/Token-Store/file.py",
+        "CREDENTIALS/config.py",
+        "CREDS/config.py",
+        "Secrets/config.py",
+        "foo/Secret-Cache/a.py",
+    ],
+)
+def test_global_denies_recurse_through_sensitive_directories(
+    path: str, manifest: ProjectManifest
+) -> None:
+    assert is_denied(PurePosixPath(path), effective_excludes(manifest))
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["src/auth/config.py", "a/public-store/file.py", "docs/security/guide.md"],
+)
+def test_recursive_sensitive_directory_denies_preserve_ordinary_directories(
+    path: str, manifest: ProjectManifest
+) -> None:
+    assert not is_denied(PurePosixPath(path), effective_excludes(manifest))
+
+
 @pytest.mark.parametrize("path", ["contest.py", "src/notebook.py", "Projects/demo/Generated/a.md"])
 def test_component_aware_denies_preserve_safe_paths(
     path: str, manifest: ProjectManifest

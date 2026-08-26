@@ -16,10 +16,14 @@ from .models import ProjectManifest
 from .privacy import GLOBAL_DENY_PATTERNS, is_denied
 
 
+_TOKEN_START = rb"(?<![A-Za-z0-9])"
+_TOKEN_END = rb"(?![A-Za-z0-9])"
 _STRUCTURED_RULES = (
     (
         "telegram_token",
-        re.compile(rb"(?<![0-9])[0-9]{8,10}:[A-Za-z0-9_-]{30,}"),
+        re.compile(
+            _TOKEN_START + rb"[0-9]{8,10}:[A-Za-z0-9_-]{30,}" + _TOKEN_END
+        ),
     ),
     (
         "private_key",
@@ -27,22 +31,45 @@ _STRUCTURED_RULES = (
             rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----\s*[\r\n]+[A-Za-z0-9+/=]{32,}"
         ),
     ),
-    ("aws_access_key", re.compile(rb"\bAKIA[0-9A-Z]{16}\b")),
-    ("github_token", re.compile(rb"\bgh[pousr]_[A-Za-z0-9]{20,}\b")),
-    ("google_api_key", re.compile(rb"\bAIza[A-Za-z0-9_-]{35}\b")),
-    ("stripe_live_key", re.compile(rb"\b[rs]k_live_[A-Za-z0-9]{16,}\b")),
-    ("slack_token", re.compile(rb"\bxox[baprs]-[A-Za-z0-9-]{20,}\b")),
+    (
+        "aws_access_key",
+        re.compile(_TOKEN_START + rb"(?:AKIA|ASIA)[0-9A-Z]{16}" + _TOKEN_END),
+    ),
+    (
+        "github_token",
+        re.compile(_TOKEN_START + rb"gh[pousr]_[A-Za-z0-9]{20,}" + _TOKEN_END),
+    ),
+    (
+        "github_token",
+        re.compile(_TOKEN_START + rb"github_pat_[A-Za-z0-9_]{82}" + _TOKEN_END),
+    ),
+    (
+        "google_api_key",
+        re.compile(_TOKEN_START + rb"AIza[A-Za-z0-9_-]{35}" + _TOKEN_END),
+    ),
+    (
+        "stripe_live_key",
+        re.compile(_TOKEN_START + rb"[rs]k_live_[A-Za-z0-9]{16,}" + _TOKEN_END),
+    ),
+    (
+        "slack_token",
+        re.compile(_TOKEN_START + rb"xox[baprs]-[A-Za-z0-9-]{20,}" + _TOKEN_END),
+    ),
     (
         "jwt",
         re.compile(
-            rb"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"
+            _TOKEN_START
+            + rb"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"
+            + _TOKEN_END
         ),
     ),
     (
         "bearer_token",
         re.compile(
-            rb"(?i)(?:\bauthorization\b\s*[:=]\s*[\"']?)?"
-            rb"\bBearer\s+[A-Za-z0-9._~+/=-]{20,}"
+            _TOKEN_START
+            + rb"(?i:(?:authorization\s*[:=]\s*[\"']?)?"
+            rb"Bearer\s+[A-Za-z0-9._~+/=-]{20,})"
+            + _TOKEN_END
         ),
     ),
     (

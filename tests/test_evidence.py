@@ -452,6 +452,37 @@ def test_invocation_rejects_private_or_secret_shaped_models_without_echo(
     assert all(model not in value for value in serialized)
 
 
+@pytest.mark.parametrize(
+    "model",
+    [
+        "org_" + "gh" + "p_" + "a" * 36,
+        "org_" + "github" + "_pat_" + "a" * 82,
+        "org_" + "AK" + "IA" + "A" * 16,
+        "org_" + "AS" + "IA" + "A" * 16,
+        "org_" + "AI" + "za" + "A" * 35,
+        "org_" + "xox" + "b-" + "1" * 12 + "-" + "a" * 24,
+        "org_" + "eyJ" + "a" * 12 + "." + "b" * 16 + "." + "c" * 16,
+    ],
+)
+def test_invocation_rejects_namespaced_secret_models_without_echo(
+    model: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    serialized: list[str] = []
+    canonicalize = evidence_module._canonical_json
+
+    def record_serialization(value: object) -> bytes:
+        serialized.append(repr(value))
+        return canonicalize(value)
+
+    monkeypatch.setattr(evidence_module, "_canonical_json", record_serialization)
+    with pytest.raises(EvidenceError, match="public model identifier") as captured:
+        invocation_factory(model=model)
+    assert captured.value.__cause__ is None
+    assert model not in str(captured.value)
+    assert all(model not in value for value in serialized)
+
+
 def fixture_document() -> dict[str, object]:
     payload = resources.files("project_knowledge.compatibility_fixtures").joinpath(
         "graphify_0_9_48.json"
@@ -792,6 +823,36 @@ def test_builder_reapplies_immutable_privacy_denies_to_staged_files(
 
     with pytest.raises(EvidenceError, match="staged files") as captured:
         build_from_pipeline(fixture_pipeline(), staged_files=staged_files)
+    assert denied not in str(captured.value)
+
+
+@pytest.mark.parametrize(
+    "denied",
+    [
+        "tokens/config.py",
+        "a/token-store/file.py",
+        "credentials/config.py",
+        "creds/config.py",
+        "secrets/config.py",
+        "foo/secret-cache/a.py",
+        "TOKENS/config.py",
+        "a/Token-Store/file.py",
+        "CREDENTIALS/config.py",
+        "CREDS/config.py",
+        "Secrets/config.py",
+        "foo/Secret-Cache/a.py",
+    ],
+)
+def test_builder_reapplies_immutable_privacy_denies_to_directory_descendants(
+    denied: str,
+) -> None:
+    staged_files = frozenset(
+        {PurePosixPath("fixture.py"), PurePosixPath(denied)}
+    )
+
+    with pytest.raises(EvidenceError, match="staged files") as captured:
+        build_from_pipeline(fixture_pipeline(), staged_files=staged_files)
+    assert captured.value.__cause__ is None
     assert denied not in str(captured.value)
 
 

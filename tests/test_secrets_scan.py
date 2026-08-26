@@ -8,6 +8,7 @@ import pytest
 from project_knowledge.models import ProjectManifest
 from project_knowledge.secrets_scan import (
     SecretExceptionError,
+    has_secret_shape,
     load_secret_exceptions,
     scan_payload,
     scan_repository,
@@ -37,11 +38,13 @@ def manifest() -> ProjectManifest:
             b"-----BEGIN PRIVATE KEY-----\n" + b"A" * 48,
         ),
         ("aws_access_key", b"AK" + b"IA" + b"A" * 16),
+        ("aws_access_key", b"AS" + b"IA" + b"A" * 16),
         ("github_token", b"gh" + b"p_" + b"a" * 36),
         ("github_token", b"gh" + b"o_" + b"a" * 36),
         ("github_token", b"gh" + b"u_" + b"a" * 36),
         ("github_token", b"gh" + b"s_" + b"a" * 36),
         ("github_token", b"gh" + b"r_" + b"a" * 36),
+        ("github_token", b"github" + b"_pat_" + b"a" * 82),
         ("google_api_key", b"AI" + b"za" + b"A" * 35),
         ("stripe_live_key", b"sk" + b"_live_" + b"a" * 24),
         ("stripe_live_key", b"rk" + b"_live_" + b"a" * 24),
@@ -70,6 +73,60 @@ def test_structured_findings_are_named_redacted_and_non_bypassable(
     assert selected.bypassable is False
     serialized = repr(selected)
     assert payload.decode("utf-8", errors="ignore") not in serialized
+    assert has_secret_shape(payload)
+
+
+@pytest.mark.parametrize(
+    ("detector", "payload"),
+    [
+        ("github_token", b"org_" + b"gh" + b"p_" + b"a" * 36),
+        ("github_token", b"org_" + b"github" + b"_pat_" + b"a" * 82),
+        ("aws_access_key", b"org_" + b"AK" + b"IA" + b"A" * 16),
+        ("aws_access_key", b"org_" + b"AS" + b"IA" + b"A" * 16),
+        ("google_api_key", b"org_" + b"AI" + b"za" + b"A" * 35),
+        ("stripe_live_key", b"org_" + b"sk" + b"_live_" + b"a" * 24),
+        ("stripe_live_key", b"org_" + b"rk" + b"_live_" + b"a" * 24),
+        (
+            "slack_token",
+            b"org_" + b"xox" + b"b-" + b"1" * 12 + b"-" + b"a" * 24,
+        ),
+        (
+            "jwt",
+            b"org_"
+            + b"eyJ"
+            + b"a" * 12
+            + b"."
+            + b"b" * 16
+            + b"."
+            + b"c" * 16,
+        ),
+        ("bearer_token", b"org_" + b"Bearer " + b"a" * 32),
+    ],
+)
+def test_structured_token_boundaries_detect_namespaced_tokens(
+    detector: str, payload: bytes
+) -> None:
+    findings = scan_payload(PurePosixPath("src/settings.bin"), payload)
+
+    assert [item.detector for item in findings] == [detector]
+    assert has_secret_shape(payload)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"alphagh" + b"p_" + b"a" * 36,
+        b"alphaAK" + b"IA" + b"A" * 16,
+        b"alphaAS" + b"IA" + b"A" * 16,
+        b"github" + b"_path_" + b"a" * 82,
+        b"github" + b"_pat_" + b"a" * 81,
+    ],
+)
+def test_structured_token_boundaries_do_not_match_embedded_or_malformed_values(
+    payload: bytes,
+) -> None:
+    assert scan_payload(PurePosixPath("src/settings.bin"), payload) == ()
+    assert not has_secret_shape(payload)
 
 
 @pytest.mark.parametrize(

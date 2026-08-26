@@ -579,6 +579,39 @@ def test_adapt_clustered_graph_reapplies_immutable_privacy_denies(
 
 
 @pytest.mark.parametrize(
+    "denied",
+    [
+        "tokens/config.py",
+        "a/token-store/file.py",
+        "credentials/config.py",
+        "creds/config.py",
+        "secrets/config.py",
+        "foo/secret-cache/a.py",
+        "TOKENS/config.py",
+        "a/Token-Store/file.py",
+        "CREDENTIALS/config.py",
+        "CREDS/config.py",
+        "Secrets/config.py",
+        "foo/Secret-Cache/a.py",
+    ],
+)
+def test_adapt_clustered_graph_reapplies_immutable_privacy_denies_to_directory_descendants(
+    denied: str,
+) -> None:
+    staged_files = frozenset(
+        {PurePosixPath("src/pkg/a.py"), PurePosixPath(denied)}
+    )
+
+    with pytest.raises(AdapterContractError, match="staged files") as captured:
+        adapter().adapt_clustered_graph(
+            clustered_artifact(valid_clustered_document()),
+            staged_files=staged_files,
+        )
+    assert captured.value.__cause__ is None
+    assert denied not in str(captured.value)
+
+
+@pytest.mark.parametrize(
     "mutation",
     [
         lambda value: value.update(edges=value.pop("links")),
