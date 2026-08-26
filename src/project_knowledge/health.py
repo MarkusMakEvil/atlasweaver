@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
 import json
@@ -9,18 +11,27 @@ import math
 import os
 from pathlib import Path, PurePosixPath
 import stat
-from typing import Any, Literal
+from typing import Any, Iterator, Literal
 
-from .artifacts import OWNERSHIP_MANIFEST
+from .artifacts import OWNERSHIP_MANIFEST, validate_owned_graph
 from .compatibility import GraphSemantics, resolve_graphify_compatibility
 from .integrity import GraphIntegrity, IntegrityError, analyze_graph
 from .models import ProjectManifest
+from .locking import RepositoryAccess, RepositoryIdentity, open_repository_access
+from .manifest import (
+    assert_current_manifest_unchanged,
+    require_current_manifest,
+)
 from .privacy import effective_excludes, is_denied
 from .secrets_scan import load_secret_exceptions, scan_payload
 from .staging import inspect_projection, iter_safe_files
 
 
-HealthStatus = Literal["error", "missing", "stale", "partial", "healthy"]
+CoreStatus = Literal["error", "missing", "stale", "partial", "healthy"]
+HealthStatus = CoreStatus
+FeatureStatus = Literal[
+    "disabled", "available", "unavailable", "misconfigured"
+]
 _STABLE_ERROR_CODES = frozenset(
     {"source_inspection_failed", "registry_inspection_failed", "inspection_failed"}
 )
@@ -35,28 +46,77 @@ class SafeInputSnapshot:
 
 
 @dataclass(frozen=True)
+class FeatureHealth:
+    status: FeatureStatus
+    issues: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.status not in {
+            "disabled",
+            "available",
+            "unavailable",
+            "misconfigured",
+        } or type(self.issues) is not tuple or any(
+            type(item) is not str or not item for item in self.issues
+        ):
+            raise ValueError("feature health is invalid")
+
+
+@dataclass(frozen=True)
+class TrustHealth:
+    impact: Literal["trusted", "navigation"]
+    limitations: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.impact not in {"trusted", "navigation"} or type(
+            self.limitations
+        ) is not tuple or any(
+            type(item) is not str or not item for item in self.limitations
+        ):
+            raise ValueError("trust health is invalid")
+
+
+@dataclass(frozen=True)
 class KnowledgeState:
-    """Sanitized facts consumed by the deterministic health classifier."""
+    """Sanitized facts consumed by the deterministic schema-v2 classifier."""
 
     project_id: str
+    manifest_schema_version: Literal[1, 2]
+    artifact_schema_version: Literal[1, 2] | None
     graph_exists: bool
     graph_valid: bool
     graph_version: str | None
     current_source_digest: str | None
     graph_source_digest: str | None
-    atlas_available: bool
-    registry_matches: bool
+    current_projection_digest: str | None
+    graph_projection_digest: str | None
+    features: Mapping[str, FeatureHealth]
     coverage_skips: int = 0
     unapproved_skips: int = 0
-    impact_analysis_trusted: bool = False
+    impact_trust: Literal["trusted", "navigation"] = "navigation"
+    impact_limitations: tuple[str, ...] = ()
     errors: tuple[str, ...] = ()
 
     @property
     def source_matches(self) -> bool:
         return (
             self.current_source_digest is not None
-            and self.graph_source_digest is not None
             and self.current_source_digest == self.graph_source_digest
+        )
+
+    @property
+    def projection_matches(self) -> bool:
+        if (
+            self.manifest_schema_version == 1
+            and self.artifact_schema_version == 1
+            and self.graph_valid
+            and self.current_projection_digest is None
+            and self.graph_projection_digest is None
+        ):
+            return True
+        return (
+            self.current_projection_digest is not None
+            and self.current_projection_digest == self.graph_projection_digest
         )
 
 
@@ -64,82 +124,126 @@ class KnowledgeState:
 class KnowledgeHealth:
     """Stable, path-free health result safe for CLI JSON and text output."""
 
-    status: HealthStatus
+    core_status: CoreStatus
     project_id: str
     graph_version: str | None
     source_matches: bool
-    atlas_available: bool
-    registry_matches: bool
-    impact_analysis_trusted: bool
+    projection_matches: bool
+    features: Mapping[str, FeatureHealth]
+    trust: TrustHealth
     issues: tuple[str, ...]
+    warnings: tuple[str, ...]
+    schema_version: int = 2
+
+    @property
+    def status(self) -> CoreStatus:
+        return self.core_status
+
+    @property
+    def atlas_available(self) -> bool:
+        return self.features["atlas"].status == "available"
+
+    @property
+    def registry_matches(self) -> bool:
+        return self.features["registry"].status == "available"
+
+    @property
+    def impact_analysis_trusted(self) -> bool:
+        return self.trust.impact == "trusted"
 
     def to_dict(self) -> dict[str, object]:
         return {
-            "status": self.status,
+            "schema_version": 2,
+            "core_status": self.core_status,
+            "status": self.core_status,
             "project_id": self.project_id,
             "graph_version": self.graph_version,
             "source_matches": self.source_matches,
+            "projection_matches": self.projection_matches,
+            "features": {
+                name: {"status": value.status, "issues": list(value.issues)}
+                for name, value in sorted(self.features.items())
+            },
+            "trust": {
+                "impact": self.trust.impact,
+                "limitations": list(self.trust.limitations),
+            },
+            "issues": list(self.issues),
+            "warnings": list(self.warnings),
             "atlas_available": self.atlas_available,
             "registry_matches": self.registry_matches,
             "impact_analysis_trusted": self.impact_analysis_trusted,
-            "issues": list(self.issues),
         }
 
 
 def assess_health(state: KnowledgeState) -> KnowledgeHealth:
     """Classify facts with error→missing→stale→partial→healthy precedence."""
     issues: list[str] = []
+    warnings: list[str] = []
     if state.errors:
         for issue in state.errors:
             stable = issue if issue in _STABLE_ERROR_CODES else "inspection_failed"
-            if stable not in issues:
-                issues.append(stable)
-        status: HealthStatus = "error"
-    elif not state.graph_exists or not state.graph_valid:
-        issues.append("graph_missing" if not state.graph_exists else "graph_invalid")
+            _append_unique(issues, stable)
+    if state.graph_exists and not state.graph_valid:
+        _append_unique(issues, "graph_invalid")
+    if state.unapproved_skips:
+        _append_unique(issues, "extraction_coverage_unapproved")
+
+    if state.errors or (state.graph_exists and not state.graph_valid) or state.unapproved_skips:
+        status: CoreStatus = "error"
+    elif not state.graph_exists:
+        _append_unique(issues, "graph_missing")
         status = "missing"
+    elif not state.source_matches or not state.projection_matches:
+        if not state.source_matches:
+            _append_unique(issues, "source_digest_mismatch")
+        if not state.projection_matches:
+            _append_unique(issues, "projection_digest_mismatch")
+        status = "stale"
+    elif state.coverage_skips:
+        _append_unique(issues, "extraction_coverage_partial")
+        status = "partial"
     else:
-        if not state.source_matches:
-            issues.append("source_digest_mismatch")
-        if not state.atlas_available:
-            issues.append("atlas_unavailable")
-        if not state.registry_matches:
-            issues.append("registry_mismatch")
-        if state.coverage_skips:
-            issues.append("extraction_coverage_partial")
-        if state.unapproved_skips:
-            issues.append("extraction_coverage_unapproved")
-        if not state.impact_analysis_trusted:
-            issues.append("graph_integrity_degraded")
-        if not state.source_matches:
-            status = "stale"
-        elif state.unapproved_skips:
-            status = "error"
-        elif (
-            not state.atlas_available
-            or not state.registry_matches
-            or state.coverage_skips
-            or not state.impact_analysis_trusted
-        ):
-            status = "partial"
-        else:
-            status = "healthy"
+        status = "healthy"
+
+    for feature in state.features.values():
+        if feature.status in {"unavailable", "misconfigured"}:
+            for issue in feature.issues:
+                _append_unique(warnings, issue)
+    if state.impact_trust == "navigation":
+        _append_unique(warnings, "impact_evidence_incomplete")
+        for limitation in state.impact_limitations:
+            _append_unique(warnings, limitation)
+
     return KnowledgeHealth(
-        status=status,
+        core_status=status,
         project_id=state.project_id,
         graph_version=state.graph_version,
         source_matches=state.source_matches,
-        atlas_available=state.atlas_available,
-        registry_matches=state.registry_matches,
-        impact_analysis_trusted=state.impact_analysis_trusted,
+        projection_matches=state.projection_matches,
+        features=dict(state.features),
+        trust=TrustHealth(state.impact_trust, state.impact_limitations),
         issues=tuple(issues),
+        warnings=tuple(warnings),
     )
 
 
-def safe_input_snapshot(repo_root: Path, manifest: ProjectManifest) -> SafeInputSnapshot:
+def _append_unique(values: list[str], value: str) -> None:
+    if value not in values:
+        values.append(value)
+
+
+def safe_input_snapshot(
+    repo_root: Path,
+    manifest: ProjectManifest,
+    *,
+    repository_access: RepositoryAccess | None = None,
+) -> SafeInputSnapshot:
     """Recompute the safe-input digest without creating a staging directory."""
     if manifest.schema_version == 2:
-        projection = inspect_projection(repo_root, manifest)
+        projection = inspect_projection(
+            repo_root, manifest, repository_access=repository_access
+        )
         return SafeInputSnapshot(
             projection.source_digest,
             tuple(item.path for item in projection.files),
@@ -169,67 +273,221 @@ def inspect_project_state(
     repo_root: Path,
     manifest: ProjectManifest,
     *,
-    atlas_available: bool = False,
-    registry_matches: bool = False,
+    atlas: FeatureHealth | None = None,
+    registry: FeatureHealth | None = None,
+    artifacts: FeatureHealth | None = None,
+    repository_access: RepositoryAccess | None = None,
+    expected_repository_identity: RepositoryIdentity | None = None,
+    atlas_available: bool | None = None,
+    registry_matches: bool | None = None,
 ) -> KnowledgeState:
-    """Inspect current source and promoted graph without writing either tree."""
-    try:
-        current = safe_input_snapshot(repo_root, manifest)
-    except (OSError, ValueError):
-        return KnowledgeState(
-            project_id=manifest.project_id,
-            graph_exists=False,
-            graph_valid=False,
-            graph_version=None,
-            current_source_digest=None,
-            graph_source_digest=None,
-            atlas_available=atlas_available,
-            registry_matches=registry_matches,
-            errors=("source_inspection_failed",),
-        )
-
-    output = repo_root.absolute().joinpath(*manifest.output_dir.parts)
-    exists = output.exists() or output.is_symlink()
-    if not exists:
-        return KnowledgeState(
-            project_id=manifest.project_id,
-            graph_exists=False,
-            graph_valid=False,
-            graph_version=None,
-            current_source_digest=current.source_digest,
-            graph_source_digest=None,
-            atlas_available=atlas_available,
-            registry_matches=registry_matches,
-        )
-
-    try:
-        ownership, graph_payload = _read_valid_graph_metadata(output, manifest)
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
-        return KnowledgeState(
-            project_id=manifest.project_id,
-            graph_exists=True,
-            graph_valid=False,
-            graph_version=None,
-            current_source_digest=current.source_digest,
-            graph_source_digest=None,
-            atlas_available=atlas_available,
-            registry_matches=registry_matches,
-        )
-
-    del graph_payload
-    return KnowledgeState(
-        project_id=manifest.project_id,
-        graph_exists=True,
-        graph_valid=True,
-        graph_version=str(ownership["graphify_version"]),
-        current_source_digest=current.source_digest,
-        graph_source_digest=str(ownership["source_digest"]),
+    """Inspect current source and promoted graph without creating state."""
+    if repository_access is not None and expected_repository_identity is not None:
+        raise ValueError("repository authority is ambiguous")
+    features = _feature_health(
+        manifest,
+        atlas=atlas,
+        registry=registry,
+        artifacts=artifacts,
         atlas_available=atlas_available,
         registry_matches=registry_matches,
-        coverage_skips=int(ownership["skipped_count"]),
-        unapproved_skips=int(ownership["unapproved_skips"]),
-        impact_analysis_trusted=bool(ownership["impact_analysis_trusted"]),
     )
+    with _use_repository_access(
+        repo_root,
+        repository_access=repository_access,
+        expected_repository_identity=expected_repository_identity,
+    ) as repository:
+        current_manifest = require_current_manifest(
+            repo_root, manifest, repository_access=repository
+        )
+        try:
+            if current_manifest.schema_version == 2:
+                projection = inspect_projection(
+                    repo_root,
+                    current_manifest,
+                    repository_access=repository,
+                )
+                current_source_digest = projection.source_digest
+                current_projection_digest = projection.projection_digest
+            else:
+                snapshot = safe_input_snapshot(repo_root, current_manifest)
+                current_source_digest = snapshot.source_digest
+                current_projection_digest = None
+        except (OSError, ValueError, TypeError):
+            assert_current_manifest_unchanged(
+                repo_root, current_manifest, repository_access=repository
+            )
+            return _empty_state(
+                current_manifest,
+                features,
+                errors=("source_inspection_failed",),
+            )
+
+        output = repo_root.absolute().joinpath(*current_manifest.output_dir.parts)
+        if not _entry_exists(repository.descriptor, current_manifest.output_dir):
+            assert_current_manifest_unchanged(
+                repo_root, current_manifest, repository_access=repository
+            )
+            return _empty_state(
+                current_manifest,
+                features,
+                source_digest=current_source_digest,
+                projection_digest=current_projection_digest,
+            )
+
+        try:
+            owned = validate_owned_graph(
+                output,
+                current_manifest,
+                expected_source_digest=current_source_digest,
+                expected_projection_digest=current_projection_digest,
+                repository_access=repository,
+            )
+        except (OSError, TypeError, ValueError):
+            assert_current_manifest_unchanged(
+                repo_root, current_manifest, repository_access=repository
+            )
+            return _empty_state(
+                current_manifest,
+                features,
+                graph_exists=True,
+                source_digest=current_source_digest,
+                projection_digest=current_projection_digest,
+            )
+        assert_current_manifest_unchanged(
+            repo_root, current_manifest, repository_access=repository
+        )
+        artifact_schema = getattr(owned, "artifact_schema_version", 1)
+        impact_trust = getattr(owned, "impact_trust", "navigation")
+        limitations = getattr(owned, "impact_limitations", ())
+        return KnowledgeState(
+            project_id=current_manifest.project_id,
+            manifest_schema_version=current_manifest.schema_version,
+            artifact_schema_version=artifact_schema,
+            graph_exists=True,
+            graph_valid=True,
+            graph_version=current_manifest.graphify_version,
+            current_source_digest=current_source_digest,
+            graph_source_digest=getattr(owned, "source_digest", None),
+            current_projection_digest=current_projection_digest,
+            graph_projection_digest=getattr(owned, "projection_digest", None),
+            features=features,
+            coverage_skips=getattr(owned, "skipped_count", 0),
+            unapproved_skips=getattr(owned, "unapproved_skips", 0),
+            impact_trust=(
+                impact_trust if impact_trust in {"trusted", "navigation"} else "navigation"
+            ),
+            impact_limitations=(
+                limitations if type(limitations) is tuple else ()
+            ),
+        )
+
+
+def _empty_state(
+    manifest: ProjectManifest,
+    features: Mapping[str, FeatureHealth],
+    *,
+    graph_exists: bool = False,
+    source_digest: str | None = None,
+    projection_digest: str | None = None,
+    errors: tuple[str, ...] = (),
+) -> KnowledgeState:
+    return KnowledgeState(
+        project_id=manifest.project_id,
+        manifest_schema_version=manifest.schema_version,
+        artifact_schema_version=None,
+        graph_exists=graph_exists,
+        graph_valid=False,
+        graph_version=None,
+        current_source_digest=source_digest,
+        graph_source_digest=None,
+        current_projection_digest=projection_digest,
+        graph_projection_digest=None,
+        features=features,
+        errors=errors,
+    )
+
+
+def _feature_health(
+    manifest: ProjectManifest,
+    *,
+    atlas: FeatureHealth | None,
+    registry: FeatureHealth | None,
+    artifacts: FeatureHealth | None,
+    atlas_available: bool | None,
+    registry_matches: bool | None,
+) -> Mapping[str, FeatureHealth]:
+    if atlas is not None and atlas_available is not None:
+        raise ValueError("atlas health is ambiguous")
+    if registry is not None and registry_matches is not None:
+        raise ValueError("registry health is ambiguous")
+
+    def optional(
+        supplied: FeatureHealth | None,
+        enabled: bool,
+        legacy: bool | None,
+        issue: str,
+    ) -> FeatureHealth:
+        if supplied is not None:
+            return supplied
+        if legacy is not None:
+            return FeatureHealth("available" if legacy else "unavailable", (() if legacy else (issue,)))
+        if not enabled:
+            return FeatureHealth("disabled")
+        return FeatureHealth("unavailable", (issue,))
+
+    artifact_enabled = manifest.artifacts.provider != "none"
+    return {
+        "atlas": optional(
+            atlas,
+            manifest.features.atlas == "enabled",
+            atlas_available,
+            "atlas_unavailable",
+        ),
+        "registry": optional(
+            registry,
+            manifest.features.registry == "enabled",
+            registry_matches,
+            "registry_mismatch",
+        ),
+        "artifacts": optional(
+            artifacts,
+            artifact_enabled,
+            None,
+            "artifact_provider_invalid",
+        ),
+    }
+
+
+@contextmanager
+def _use_repository_access(
+    repo_root: Path,
+    *,
+    repository_access: RepositoryAccess | None,
+    expected_repository_identity: RepositoryIdentity | None,
+) -> Iterator[RepositoryAccess]:
+    if repository_access is not None:
+        yield repository_access
+        return
+    with open_repository_access(
+        repo_root,
+        expected_repository_identity=expected_repository_identity,
+    ) as opened:
+        yield opened
+
+
+def _entry_exists(repository_descriptor: int, relative: PurePosixPath) -> bool:
+    try:
+        os.stat(
+            relative.as_posix(),
+            dir_fd=repository_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
 
 
 def _walk_safe_files(

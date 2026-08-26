@@ -1,23 +1,188 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import hashlib
 import os
 from pathlib import Path, PurePosixPath
+from types import SimpleNamespace
 
 import pytest
 
 from project_knowledge.compatibility import production_graphify_compatibility
 from project_knowledge.integrity import analyze_graph
 from project_knowledge.health import (
+    FeatureHealth,
     KnowledgeState,
     assess_health,
     inspect_project_state,
     safe_input_snapshot,
 )
+from project_knowledge.locking import RepositoryAccess
 from project_knowledge.models import ProjectManifest
 from project_knowledge.staging import inspect_projection
 from tests.support import manifest_v2
+from tests.test_manifest import write_manifest as write_v1_manifest_file
+
+
+def healthy_state(**changes: object) -> KnowledgeState:
+    values: dict[str, object] = {
+        "project_id": "demo",
+        "manifest_schema_version": 2,
+        "artifact_schema_version": 2,
+        "graph_exists": True,
+        "graph_valid": True,
+        "graph_version": "0.9.48",
+        "current_source_digest": "a" * 64,
+        "graph_source_digest": "a" * 64,
+        "current_projection_digest": "b" * 64,
+        "graph_projection_digest": "b" * 64,
+        "features": {
+            "atlas": FeatureHealth("disabled"),
+            "registry": FeatureHealth("disabled"),
+            "artifacts": FeatureHealth("disabled"),
+        },
+        "coverage_skips": 0,
+        "unapproved_skips": 0,
+        "impact_trust": "navigation",
+        "impact_limitations": ("pre_dedup_edge_projection_unavailable",),
+        "errors": (),
+    }
+    values.update(changes)
+    return KnowledgeState(**values)  # type: ignore[arg-type]
+
+
+def test_disabled_optional_features_do_not_lower_core_health() -> None:
+    health = assess_health(healthy_state())
+
+    assert health.schema_version == 2
+    assert health.core_status == health.status == "healthy"
+    assert health.features["atlas"].status == "disabled"
+    assert health.issues == ()
+    assert "impact_evidence_incomplete" in health.warnings
+    assert health.impact_analysis_trusted is False
+
+
+def test_enabled_but_unavailable_feature_warns_without_lowering_core() -> None:
+    health = assess_health(
+        healthy_state(
+            features={
+                "atlas": FeatureHealth("unavailable", ("atlas_unavailable",)),
+                "registry": FeatureHealth("disabled"),
+                "artifacts": FeatureHealth("disabled"),
+            }
+        )
+    )
+
+    assert health.core_status == "healthy"
+    assert "atlas_unavailable" in health.warnings
+
+
+@pytest.mark.parametrize(
+    ("changes", "status"),
+    [
+        ({"errors": ("source_inspection_failed",)}, "error"),
+        ({"graph_exists": False, "graph_valid": False}, "missing"),
+        ({"graph_exists": True, "graph_valid": False}, "error"),
+        ({"graph_source_digest": "c" * 64}, "stale"),
+        ({"graph_projection_digest": "c" * 64}, "stale"),
+        ({"coverage_skips": 1}, "partial"),
+        ({}, "healthy"),
+    ],
+)
+def test_core_precedence(changes: dict[str, object], status: str) -> None:
+    assert assess_health(healthy_state(**changes)).core_status == status
+
+
+def test_unapproved_coverage_is_error_not_admitted_partial() -> None:
+    health = assess_health(healthy_state(coverage_skips=1, unapproved_skips=1))
+
+    assert health.core_status == "error"
+    assert "extraction_coverage_unapproved" in health.issues
+
+
+def test_unapproved_coverage_error_precedes_stale() -> None:
+    health = assess_health(
+        healthy_state(
+            graph_source_digest="c" * 64,
+            coverage_skips=1,
+            unapproved_skips=1,
+        )
+    )
+
+    assert health.core_status == "error"
+
+
+def test_v1_projection_compatibility_is_explicit_not_synthetic() -> None:
+    selected = healthy_state(
+        manifest_schema_version=1,
+        artifact_schema_version=1,
+        current_projection_digest=None,
+        graph_projection_digest=None,
+    )
+
+    assert selected.projection_matches is True
+    assert replace(selected, artifact_schema_version=2).projection_matches is False
+
+
+def test_live_inspection_supplies_both_current_digests_to_owned_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "src/app.py").write_text("safe\n", encoding="utf-8")
+    from tests.support import write_manifest_v2
+
+    write_manifest_v2(repo)
+    (repo / "graphify-out").mkdir()
+    supplied: dict[str, object] = {}
+
+    def recording_validate(root: Path, value: ProjectManifest, **kwargs: object):
+        del root, value
+        supplied.update(kwargs)
+        return SimpleNamespace(
+            artifact_schema_version=2,
+            source_digest=kwargs["expected_source_digest"],
+            projection_digest=kwargs["expected_projection_digest"],
+            graphify_version="0.9.48",
+            skipped_count=0,
+            unapproved_skips=0,
+            impact_trust="navigation",
+            impact_limitations=("pre_dedup_edge_projection_unavailable",),
+        )
+
+    monkeypatch.setattr(
+        "project_knowledge.health.validate_owned_graph", recording_validate
+    )
+
+    state = inspect_project_state(repo, manifest_v2())
+
+    access = supplied.pop("repository_access")
+    assert isinstance(access, RepositoryAccess)
+    assert supplied == {
+        "expected_source_digest": state.current_source_digest,
+        "expected_projection_digest": state.current_projection_digest,
+    }
+    assert state.source_matches and state.projection_matches
+
+
+def test_direct_health_inspection_is_noncreating_and_tree_read_only(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "src/app.py").write_text("safe\n", encoding="utf-8")
+    from tests.support import write_manifest_v2
+
+    write_manifest_v2(repo)
+    before = snapshot_tree(repo)
+
+    selected = inspect_project_state(repo, manifest_v2())
+
+    assert selected.graph_exists is False
+    assert assess_health(selected).core_status == "missing"
+    assert snapshot_tree(repo) == before
+    assert not (repo / ".project-knowledge").exists()
 
 
 def manifest() -> ProjectManifest:
@@ -28,9 +193,19 @@ def manifest() -> ProjectManifest:
         include_roots=(PurePosixPath("src"),),
         output_dir=PurePosixPath("graphify-out"),
         obsidian_namespace=PurePosixPath("Projects/demo/Generated"),
-        excludes=(),
+        excludes=("generated/**",),
         track_html=True,
         graphify_version="0.9.48",
+    )
+
+
+def _write_v1_manifest(repo: Path) -> None:
+    write_v1_manifest_file(
+        repo,
+        project_id="demo",
+        display_name="Demo",
+        include_roots=["src"],
+        obsidian_namespace="Projects/demo/Generated",
     )
 
 
@@ -48,14 +223,27 @@ def state(
     recorded = current if source_matches else "b" * 64
     return KnowledgeState(
         project_id="demo",
+        manifest_schema_version=2,
+        artifact_schema_version=2,
         graph_exists=graph_exists,
         graph_valid=graph_valid,
         graph_version="0.9.48" if graph_exists else None,
         current_source_digest=current,
         graph_source_digest=recorded,
-        atlas_available=atlas_available,
-        registry_matches=registry_matches,
-        impact_analysis_trusted=impact_analysis_trusted,
+        current_projection_digest="c" * 64,
+        graph_projection_digest="c" * 64,
+        features={
+            "atlas": FeatureHealth(
+                "available" if atlas_available else "unavailable",
+                () if atlas_available else ("atlas_unavailable",),
+            ),
+            "registry": FeatureHealth(
+                "available" if registry_matches else "unavailable",
+                () if registry_matches else ("registry_mismatch",),
+            ),
+            "artifacts": FeatureHealth("disabled"),
+        },
+        impact_trust="trusted" if impact_analysis_trusted else "navigation",
         errors=errors,
     )
 
@@ -65,10 +253,10 @@ def state(
     [
         (state(errors=("inspection_failed",)), "error"),
         (state(graph_exists=False, graph_valid=False), "missing"),
-        (state(graph_valid=False), "missing"),
+        (state(graph_valid=False), "error"),
         (state(source_matches=False), "stale"),
-        (state(atlas_available=False), "partial"),
-        (state(registry_matches=False), "partial"),
+        (state(atlas_available=False), "healthy"),
+        (state(registry_matches=False), "healthy"),
         (state(), "healthy"),
     ],
 )
@@ -89,40 +277,45 @@ def test_health_issues_are_stable_codes_not_paths_or_raw_diagnostics() -> None:
         )
     )
 
-    assert health.issues == (
-        "source_digest_mismatch",
-        "atlas_unavailable",
-        "registry_mismatch",
-    )
+    assert health.issues == ("source_digest_mismatch",)
+    assert health.warnings == ("atlas_unavailable", "registry_mismatch")
     assert health.source_matches is False
     assert health.to_dict() == {
+        "schema_version": 2,
+        "core_status": "stale",
         "status": "stale",
         "project_id": "demo",
         "graph_version": "0.9.48",
         "source_matches": False,
+        "projection_matches": True,
+        "features": {
+            "artifacts": {"status": "disabled", "issues": []},
+            "atlas": {"status": "unavailable", "issues": ["atlas_unavailable"]},
+            "registry": {"status": "unavailable", "issues": ["registry_mismatch"]},
+        },
+        "trust": {"impact": "trusted", "limitations": []},
+        "issues": ["source_digest_mismatch"],
+        "warnings": ["atlas_unavailable", "registry_mismatch"],
         "atlas_available": False,
         "registry_matches": False,
         "impact_analysis_trusted": True,
-        "issues": [
-            "source_digest_mismatch",
-            "atlas_unavailable",
-            "registry_mismatch",
-        ],
     }
 
 
-def test_health_marks_untrusted_impact_analysis_as_partial() -> None:
+def test_health_marks_untrusted_impact_analysis_as_navigation_warning() -> None:
     health = assess_health(state(impact_analysis_trusted=False))
 
-    assert health.status == "partial"
+    assert health.status == "healthy"
     assert health.impact_analysis_trusted is False
-    assert health.issues == ("graph_integrity_degraded",)
+    assert health.issues == ()
+    assert health.warnings == ("impact_evidence_incomplete",)
 
 
 def test_missing_graph_never_defaults_to_trusted_impact_analysis(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     (repo / "src").mkdir(parents=True)
     (repo / "src/app.py").write_text("safe\n", encoding="utf-8")
+    _write_v1_manifest(repo)
 
     inspected = inspect_project_state(repo, manifest())
     health = assess_health(inspected)
@@ -275,7 +468,7 @@ def test_inspection_treats_source_digest_mismatch_as_authoritative(
     (repo / "src/app.py").write_text("current\n", encoding="utf-8")
     output = repo / "graphify-out"
     output.mkdir()
-    graph = json.dumps({"nodes": [{"id": "app", "source_file": "src/app.py"}], "edges": [], "graph_health": analyze_graph([{"id": "app", "source_file": "src/app.py"}], [], semantics=production_graphify_compatibility().semantics).to_dict(), "extraction_coverage": {"schema_version": 1, "total_staged_files": 1, "represented_source_paths": ["src/app.py"], "skipped": []}}).encode() + b"\n"
+    graph = json.dumps({"project_id": "demo", "graphify_version": "0.9.48", "source_digest": "0" * 64, "nodes": [{"id": "app", "source_file": "src/app.py"}], "edges": [], "graph_health": analyze_graph([{"id": "app", "source_file": "src/app.py"}], [], semantics=production_graphify_compatibility().semantics).to_dict(), "extraction_coverage": {"schema_version": 1, "total_staged_files": 1, "represented_source_paths": ["src/app.py"], "skipped": []}}).encode() + b"\n"
     (output / "graph.json").write_bytes(graph)
     report = b"# report\n"
     html = b"<title>demo</title>\n"
@@ -306,6 +499,7 @@ def test_inspection_treats_source_digest_mismatch_as_authoritative(
     )
     (output / "GRAPH_REPORT.md").write_bytes(report)
     (output / "graph.html").write_bytes(html)
+    _write_v1_manifest(repo)
 
     inspected = inspect_project_state(
         repo,
@@ -319,8 +513,8 @@ def test_inspection_treats_source_digest_mismatch_as_authoritative(
     assert assess_health(inspected).source_matches is False
 
 
-def test_inspection_accepts_official_graphify_query_cache(tmp_path: Path) -> None:
-    """A normal Graphify query must not make a valid promoted graph unhealthy."""
+def test_inspection_rejects_unowned_graphify_query_cache(tmp_path: Path) -> None:
+    """Only ownership-bound artifact bytes can enter live health."""
     repo = tmp_path / "repo"
     (repo / "src").mkdir(parents=True)
     (repo / "src/app.py").write_text("current\n", encoding="utf-8")
@@ -336,9 +530,9 @@ def test_inspection_accepts_official_graphify_query_cache(tmp_path: Path) -> Non
         registry_matches=True,
     )
 
-    assert inspected.graph_valid is True
-    assert assess_health(inspected).status == "partial"
-    assert assess_health(inspected).issues == ("graph_integrity_degraded",)
+    assert inspected.graph_valid is False
+    assert assess_health(inspected).status == "error"
+    assert assess_health(inspected).issues == ("graph_invalid",)
 
 
 def test_inspection_rejects_tampered_owned_report(tmp_path: Path) -> None:
@@ -434,6 +628,7 @@ def test_inspection_rejects_unknown_graphify_cache_entries(
     target = query_cache / cache_entry
     if cache_entry == "nested":
         target.mkdir()
+        (target / "unexpected").write_text("not owned\n", encoding="utf-8")
     else:
         target.write_text("not owned\n", encoding="utf-8")
 
@@ -474,12 +669,13 @@ def test_inspection_rejects_malformed_or_nonfinite_ownership_json(
     (output / ".project-knowledge-ownership.json").write_text(
         '{"schema_version": NaN}', encoding="utf-8"
     )
+    _write_v1_manifest(repo)
 
     inspected = inspect_project_state(repo, manifest())
 
     assert inspected.graph_exists is True
     assert inspected.graph_valid is False
-    assert assess_health(inspected).status == "missing"
+    assert assess_health(inspected).status == "error"
     assert assess_health(inspected).issues == ("graph_invalid",)
 
 
@@ -516,9 +712,11 @@ def snapshot_tree(root: Path) -> tuple[tuple[str, str, bytes], ...]:
 
 
 def _write_valid_graph_output(repo: Path) -> None:
+    _write_v1_manifest(repo)
     output = repo / "graphify-out"
     output.mkdir()
-    graph = json.dumps({"nodes": [{"id": "app", "source_file": "src/app.py"}], "edges": [], "graph_health": analyze_graph([{"id": "app", "source_file": "src/app.py"}], [], semantics=production_graphify_compatibility().semantics).to_dict(), "extraction_coverage": {"schema_version": 1, "total_staged_files": 1, "represented_source_paths": ["src/app.py"], "skipped": []}}).encode() + b"\n"
+    source_digest = safe_input_snapshot(repo, manifest()).source_digest
+    graph = json.dumps({"project_id": "demo", "graphify_version": "0.9.48", "source_digest": source_digest, "nodes": [{"id": "app", "source_file": "src/app.py"}], "edges": [], "graph_health": analyze_graph([{"id": "app", "source_file": "src/app.py"}], [], semantics=production_graphify_compatibility().semantics).to_dict(), "extraction_coverage": {"schema_version": 1, "total_staged_files": 1, "represented_source_paths": ["src/app.py"], "skipped": []}}).encode() + b"\n"
     (output / "graph.json").write_bytes(graph)
     report = b"# report\n"
     html = b"<title>demo</title>\n"
@@ -526,7 +724,7 @@ def _write_valid_graph_output(repo: Path) -> None:
         "schema_version": 1,
         "project_id": "demo",
         "graphify_version": "0.9.48",
-        "source_digest": safe_input_snapshot(repo, manifest()).source_digest,
+        "source_digest": source_digest,
         "graph_digest": hashlib.sha256(graph).hexdigest(),
         "artifact_digests": {
             "GRAPH_REPORT.md": hashlib.sha256(report).hexdigest(),
