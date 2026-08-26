@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import subprocess
+import zipfile
 
 try:
     import tomllib
@@ -63,3 +64,23 @@ def test_public_tree_contains_no_private_product_context() -> None:
             continue
         text = path.read_text(encoding="utf-8", errors="ignore").casefold()
         assert all(value.casefold() not in text for value in forbidden), path
+
+
+def test_built_wheel_contains_managed_agent_skill_resources(tmp_path: Path) -> None:
+    result = subprocess.run(
+        ["uv", "build", "--wheel", "--out-dir", str(tmp_path)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    wheels = tuple(tmp_path.glob("*.whl"))
+    assert len(wheels) == 1
+    with zipfile.ZipFile(wheels[0]) as archive:
+        names = set(archive.namelist())
+    assert {
+        "project_knowledge/resources/skills/using-project-knowledge-graphs/SKILL.md",
+        "project_knowledge/resources/skills/using-project-knowledge-graphs/agents/openai.yaml",
+        "project_knowledge/resources/skills/using-project-knowledge-graphs/references/workflow.md",
+    } <= names

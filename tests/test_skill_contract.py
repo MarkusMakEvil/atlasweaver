@@ -1,22 +1,26 @@
 from __future__ import annotations
 
 from pathlib import Path
+from importlib import resources
 
+import pytest
 import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SKILL_ROOT = ROOT / "skills/using-project-knowledge-graphs"
-SKILL = SKILL_ROOT / "SKILL.md"
-WORKFLOW = SKILL_ROOT / "references/workflow.md"
+SOURCE_SKILL_ROOT = ROOT / "skills/using-project-knowledge-graphs"
+PACKAGED_SKILL_ROOT = resources.files("project_knowledge").joinpath(
+    "resources/skills/using-project-knowledge-graphs"
+)
+SKILL_ROOTS = (SOURCE_SKILL_ROOT, PACKAGED_SKILL_ROOT)
 
 
-def skill_text() -> str:
-    return SKILL.read_text(encoding="utf-8")
+def skill_text(skill_root) -> str:
+    return skill_root.joinpath("SKILL.md").read_text(encoding="utf-8")
 
 
-def frontmatter() -> dict[str, object]:
-    text = skill_text()
+def frontmatter(skill_root) -> dict[str, object]:
+    text = skill_text(skill_root)
     assert text.startswith("---\n")
     _, block, _ = text.split("---", 2)
     value = yaml.safe_load(block)
@@ -24,8 +28,9 @@ def frontmatter() -> dict[str, object]:
     return value
 
 
-def test_skill_routes_graph_work_without_mutation_authority() -> None:
-    text = skill_text()
+@pytest.mark.parametrize("skill_root", SKILL_ROOTS)
+def test_skill_routes_graph_work_without_mutation_authority(skill_root) -> None:
+    text = skill_text(skill_root)
     lowered = text.lower()
 
     assert "project-knowledge preflight" in text
@@ -35,8 +40,9 @@ def test_skill_routes_graph_work_without_mutation_authority() -> None:
     assert "read-only" in lowered
 
 
-def test_description_is_trigger_only_and_discriminating() -> None:
-    metadata = frontmatter()
+@pytest.mark.parametrize("skill_root", SKILL_ROOTS)
+def test_description_is_trigger_only_and_discriminating(skill_root) -> None:
+    metadata = frontmatter(skill_root)
     description = metadata["description"]
 
     assert metadata["name"] == "using-project-knowledge-graphs"
@@ -47,16 +53,18 @@ def test_description_is_trigger_only_and_discriminating() -> None:
     assert "workflow" not in description.lower()
 
 
-def test_skill_routes_details_progressively() -> None:
-    text = skill_text()
+@pytest.mark.parametrize("skill_root", SKILL_ROOTS)
+def test_skill_routes_details_progressively(skill_root) -> None:
+    text = skill_text(skill_root)
 
     assert "references/workflow.md" in text
     assert "Read `references/workflow.md`" in text
-    assert WORKFLOW.is_file()
+    assert skill_root.joinpath("references/workflow.md").is_file()
 
 
-def test_skill_preserves_provenance_freshness_and_checkpoint_contract() -> None:
-    text = skill_text().lower()
+@pytest.mark.parametrize("skill_root", SKILL_ROOTS)
+def test_skill_preserves_provenance_freshness_and_checkpoint_contract(skill_root) -> None:
+    text = skill_text(skill_root).lower()
 
     assert "graphify-extracted" in text
     assert "graphify-inferred" in text
@@ -69,8 +77,13 @@ def test_skill_preserves_provenance_freshness_and_checkpoint_contract() -> None:
     assert "trivial" in text
 
 
-def test_skill_keeps_generated_and_human_notes_isolated() -> None:
-    combined = (skill_text() + "\n" + WORKFLOW.read_text(encoding="utf-8")).lower()
+@pytest.mark.parametrize("skill_root", SKILL_ROOTS)
+def test_skill_keeps_generated_and_human_notes_isolated(skill_root) -> None:
+    combined = (
+        skill_text(skill_root)
+        + "\n"
+        + skill_root.joinpath("references/workflow.md").read_text(encoding="utf-8")
+    ).lower()
 
     assert "generated/" in combined
     assert "notes/" in combined
@@ -87,8 +100,11 @@ def test_skill_keeps_generated_and_human_notes_isolated() -> None:
         assert account_specific not in combined
 
 
-def test_skill_documents_receipt_adapter_secret_and_integrity_contracts() -> None:
-    combined = skill_text() + "\n" + WORKFLOW.read_text(encoding="utf-8")
+@pytest.mark.parametrize("skill_root", SKILL_ROOTS)
+def test_skill_documents_receipt_adapter_secret_and_integrity_contracts(skill_root) -> None:
+    combined = skill_text(skill_root) + "\n" + skill_root.joinpath(
+        "references/workflow.md"
+    ).read_text(encoding="utf-8")
     lowered = combined.lower()
 
     assert "project-knowledge scan-secrets" in combined

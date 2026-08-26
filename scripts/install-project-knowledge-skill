@@ -1,194 +1,22 @@
 #!/usr/bin/env python3
-"""Install the repository-owned project knowledge skill into a Codex home."""
+"""Legacy Codex-root wrapper around the packaged AtlasWeaver agent installer."""
 
 from __future__ import annotations
 
 import argparse
-import hashlib
-import json
-import os
 from pathlib import Path
-import shutil
-import stat
 import sys
-import tempfile
-import uuid
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from project_knowledge.agent_install import (  # noqa: E402
+    AgentInstallError,
+    _install_agent_for_platform_root,
+)
 
 
 SKILL_NAME = "using-project-knowledge-graphs"
-MARKER = ".project-knowledge-managed.json"
-MANAGER = "project-knowledge-skill-installer"
-
-
-class InstallError(RuntimeError):
-    pass
-
-
-def tree_digest(root: Path, *, ignore_marker: bool = False) -> str:
-    digest = hashlib.sha256()
-    for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
-        relative = path.relative_to(root).as_posix()
-        if ignore_marker and relative == MARKER:
-            continue
-        metadata = path.lstat()
-        if stat.S_ISLNK(metadata.st_mode):
-            raise InstallError(f"symlink is not allowed in managed skill: {relative}")
-        if stat.S_ISDIR(metadata.st_mode):
-            kind = b"d"
-        elif stat.S_ISREG(metadata.st_mode):
-            kind = b"f"
-        else:
-            raise InstallError(f"unsupported file type in managed skill: {relative}")
-        digest.update(kind + b"\0" + relative.encode() + b"\0")
-        if kind == b"f":
-            digest.update(path.read_bytes())
-        digest.update(b"\0")
-    return digest.hexdigest()
-
-
-def fsync_tree(root: Path) -> None:
-    directories: list[Path] = []
-    for path in sorted(root.rglob("*"), key=lambda item: item.as_posix()):
-        if path.is_dir():
-            directories.append(path)
-        else:
-            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-            try:
-                os.fsync(descriptor)
-            finally:
-                os.close(descriptor)
-    for directory in reversed(directories):
-        descriptor = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-    descriptor = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
-def fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
-def read_marker(destination: Path) -> dict[str, object]:
-    marker = destination / MARKER
-    try:
-        metadata = marker.lstat()
-    except FileNotFoundError as error:
-        raise InstallError("refusing to replace unmanaged destination") from error
-    if not stat.S_ISREG(metadata.st_mode):
-        raise InstallError("managed marker must be a regular file")
-    try:
-        value = json.loads(marker.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise InstallError("managed marker is invalid") from error
-    expected_keys = {"schema_version", "manager", "source_digest"}
-    if not isinstance(value, dict) or set(value) != expected_keys:
-        raise InstallError("managed marker is invalid")
-    if value["schema_version"] != 1 or value["manager"] != MANAGER:
-        raise InstallError("refusing to replace unmanaged destination")
-    if not isinstance(value["source_digest"], str):
-        raise InstallError("managed marker is invalid")
-    return value
-
-
-def assert_managed_or_absent(destination: Path) -> None:
-    try:
-        metadata = destination.lstat()
-    except FileNotFoundError:
-        return
-    if stat.S_ISLNK(metadata.st_mode):
-        raise InstallError("refusing symlink destination")
-    if not stat.S_ISDIR(metadata.st_mode):
-        raise InstallError("destination is not a managed directory")
-    marker = read_marker(destination)
-    actual = tree_digest(destination, ignore_marker=True)
-    if actual != marker["source_digest"]:
-        raise InstallError("managed destination was modified; refusing replacement")
-
-
-def write_marker(stage: Path, source_digest: str) -> None:
-    content = json.dumps(
-        {
-            "schema_version": 1,
-            "manager": MANAGER,
-            "source_digest": source_digest,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    ) + "\n"
-    marker = stage / MARKER
-    descriptor = os.open(
-        marker,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-        0o600,
-    )
-    try:
-        os.write(descriptor, content.encode())
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
-def install(codex_home: Path) -> str:
-    repo_root = Path(__file__).resolve().parent.parent
-    canonical = repo_root / "skills" / SKILL_NAME
-    if not canonical.is_dir():
-        raise InstallError("canonical skill is missing")
-    source_digest = tree_digest(canonical)
-
-    if codex_home.exists() and codex_home.is_symlink():
-        raise InstallError("refusing symlink Codex home")
-    skills = codex_home / "skills"
-    skills.mkdir(parents=True, exist_ok=True)
-    if skills.is_symlink():
-        raise InstallError("refusing symlink skills directory")
-    destination = skills / SKILL_NAME
-    assert_managed_or_absent(destination)
-
-    if destination.exists() and tree_digest(destination, ignore_marker=True) == source_digest:
-        return "already current"
-
-    stage = Path(tempfile.mkdtemp(prefix=f".{SKILL_NAME}.stage-", dir=skills))
-    backup: Path | None = None
-    try:
-        stage.rmdir()
-        shutil.copytree(canonical, stage, copy_function=shutil.copy2)
-        write_marker(stage, source_digest)
-        fsync_tree(stage)
-
-        if destination.exists():
-            backup = skills / f".{SKILL_NAME}.backup-{uuid.uuid4().hex}"
-            os.replace(destination, backup)
-            fsync_directory(skills)
-        try:
-            os.replace(stage, destination)
-            fsync_directory(skills)
-        except BaseException:
-            if backup is not None and backup.exists() and not destination.exists():
-                os.replace(backup, destination)
-                fsync_directory(skills)
-                backup = None
-            raise
-        if backup is not None:
-            shutil.rmtree(backup)
-            fsync_directory(skills)
-            backup = None
-        return "installed"
-    finally:
-        if stage.exists():
-            shutil.rmtree(stage)
-        if backup is not None and backup.exists() and destination.exists():
-            shutil.rmtree(backup)
-            fsync_directory(skills)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -200,11 +28,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     arguments = parse_args(argv)
     try:
-        result = install(arguments.codex_home)
-    except InstallError as error:
-        print(f"install-project-knowledge-skill: {error}", file=sys.stderr)
+        result = _install_agent_for_platform_root("codex", arguments.codex_home)
+    except AgentInstallError as error:
+        print(f"install-project-knowledge-skill: {error.code}", file=sys.stderr)
         return 1
-    print(f"{SKILL_NAME}: {result}")
+    rendered = "already current" if result.status == "already_current" else result.status
+    print(f"{SKILL_NAME}: {rendered}")
     return 0
 
 
