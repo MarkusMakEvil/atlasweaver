@@ -6,11 +6,12 @@ from collections.abc import Sequence
 from fnmatch import fnmatchcase
 from pathlib import PurePosixPath
 from pathlib import Path
+import hashlib
 import stat
 
 from pathspec import GitIgnoreSpec
 
-from .models import ProjectManifest
+from .models import PrivacyDecision, ProjectManifest
 
 
 class PrivacyError(ValueError):
@@ -55,6 +56,89 @@ GLOBAL_DENY_PATTERNS = (
     "Projects/*/Notes/**",
 )
 
+_SENSITIVE_FRAGMENTS = ("token", "credential", "creds", "secret")
+_DATA_SUFFIXES = frozenset({
+    ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf",
+    ".tfvars", ".sqlite", ".sqlite3", ".db", ".kdbx", ".p12", ".pfx",
+})
+GLOBAL_DENY_RULES: tuple[tuple[str, str], ...] = (
+    ("environment_file", ".env"),
+    ("environment_file", ".env.*"),
+    ("environment_file", "**/.env"),
+    ("environment_file", "**/.env.*"),
+    ("git_metadata", ".git/**"),
+    ("worktree_metadata", ".worktrees/**"),
+    ("root_workspace", "workspace/**"),
+    ("runtime_state", "**/runtime/**"),
+    ("draft_content", "**/drafts/**"),
+    ("snapshot_state", "**/snapshots/**"),
+    ("cookie_store", "**/cookie/**"),
+    ("cookie_store", "**/cookies/**"),
+    ("session_store", "**/session/**"),
+    ("session_store", "**/sessions/**"),
+    ("virtual_environment", "**/.venv/**"),
+    ("dependency_tree", "**/node_modules/**"),
+    ("build_output", "**/dist/**"),
+    ("bytecode_cache", "**/__pycache__/**"),
+    ("private_content", "**/private/**"),
+    ("identity_control", "**/identity.yaml"),
+    ("disclosure_control", "**/disclosure.yaml"),
+    ("runtime_control", "**/current-state.yaml"),
+    ("voice_source", "**/voice-source/**"),
+    ("private_key_material", "**/*.pem"),
+    ("private_key_material", "**/*.key"),
+    ("private_key_material", "**/*.p12"),
+    ("private_key_material", "**/*.pfx"),
+    ("credential_store", "**/*.kdbx"),
+    ("human_notes", "Projects/*/Notes/**"),
+)
+
+
+def classify_path(
+    path: PurePosixPath,
+    *,
+    project_excludes: Sequence[str],
+    sensitive_source_suffixes: frozenset[str],
+) -> PrivacyDecision:
+    """Return the closed v2 path decision without inspecting denied bytes."""
+    from .manifest import ManifestError, validate_project_excludes
+
+    try:
+        exact_excludes = validate_project_excludes(tuple(project_excludes))
+    except ManifestError:
+        raise PrivacyError(
+            "negated or invalid project exclude is forbidden"
+        ) from None
+    if (
+        not path.parts
+        or path.is_absolute()
+        or any(part in {"", ".", ".."} for part in path.parts)
+        or "\\" in path.as_posix()
+    ):
+        return PrivacyDecision(path, "deny", "path_escape")
+    folded = tuple(part.casefold() for part in path.parts)
+    name = folded[-1]
+    suffix = PurePosixPath(name).suffix.casefold()
+    if any(
+        fragment in component
+        for component in folded[:-1]
+        for fragment in _SENSITIVE_FRAGMENTS
+    ):
+        return PrivacyDecision(path, "deny", "sensitive_directory")
+    for rule_id, pattern in GLOBAL_DENY_RULES:
+        if _matches(folded, tuple(part.casefold() for part in pattern.split("/"))):
+            return PrivacyDecision(path, "deny", rule_id)
+    if any(
+        _matches(folded, tuple(part.casefold() for part in pattern.split("/")))
+        for pattern in exact_excludes
+    ):
+        return PrivacyDecision(path, "deny", "project_exclude")
+    if any(fragment in name for fragment in _SENSITIVE_FRAGMENTS):
+        if suffix in sensitive_source_suffixes and suffix not in _DATA_SUFFIXES:
+            return PrivacyDecision(path, "scan", "sensitive_source_name")
+        return PrivacyDecision(path, "deny", "sensitive_data_name")
+    return PrivacyDecision(path, "allow", "ordinary_source")
+
 
 def effective_excludes(manifest: ProjectManifest) -> tuple[str, ...]:
     """Combine immutable global denies with stricter project exclusions."""
@@ -84,6 +168,7 @@ class RepositoryIgnores:
     def __init__(self, root: Path) -> None:
         self.root = root.absolute()
         self._git_specs: dict[PurePosixPath, GitIgnoreSpec | None] = {}
+        self._digest_entries: dict[PurePosixPath, str] = {}
         self._graphify = self._load(PurePosixPath(), ".graphifyignore")
 
     def __call__(self, path: PurePosixPath, *, is_directory: bool = False) -> bool:
@@ -116,10 +201,24 @@ class RepositoryIgnores:
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
             raise PrivacyError(f"{name} must be a regular file")
         try:
-            lines = path.read_text(encoding="utf-8").splitlines()
+            payload = path.read_bytes()
+            lines = payload.decode("utf-8").splitlines()
         except (OSError, UnicodeError) as error:
             raise PrivacyError(f"unable to read {name}") from error
+        relative = base / name
+        self._digest_entries[relative] = hashlib.sha256(
+            b"atlasweaver-ignore-v2\0"
+            + relative.as_posix().encode("utf-8") + b"\0" + payload
+        ).hexdigest()
         return GitIgnoreSpec.from_lines(lines)
+
+    def digests(self) -> tuple[str, ...]:
+        """Return path-bound ignore-file digests in confined path order."""
+        return tuple(
+            self._digest_entries[path] for path in sorted(
+                self._digest_entries, key=lambda item: item.as_posix().encode("utf-8")
+            )
+        )
 
 
 def repository_ignores(repo_root: Path) -> RepositoryIgnores:

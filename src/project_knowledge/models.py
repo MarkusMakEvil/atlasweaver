@@ -8,6 +8,7 @@ from uuid import UUID
 
 FeatureSwitch = Literal["disabled", "enabled"]
 ArtifactProvider = Literal["none", "github-release"]
+PrivacyAction = Literal["deny", "scan", "allow"]
 
 
 @dataclass(frozen=True)
@@ -48,3 +49,29 @@ class ProjectManifest:
     project_uid: UUID | None = None
     features: FeatureIntent = field(default_factory=FeatureIntent)
     artifacts: ArtifactIntent = field(default_factory=ArtifactIntent)
+
+
+@dataclass(frozen=True)
+class PrivacyDecision:
+    path: PurePosixPath
+    action: PrivacyAction
+    rule_id: str
+
+
+@dataclass(frozen=True)
+class ProjectionFile:
+    path: PurePosixPath
+    sha256: str
+    byte_length: int
+
+
+@dataclass(frozen=True)
+class ProjectionSnapshot:
+    source_digest: str
+    projection_digest: str | None
+    files: tuple[ProjectionFile, ...]
+    decisions: tuple[PrivacyDecision, ...]
+    reason_counts: tuple[tuple[str, int], ...]
+    ignore_digests: tuple[str, ...]
+    secret_exception_digest: str | None
+    coverage_digest: str | None
