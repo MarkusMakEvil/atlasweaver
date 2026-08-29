@@ -780,10 +780,10 @@ def test_console_entrypoint_is_declared_only_with_the_working_module() -> None:
     assert "Traceback" not in result.stderr
 
 
-def test_onboarding_script_loads_runtime_pin_without_project_dependencies(
+def test_onboarding_script_bootstraps_on_python_39_without_project_dependencies(
     tmp_path: Path,
 ) -> None:
-    """A clean Python can reach the uv install call before dependencies exist."""
+    """Python 3.9 can reach the uv install call before runtime imports exist."""
     real_uv = shutil.which("uv")
     assert real_uv is not None
     fake_bin = tmp_path / "bin"
@@ -811,7 +811,7 @@ Path({str(recorded)!r}).write_text(json.dumps(sys.argv[1:]), encoding="utf-8")
             "--isolated",
             "--no-project",
             "--python",
-            f"{sys.version_info.major}.{sys.version_info.minor}",
+            "3.9",
             "python",
             "scripts/install-project-knowledge-tool",
         ],
@@ -827,6 +827,8 @@ Path({str(recorded)!r}).write_text(json.dumps(sys.argv[1:]), encoding="utf-8")
         "tool",
         "install",
         "--force",
+        "--reinstall-package",
+        "atlasweaver",
         "--with-executables-from",
         f"graphifyy=={production_graphify_compatibility().version}",
         str(Path(__file__).resolve().parents[1]),

@@ -2,6 +2,16 @@
 
 All notable changes to AtlasWeaver are documented here.
 
+## 0.3.6 - 2026-08-29
+
+- Made the source installer bootstrap correctly under the stock Python 3.9
+  shipped on older macOS systems while delegating the supported runtime to uv.
+- Forced source installs to rebuild AtlasWeaver instead of reusing a stale
+  same-version wheel from uv's cache.
+- Migrated intact legacy managed Codex skill installations to the current
+  ownership marker without weakening tamper or symlink protections.
+- Required the Python 3.10, Python 3.13, and Graphify fixture checks on `main`.
+
 ## 0.3.5 - 2026-08-29
 
 - Added a fixture-bound Graphify 0.9.51 production adapter while retaining exact

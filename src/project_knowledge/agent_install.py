@@ -44,8 +44,13 @@ AgentPlatform = Literal["codex", "agents"]
 SKILL_RELATIVE = PurePosixPath("skills/using-project-knowledge-graphs")
 MANAGED_MARKER = ".atlasweaver-managed.json"
 _MANAGER = "atlasweaver-agent-installer"
+_LEGACY_MANAGED_MARKER = ".project-knowledge-managed.json"
+_LEGACY_MANAGER = "project-knowledge-skill-installer"
 _MARKER_KEYS = frozenset(
     {"manager", "platform", "resource_digest", "schema_version"}
+)
+_LEGACY_MARKER_KEYS = frozenset(
+    {"manager", "schema_version", "source_digest"}
 )
 _HEX_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _MAX_MARKER_BYTES = 4_096
@@ -107,6 +112,13 @@ class _ManagedDestination:
     root_identities: tuple[tuple[int, int], tuple[int, int], tuple[int, int]]
 
 
+@dataclass(frozen=True)
+class _DestinationOwnership:
+    resource_digest: str
+    marker: Literal["current", "legacy"]
+    identity: tuple[int, int]
+
+
 def install_agent(
     request: AgentInstallRequest,
     *,
@@ -115,8 +127,8 @@ def install_agent(
     """Delegate the official platform install, then atomically own our skill only."""
     contract, target = _agent_contract(request.platform)
     managed = _prepare_destination(request.user_home, request.platform, target)
-    current_digest = _validate_existing_destination(
-        managed.destination, request.platform
+    current = _validate_existing_destination(
+        managed.destination, request.platform, allow_legacy=True
     )
     try:
         resource_digest = _resource_tree_digest(dependencies.resource_root)
@@ -141,13 +153,17 @@ def install_agent(
         raise AgentInstallError("agent_install_failed") from None
 
     _revalidate_managed_roots(managed)
-    delegated_digest = _validate_existing_destination(
-        managed.destination, request.platform
+    delegated = _validate_existing_destination(
+        managed.destination, request.platform, allow_legacy=True
     )
-    if delegated_digest != current_digest:
+    if delegated != current:
         raise AgentInstallError("agent_destination_modified")
 
-    if current_digest == resource_digest:
+    if (
+        current is not None
+        and current.marker == "current"
+        and current.resource_digest == resource_digest
+    ):
         return AgentInstallResult(
             request.platform, "already_current", resource_digest
         )
@@ -157,6 +173,7 @@ def install_agent(
         dependencies.resource_root,
         request.platform,
         resource_digest,
+        expected=current,
     )
     return AgentInstallResult(request.platform, "installed", resource_digest)
 
@@ -168,8 +185,10 @@ def uninstall_agent(
     """Remove only an unchanged AtlasWeaver-owned resource tree."""
     _, target = _agent_contract(platform)
     managed = _existing_destination(user_home, platform, target)
-    resource_digest = _validate_existing_destination(managed.destination, platform)
-    if resource_digest is None:
+    ownership = _validate_existing_destination(
+        managed.destination, platform, allow_legacy=False
+    )
+    if ownership is None:
         raise AgentInstallError("agent_destination_unmanaged")
 
     tombstone = managed.skills_root / (
@@ -177,6 +196,14 @@ def uninstall_agent(
     )
     try:
         os.replace(managed.destination, tombstone)
+        try:
+            moved = _validate_existing_destination(
+                tombstone, platform, allow_legacy=False
+            )
+        except AgentInstallError:
+            raise AgentInstallError("agent_destination_modified") from None
+        if moved != ownership:
+            raise AgentInstallError("agent_destination_modified")
         _fsync_directory(managed.skills_root)
         _remove_owned_tree(tombstone)
         _fsync_directory(managed.skills_root)
@@ -188,7 +215,7 @@ def uninstall_agent(
             except Exception:
                 pass
         raise AgentInstallError("agent_install_failed") from None
-    return AgentInstallResult(platform, "uninstalled", resource_digest)
+    return AgentInstallResult(platform, "uninstalled", ownership.resource_digest)
 
 
 def _install_agent_for_platform_root(
@@ -363,21 +390,61 @@ def _agent_environment(user_home: Path) -> dict[str, str]:
 def _validate_existing_destination(
     destination: Path,
     platform: AgentPlatform,
-) -> str | None:
+    *,
+    allow_legacy: bool,
+) -> _DestinationOwnership | None:
     try:
         metadata = destination.lstat()
     except FileNotFoundError:
         return None
     if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
         raise AgentInstallError("agent_destination_unmanaged")
-    marker = _read_marker(destination / MANAGED_MARKER, platform)
+    current_path = destination / MANAGED_MARKER
+    legacy_path = destination / _LEGACY_MANAGED_MARKER
+    current_present = _path_entry_exists(current_path)
+    legacy_present = _path_entry_exists(legacy_path)
+    if current_present and legacy_present:
+        raise AgentInstallError("agent_destination_unmanaged")
+    if current_present:
+        marker = _read_marker(current_path, platform)
+        digest_key = "resource_digest"
+        marker_name = MANAGED_MARKER
+        marker_kind: Literal["current", "legacy"] = "current"
+    elif allow_legacy and platform == "codex" and legacy_present:
+        marker = _read_legacy_marker(legacy_path)
+        digest_key = "source_digest"
+        marker_name = _LEGACY_MANAGED_MARKER
+        marker_kind = "legacy"
+    else:
+        raise AgentInstallError("agent_destination_unmanaged")
     try:
-        actual = _filesystem_tree_digest(destination, ignore_marker=True)
+        actual = _filesystem_tree_digest(destination, ignore_marker=marker_name)
     except AgentInstallError:
         raise AgentInstallError("agent_destination_modified") from None
-    if actual != marker["resource_digest"]:
+    if actual != marker[digest_key]:
         raise AgentInstallError("agent_destination_modified")
-    return actual
+    try:
+        current_metadata = destination.lstat()
+    except OSError:
+        raise AgentInstallError("agent_destination_modified") from None
+    identity = (metadata.st_dev, metadata.st_ino)
+    if (
+        stat.S_ISLNK(current_metadata.st_mode)
+        or not stat.S_ISDIR(current_metadata.st_mode)
+        or (current_metadata.st_dev, current_metadata.st_ino) != identity
+    ):
+        raise AgentInstallError("agent_destination_modified")
+    return _DestinationOwnership(actual, marker_kind, identity)
+
+
+def _path_entry_exists(path: Path) -> bool:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        raise AgentInstallError("agent_destination_unmanaged") from None
+    return True
 
 
 def _read_marker(path: Path, platform: AgentPlatform) -> dict[str, object]:
@@ -394,6 +461,24 @@ def _read_marker(path: Path, platform: AgentPlatform) -> dict[str, object]:
         or type(document.get("schema_version")) is not int
         or not isinstance(document.get("resource_digest"), str)
         or _HEX_DIGEST.fullmatch(document["resource_digest"]) is None
+    ):
+        raise AgentInstallError("agent_destination_unmanaged")
+    return document
+
+
+def _read_legacy_marker(path: Path) -> dict[str, object]:
+    try:
+        payload = _read_regular_file(path, max_bytes=_MAX_MARKER_BYTES)
+        document = _strict_json_object(payload)
+    except (AgentInstallError, UnicodeError, ValueError):
+        raise AgentInstallError("agent_destination_unmanaged") from None
+    if (
+        set(document) != _LEGACY_MARKER_KEYS
+        or document.get("manager") != _LEGACY_MANAGER
+        or document.get("schema_version") != 1
+        or type(document.get("schema_version")) is not int
+        or not isinstance(document.get("source_digest"), str)
+        or _HEX_DIGEST.fullmatch(document["source_digest"]) is None
     ):
         raise AgentInstallError("agent_destination_unmanaged")
     return document
@@ -477,7 +562,7 @@ def _read_regular_file(path: Path, *, max_bytes: int | None = None) -> bytes:
         raise AgentInstallError("agent_resource_invalid") from None
 
 
-def _filesystem_tree_digest(root: Path, *, ignore_marker: bool) -> str:
+def _filesystem_tree_digest(root: Path, *, ignore_marker: str | None) -> str:
     digest = hashlib.sha256()
     try:
         entries = sorted(
@@ -487,7 +572,7 @@ def _filesystem_tree_digest(root: Path, *, ignore_marker: bool) -> str:
         raise AgentInstallError("agent_resource_invalid") from None
     for path in entries:
         relative = path.relative_to(root).as_posix()
-        if ignore_marker and relative == MANAGED_MARKER:
+        if ignore_marker is not None and relative == ignore_marker:
             continue
         try:
             metadata = path.lstat()
@@ -571,7 +656,7 @@ def _walk_resource_tree(root: Traversable) -> tuple[tuple[str, bytes, bytes], ..
 def _require_resource_name(name: str) -> None:
     if (
         not isinstance(name, str)
-        or name in {"", ".", "..", MANAGED_MARKER}
+        or name in {"", ".", "..", MANAGED_MARKER, _LEGACY_MANAGED_MARKER}
         or "/" in name
         or "\\" in name
         or "\x00" in name
@@ -584,6 +669,8 @@ def _replace_managed_resource(
     resource_root: Traversable,
     platform: AgentPlatform,
     resource_digest: str,
+    *,
+    expected: _DestinationOwnership | None,
 ) -> None:
     skills_root = destination.parent
     stage = Path(
@@ -595,17 +682,30 @@ def _replace_managed_resource(
     rollback_tree: Path | None = None
     try:
         _copy_resource_tree(resource_root, stage)
-        if _filesystem_tree_digest(stage, ignore_marker=False) != resource_digest:
+        if _filesystem_tree_digest(stage, ignore_marker=None) != resource_digest:
             raise AgentInstallError("agent_resource_invalid")
         _write_marker(stage, platform, resource_digest)
         _fsync_tree(stage)
 
-        if destination.exists():
+        destination_present = _path_entry_exists(destination)
+        if destination_present:
+            if expected is None:
+                raise AgentInstallError("agent_destination_modified")
             backup = skills_root / (
                 f".{SKILL_RELATIVE.name}.backup-{uuid.uuid4().hex}"
             )
             os.replace(destination, backup)
+            try:
+                moved = _validate_existing_destination(
+                    backup, platform, allow_legacy=True
+                )
+            except AgentInstallError:
+                raise AgentInstallError("agent_destination_modified") from None
+            if moved != expected:
+                raise AgentInstallError("agent_destination_modified")
             _fsync_directory(skills_root)
+        elif expected is not None:
+            raise AgentInstallError("agent_destination_modified")
         os.replace(stage, destination)
         committed = True
         _fsync_directory(skills_root)

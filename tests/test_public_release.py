@@ -18,7 +18,7 @@ def test_public_product_metadata_and_docs_are_complete() -> None:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
 
     assert project["name"] == "atlasweaver"
-    assert project["version"] == "0.3.5"
+    assert project["version"] == "0.3.6"
     assert project["scripts"]["project-knowledge"] == "project_knowledge.cli:main"
     assert project["license"] == "Apache-2.0"
     for relative in (

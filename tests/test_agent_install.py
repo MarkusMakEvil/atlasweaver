@@ -261,6 +261,32 @@ def _destination(user_home: Path, platform: str) -> Path:
     )
 
 
+def _write_legacy_managed_destination(
+    user_home: Path,
+    *,
+    marker_payload: str | None = None,
+) -> Path:
+    import shutil
+
+    destination = _destination(user_home, "codex")
+    shutil.copytree(SOURCE_SKILL, destination)
+    digest = _tree_digest(destination)
+    payload = marker_payload or json.dumps(
+        {
+            "manager": "project-knowledge-skill-installer",
+            "schema_version": 1,
+            "source_digest": digest,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    (destination / ".project-knowledge-managed.json").write_text(
+        payload + ("" if payload.endswith("\n") else "\n"),
+        encoding="utf-8",
+    )
+    return destination
+
+
 def test_packaged_skill_exactly_matches_reviewed_source_tree() -> None:
     packaged = resources.files("project_knowledge").joinpath(
         "resources/skills/using-project-knowledge-graphs"
@@ -319,6 +345,204 @@ def test_install_delegates_graphify_then_atomically_installs_owned_skill(
     assert stat.S_IMODE(
         (destination / ".atlasweaver-managed.json").stat().st_mode
     ) == 0o600
+
+
+def test_install_migrates_unchanged_legacy_owned_skill_transactionally(
+    tmp_path: Path,
+) -> None:
+    user_home = tmp_path / "user"
+    destination = _write_legacy_managed_destination(user_home)
+    runner = AgentRunner()
+
+    result = install_agent(
+        AgentInstallRequest("codex", user_home),
+        dependencies=agent_dependencies(
+            runner, resolved_graphify_executable(tmp_path)
+        ),
+    )
+
+    assert result.status == "installed"
+    assert not (destination / ".project-knowledge-managed.json").exists()
+    marker = json.loads((destination / ".atlasweaver-managed.json").read_text())
+    assert marker == {
+        "manager": "atlasweaver-agent-installer",
+        "platform": "codex",
+        "resource_digest": result.resource_digest,
+        "schema_version": 1,
+    }
+    assert _tree_digest(destination, ".atlasweaver-managed.json") == (
+        result.resource_digest
+    )
+    assert all(
+        not path.name.startswith(".using-project-knowledge-graphs.")
+        for path in destination.parent.iterdir()
+    )
+    assert runner.calls
+
+
+def test_install_never_deletes_unowned_tree_swapped_after_final_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from project_knowledge import agent_install
+
+    user_home = tmp_path / "user"
+    destination = _write_legacy_managed_destination(user_home)
+    displaced_owned = tmp_path / "displaced-owned"
+    unowned = tmp_path / "unowned"
+    unowned.mkdir()
+    (unowned / "human.txt").write_text("human\n", encoding="utf-8")
+    original_validate = agent_install._validate_existing_destination
+    validations = 0
+
+    def swap_after_final_validation(*args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal validations
+        ownership = original_validate(*args, **kwargs)
+        validations += 1
+        if validations == 2:
+            destination.replace(displaced_owned)
+            unowned.replace(destination)
+        return ownership
+
+    monkeypatch.setattr(
+        agent_install, "_validate_existing_destination", swap_after_final_validation
+    )
+
+    with pytest.raises(AgentInstallError, match="agent_destination_modified"):
+        install_agent(
+            AgentInstallRequest("codex", user_home),
+            dependencies=agent_dependencies(
+                AgentRunner(), resolved_graphify_executable(tmp_path)
+            ),
+        )
+
+    assert (destination / "human.txt").read_text(encoding="utf-8") == "human\n"
+    assert (displaced_owned / ".project-knowledge-managed.json").is_file()
+    assert sorted(path.name for path in destination.parent.iterdir()) == [
+        "graphify",
+        "using-project-knowledge-graphs",
+    ]
+
+
+@pytest.mark.parametrize("tamper", ["content", "extra", "symlink"])
+def test_install_refuses_tampered_legacy_owned_skill_before_graphify(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    user_home = tmp_path / "user"
+    destination = _write_legacy_managed_destination(user_home)
+    if tamper == "content":
+        (destination / "SKILL.md").write_text("tampered\n", encoding="utf-8")
+    elif tamper == "extra":
+        (destination / "unowned.txt").write_text("extra\n", encoding="utf-8")
+    else:
+        original = tmp_path / "outside-skill.md"
+        original.write_text("outside\n", encoding="utf-8")
+        (destination / "SKILL.md").unlink()
+        (destination / "SKILL.md").symlink_to(original)
+    runner = AgentRunner()
+
+    with pytest.raises(AgentInstallError, match="agent_destination_modified"):
+        install_agent(
+            AgentInstallRequest("codex", user_home),
+            dependencies=agent_dependencies(
+                runner, resolved_graphify_executable(tmp_path)
+            ),
+        )
+
+    assert runner.calls == []
+    assert (destination / ".project-knowledge-managed.json").exists()
+
+
+@pytest.mark.parametrize(
+    "marker_payload",
+    [
+        "{}",
+        json.dumps(
+            {
+                "manager": "other-installer",
+                "schema_version": 1,
+                "source_digest": "0" * 64,
+            }
+        ),
+        json.dumps(
+            {
+                "manager": "project-knowledge-skill-installer",
+                "schema_version": True,
+                "source_digest": "0" * 64,
+            }
+        ),
+        '{"manager":"project-knowledge-skill-installer","manager":"other-installer","schema_version":1,"source_digest":"%s"}'
+        % ("0" * 64),
+    ],
+)
+def test_install_refuses_malformed_legacy_marker_before_graphify(
+    tmp_path: Path,
+    marker_payload: str,
+) -> None:
+    user_home = tmp_path / "user"
+    _write_legacy_managed_destination(user_home, marker_payload=marker_payload)
+    runner = AgentRunner()
+
+    with pytest.raises(AgentInstallError, match="agent_destination_unmanaged"):
+        install_agent(
+            AgentInstallRequest("codex", user_home),
+            dependencies=agent_dependencies(
+                runner, resolved_graphify_executable(tmp_path)
+            ),
+        )
+
+    assert runner.calls == []
+
+
+def test_install_refuses_destination_with_current_and_legacy_markers(
+    tmp_path: Path,
+) -> None:
+    user_home = tmp_path / "user"
+    destination = _write_legacy_managed_destination(user_home)
+    (destination / ".atlasweaver-managed.json").write_text(
+        json.dumps(
+            {
+                "manager": "atlasweaver-agent-installer",
+                "platform": "codex",
+                "resource_digest": "0" * 64,
+                "schema_version": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    runner = AgentRunner()
+
+    with pytest.raises(AgentInstallError, match="agent_destination_unmanaged"):
+        install_agent(
+            AgentInstallRequest("codex", user_home),
+            dependencies=agent_dependencies(
+                runner, resolved_graphify_executable(tmp_path)
+            ),
+        )
+
+    assert runner.calls == []
+
+
+def test_install_never_claims_codex_only_legacy_marker_for_agents(
+    tmp_path: Path,
+) -> None:
+    user_home = tmp_path / "user"
+    codex_destination = _write_legacy_managed_destination(user_home)
+    agents_destination = _destination(user_home, "agents")
+    agents_destination.parent.mkdir(parents=True)
+    codex_destination.replace(agents_destination)
+    runner = AgentRunner()
+
+    with pytest.raises(AgentInstallError, match="agent_destination_unmanaged"):
+        install_agent(
+            AgentInstallRequest("agents", user_home),
+            dependencies=agent_dependencies(
+                runner, resolved_graphify_executable(tmp_path)
+            ),
+        )
+
+    assert runner.calls == []
+    assert (agents_destination / ".project-knowledge-managed.json").exists()
 
 
 @pytest.mark.parametrize("state", ["unmanaged", "modified"])
@@ -688,6 +912,56 @@ def test_replace_failure_restores_owned_destination_and_cleans_transactions(
         "graphify",
         "using-project-knowledge-graphs",
     ]
+
+
+def test_replace_refuses_swapped_unowned_tree_without_deleting_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from project_knowledge import agent_install
+    import shutil
+
+    user_home = tmp_path / "user"
+    resolved = resolved_graphify_executable(tmp_path)
+    install_agent(
+        AgentInstallRequest("codex", user_home),
+        dependencies=agent_dependencies(AgentRunner(), resolved),
+    )
+    destination = _destination(user_home, "codex")
+    displaced_owned = tmp_path / "displaced-owned"
+    changed_resource = tmp_path / "changed-resource"
+    shutil.copytree(SOURCE_SKILL, changed_resource)
+    (changed_resource / "SKILL.md").write_text(
+        "changed resource\n", encoding="utf-8"
+    )
+    original_replace = os.replace
+    swapped = False
+
+    def swap_before_backup(source, target):  # type: ignore[no-untyped-def]
+        nonlocal swapped
+        if not swapped and Path(source) == destination:
+            swapped = True
+            original_replace(destination, displaced_owned)
+            destination.mkdir()
+            (destination / "foreign.txt").write_text(
+                "must survive\n", encoding="utf-8"
+            )
+        return original_replace(source, target)
+
+    monkeypatch.setattr(agent_install.os, "replace", swap_before_backup)
+
+    with pytest.raises(AgentInstallError, match="agent_destination_modified"):
+        install_agent(
+            AgentInstallRequest("codex", user_home),
+            dependencies=agent_dependencies(
+                AgentRunner(), resolved, resource_root=changed_resource
+            ),
+        )
+
+    assert swapped is True
+    assert (destination / "foreign.txt").read_text(encoding="utf-8") == (
+        "must survive\n"
+    )
+    assert displaced_owned.is_dir()
 
 
 def test_parent_fsync_failure_restores_owned_destination_and_cleans_transactions(

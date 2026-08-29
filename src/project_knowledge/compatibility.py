@@ -12,7 +12,6 @@ from types import MappingProxyType
 from typing import Literal
 from uuid import UUID
 
-
 class CompatibilityError(ValueError):
     """Raised when a Graphify version or capability is outside the registry."""
 

@@ -4,9 +4,27 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import re
+import runpy
 import shutil
 import subprocess
 import sys
+
+
+def _production_graphify_version(root: Path) -> str:
+    registry = runpy.run_path(
+        str(root / "src/project_knowledge/compatibility.py")
+    )
+    resolver = registry.get("production_graphify_compatibility")
+    if not callable(resolver):
+        raise RuntimeError("production Graphify registry is invalid")
+    version = getattr(resolver(), "version", None)
+    if (
+        not isinstance(version, str)
+        or re.fullmatch(r"\d+\.\d+\.\d+", version) is None
+    ):
+        raise RuntimeError("production Graphify registry is invalid")
+    return version
 
 
 def main() -> int:
@@ -15,18 +33,15 @@ def main() -> int:
     if uv is None:
         print("install-project-knowledge-tool: uv is required", file=sys.stderr)
         return 1
-    sys.path.insert(0, str(root / "src"))
-    from project_knowledge.compatibility import production_graphify_compatibility
-
-    graphify_requirement = (
-        f"graphifyy=={production_graphify_compatibility().version}"
-    )
+    graphify_requirement = f"graphifyy=={_production_graphify_version(root)}"
     result = subprocess.run(
         [
             uv,
             "tool",
             "install",
             "--force",
+            "--reinstall-package",
+            "atlasweaver",
             "--with-executables-from",
             graphify_requirement,
             str(root),

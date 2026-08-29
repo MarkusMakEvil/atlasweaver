@@ -35,14 +35,14 @@ Install the reviewed release stack as one uv tool. This exposes
 `project-knowledge`, `graphify`, and `graphify-mcp` from the same environment:
 
 ```sh
-uv tool install --force --with-executables-from 'graphifyy==0.9.51' 'https://github.com/MarkusMakEvil/atlasweaver/releases/download/v0.3.5/atlasweaver-0.3.5-py3-none-any.whl'
+uv tool install --force --with-executables-from 'graphifyy==0.9.51' 'https://github.com/MarkusMakEvil/atlasweaver/releases/download/v0.3.6/atlasweaver-0.3.6-py3-none-any.whl'
 project-knowledge install-agent --platform codex --json
 ```
 
 For a reviewed source checkout instead:
 
 ```sh
-git clone --depth 1 --branch v0.3.5 https://github.com/MarkusMakEvil/atlasweaver.git
+git clone --depth 1 --branch v0.3.6 https://github.com/MarkusMakEvil/atlasweaver.git
 cd atlasweaver
 python3 scripts/install-project-knowledge-tool
 project-knowledge install-agent --platform codex --json
