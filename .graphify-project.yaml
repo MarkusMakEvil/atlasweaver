@@ -27,4 +27,4 @@ artifacts:
   channel: main
   source_ref: refs/heads/main
   signer_workflow: MarkusMakEvil/atlasweaver/.github/workflows/atlasweaver-publish.yml
-  signer_digest: 5d04457cffae138c69d115c1a29cbcd99adb0966
+  signer_digest: 1aa9a05379f6990d4b01273c9fb4e25b688fd643
