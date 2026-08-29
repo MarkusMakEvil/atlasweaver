@@ -9,7 +9,7 @@ output_dir: graphify-out
 obsidian_namespace: "Projects/demo-project/Generated"
 excludes: []
 track_html: false
-graphify_version: "0.9.48"
+graphify_version: "0.9.51"
 features:
   atlas: disabled
   registry: disabled

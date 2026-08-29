@@ -857,6 +857,9 @@ def _capture_owned_files(
             raise OSError("ownership invalid")
         expected = {OWNERSHIP_MANIFEST, *artifact_names}
         actual = set(os.listdir(descriptor))
+        if "cache" in actual:
+            _validate_managed_query_cache(descriptor)
+            actual.remove("cache")
         if actual != expected:
             raise OSError("owned tree mismatch")
         result = {OWNERSHIP_MANIFEST: ownership}
@@ -872,6 +875,31 @@ def _capture_owned_files(
         return result
     finally:
         os.close(descriptor)
+
+
+def _validate_managed_query_cache(output_fd: int) -> None:
+    """Reject all runtime sidecars except Graphify's exact query stamp."""
+    try:
+        cache_fd = os.open(
+            "cache",
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=output_fd,
+        )
+    except OSError:
+        raise OSError("managed query cache is invalid") from None
+    try:
+        names = tuple(sorted(os.listdir(cache_fd)))
+        if names != ("last_query_stamp",):
+            raise OSError("managed query cache is invalid")
+        info = os.stat(
+            "last_query_stamp",
+            dir_fd=cache_fd,
+            follow_symlinks=False,
+        )
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise OSError("managed query cache is invalid")
+    finally:
+        os.close(cache_fd)
 
 
 def _open_directory_components(parent_fd: int, parts: tuple[str, ...]) -> int:

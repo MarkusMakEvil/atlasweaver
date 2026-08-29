@@ -181,7 +181,9 @@ def test_init_preview_is_read_only_and_apply_generates_uuid_once(
 
     assert apply_init(repo, preview, uuid_factory=allocate) == "initialized"
     assert calls == 1
-    assert load_manifest(repo / ".graphify-project.yaml", repo).project_uid == DEMO_UID
+    initialized = load_manifest(repo / ".graphify-project.yaml", repo)
+    assert initialized.project_uid == DEMO_UID
+    assert initialized.graphify_version == "0.9.51"
     assert inspect_init_journal(repo) == "none"
 
 

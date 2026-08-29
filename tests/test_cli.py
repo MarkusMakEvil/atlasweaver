@@ -708,7 +708,7 @@ def test_health_reports_source_drift_without_atlas_path_or_sensitive_names(
     )
 
     assert result.returncode == 0
-    document = payload(result, schema_version=2)
+    document = payload(result, schema_version=3)
     assert document["command"] == "health"
     assert document["status"] == "missing"
     assert document["issues"] == ["graph_missing"]
@@ -780,8 +780,61 @@ def test_console_entrypoint_is_declared_only_with_the_working_module() -> None:
     assert "Traceback" not in result.stderr
 
 
+def test_onboarding_script_loads_runtime_pin_without_project_dependencies(
+    tmp_path: Path,
+) -> None:
+    """A clean Python can reach the uv install call before dependencies exist."""
+    real_uv = shutil.which("uv")
+    assert real_uv is not None
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    recorded = tmp_path / "uv-arguments.json"
+    fake_uv = fake_bin / "uv"
+    fake_uv.write_text(
+        f"""#!{sys.executable}
+import json
+from pathlib import Path
+import sys
+
+Path({str(recorded)!r}).write_text(json.dumps(sys.argv[1:]), encoding="utf-8")
+""",
+        encoding="utf-8",
+    )
+    fake_uv.chmod(0o755)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}{os.pathsep}{os.defpath}"
+
+    result = subprocess.run(
+        [
+            real_uv,
+            "run",
+            "--isolated",
+            "--no-project",
+            "--python",
+            f"{sys.version_info.major}.{sys.version_info.minor}",
+            "python",
+            "scripts/install-project-knowledge-tool",
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(recorded.read_text(encoding="utf-8")) == [
+        "tool",
+        "install",
+        "--force",
+        "--with-executables-from",
+        f"graphifyy=={production_graphify_compatibility().version}",
+        str(Path(__file__).resolve().parents[1]),
+    ]
+
+
 def test_onboarding_script_installs_normal_shell_command(tmp_path: Path) -> None:
-    """A workspace-only entrypoint disappears outside `uv run`."""
+    """One onboarding command installs both reviewed runtime entrypoints."""
     environment = os.environ.copy()
     environment["UV_TOOL_DIR"] = str(tmp_path / "tools")
     environment["UV_TOOL_BIN_DIR"] = str(tmp_path / "bin")
@@ -796,3 +849,11 @@ def test_onboarding_script_installs_normal_shell_command(tmp_path: Path) -> None
     smoke = subprocess.run([tmp_path / "bin/project-knowledge", "--help"], text=True, capture_output=True, check=False)
     assert smoke.returncode == 0
     assert "preflight" in smoke.stdout
+    graphify = subprocess.run(
+        [tmp_path / "bin/graphify", "--version"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert graphify.returncode == 0, graphify.stderr
+    assert production_graphify_compatibility().version in graphify.stdout

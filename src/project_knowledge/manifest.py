@@ -16,7 +16,11 @@ from uuid import UUID, RFC_4122, uuid4
 
 import yaml
 
-from .compatibility import CompatibilityError, resolve_graphify_compatibility
+from .compatibility import (
+    CompatibilityError,
+    production_graphify_compatibility,
+    resolve_graphify_compatibility,
+)
 from .locking import (
     LifecycleDescriptors,
     RepositoryAccess,
@@ -638,7 +642,7 @@ def _new_v2_manifest(
         ),
         excludes=(),
         track_html=False,
-        graphify_version="0.9.48",
+        graphify_version=production_graphify_compatibility().version,
         features=FeatureIntent(),
         artifacts=ArtifactIntent(),
     )

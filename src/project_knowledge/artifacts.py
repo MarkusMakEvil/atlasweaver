@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import hashlib
 import fcntl
@@ -47,6 +47,8 @@ from .locking import (
 
 
 OWNERSHIP_MANIFEST = ".project-knowledge-ownership.json"
+_MANAGED_QUERY_CACHE_DIRECTORY = "cache"
+_MANAGED_QUERY_CACHE_STAMP = "last_query_stamp"
 _OWNERSHIP_SCHEMA_VERSION = 1
 _TRANSACTION_SCHEMA_VERSION = 1
 _PROVENANCE_VALUES = frozenset({"EXTRACTED", "INFERRED", "AMBIGUOUS"})
@@ -207,7 +209,7 @@ def validate_candidate(
 ) -> ValidatedGraph:
     """Validate a complete candidate and attach process-local ownership evidence.
 
-    Graphify 0.9.48's native graph shape is accepted, but the wrapper must stamp
+    A supported Graphify native graph shape is accepted, but the wrapper must stamp
     exact ``project_id``, ``graphify_version``, and ``source_digest`` metadata.
     The ownership manifest is written only after all candidate bytes pass.
     """
@@ -580,8 +582,11 @@ def validate_owned_graph(
     expected_source_digest: str | None = None,
     expected_projection_digest: str | None = None,
     repository_access: RepositoryAccess | None = None,
+    allow_compatible_configuration: bool = False,
 ) -> ValidatedGraph:
     """Read and revalidate a complete ownership-bound live graph tree."""
+    if type(allow_compatible_configuration) is not bool:
+        raise ArtifactValidationError("owned graph compatibility mode is invalid")
     owned_root = _require_candidate_directory(root)
     if repository_access is not None:
         repository_root = _path_for_open_directory(repository_access.descriptor)
@@ -597,13 +602,26 @@ def validate_owned_graph(
         raise ArtifactValidationError("ownership manifest exceeds size cap")
     ownership = _load_graph_json(ownership_payload)
     schema = ownership.get("schema_version")
-    captured = _capture_candidate(owned_root)
+    captured = _capture_owned_artifacts(owned_root)
     initial_snapshot = tuple(
         (relative, hashlib.sha256(payload).hexdigest())
         for relative, _, payload in captured
     )
+    validation_manifest = manifest
+    if allow_compatible_configuration:
+        owned_version = ownership.get("graphify_version")
+        if type(owned_version) is not str:
+            raise ArtifactValidationError("ownership identity mismatch")
+        artifacts = ownership.get(
+            "artifacts" if schema == 2 else "artifact_digests"
+        )
+        validation_manifest = replace(
+            manifest,
+            graphify_version=owned_version,
+            track_html=isinstance(artifacts, Mapping) and "graph.html" in artifacts,
+        )
     try:
-        contract = resolve_graphify_compatibility(manifest.graphify_version)
+        contract = resolve_graphify_compatibility(validation_manifest.graphify_version)
     except CompatibilityError as error:
         raise ArtifactValidationError(str(error)) from error
     if schema == 2:
@@ -611,7 +629,7 @@ def validate_owned_graph(
             owned_root,
             captured,
             ownership,
-            manifest,
+            validation_manifest,
             contract,
             expected_source_digest=expected_source_digest,
             expected_projection_digest=expected_projection_digest,
@@ -621,13 +639,14 @@ def validate_owned_graph(
             owned_root,
             captured,
             ownership,
-            manifest,
+            validation_manifest,
             contract,
             expected_source_digest=expected_source_digest,
         )
     else:
         raise ArtifactValidationError("ownership schema version is invalid")
-    if _snapshot(owned_root) != initial_snapshot:
+    _validate_managed_query_cache(owned_root)
+    if _snapshot(owned_root, exclude_managed_query_cache=True) != initial_snapshot:
         raise ArtifactValidationError("owned graph changed during validation")
     return validated
 
@@ -1180,10 +1199,18 @@ def _require_regular_file(path: Path, description: str) -> None:
         raise ArtifactValidationError(f"{description} must be a regular file: {path.name}")
 
 
-def _candidate_files(root: Path) -> tuple[tuple[PurePosixPath, Path], ...]:
+def _candidate_files(
+    root: Path, *, exclude_managed_query_cache: bool = False
+) -> tuple[tuple[PurePosixPath, Path], ...]:
     files: list[tuple[PurePosixPath, Path]] = []
     for path in sorted(root.rglob("*"), key=lambda item: item.as_posix()):
         relative = PurePosixPath(path.relative_to(root).as_posix())
+        if (
+            exclude_managed_query_cache
+            and relative.parts
+            and relative.parts[0] == _MANAGED_QUERY_CACHE_DIRECTORY
+        ):
+            continue
         info = path.stat(follow_symlinks=False)
         if stat.S_ISLNK(info.st_mode):
             raise ArtifactValidationError("candidate artifacts must be regular files")
@@ -1197,11 +1224,108 @@ def _candidate_files(root: Path) -> tuple[tuple[PurePosixPath, Path], ...]:
 
 def _capture_candidate(
     root: Path,
+    *,
+    exclude_managed_query_cache: bool = False,
 ) -> tuple[tuple[PurePosixPath, Path, bytes], ...]:
     return tuple(
         (relative, path, _read_regular_bytes(path))
-        for relative, path in _candidate_files(root)
+        for relative, path in _candidate_files(
+            root, exclude_managed_query_cache=exclude_managed_query_cache
+        )
     )
+
+
+def _capture_owned_artifacts(
+    root: Path,
+) -> tuple[tuple[PurePosixPath, Path, bytes], ...]:
+    """Capture only ownership-bound artifacts after checking Graphify's sidecar."""
+    _validate_managed_query_cache(root)
+    return _capture_candidate(root, exclude_managed_query_cache=True)
+
+
+def _validate_managed_query_cache(root: Path) -> None:
+    """Accept Graphify's exact query sidecar without treating it as trusted data."""
+    try:
+        root_fd = os.open(
+            root,
+            os.O_RDONLY | os.O_DIRECTORY | _nofollow_flag() | os.O_CLOEXEC,
+        )
+    except OSError as error:
+        raise ArtifactValidationError("managed graph query cache is invalid") from error
+    try:
+        try:
+            cache_fd = os.open(
+                _MANAGED_QUERY_CACHE_DIRECTORY,
+                os.O_RDONLY | os.O_DIRECTORY | _nofollow_flag() | os.O_CLOEXEC,
+                dir_fd=root_fd,
+            )
+        except FileNotFoundError:
+            return
+        except OSError:
+            raise ArtifactValidationError(
+                "managed graph query cache is invalid"
+            ) from None
+        try:
+            cache_info = os.fstat(cache_fd)
+            names = tuple(sorted(os.listdir(cache_fd)))
+            if names != (_MANAGED_QUERY_CACHE_STAMP,):
+                raise ArtifactValidationError(
+                    "managed graph query cache is invalid"
+                )
+            stamp_info = os.stat(
+                _MANAGED_QUERY_CACHE_STAMP,
+                dir_fd=cache_fd,
+                follow_symlinks=False,
+            )
+            if stat.S_ISLNK(stamp_info.st_mode) or not stat.S_ISREG(
+                stamp_info.st_mode
+            ):
+                raise ArtifactValidationError(
+                    "managed graph query cache is invalid"
+                )
+            stamp_fd = os.open(
+                _MANAGED_QUERY_CACHE_STAMP,
+                os.O_RDONLY
+                | _nofollow_flag()
+                | os.O_CLOEXEC
+                | getattr(os, "O_NONBLOCK", 0),
+                dir_fd=cache_fd,
+            )
+            try:
+                opened_stamp = os.fstat(stamp_fd)
+                if (
+                    not stat.S_ISREG(opened_stamp.st_mode)
+                    or (opened_stamp.st_dev, opened_stamp.st_ino)
+                    != (stamp_info.st_dev, stamp_info.st_ino)
+                ):
+                    raise ArtifactValidationError(
+                        "managed graph query cache is invalid"
+                    )
+            finally:
+                os.close(stamp_fd)
+            named_cache = os.stat(
+                _MANAGED_QUERY_CACHE_DIRECTORY,
+                dir_fd=root_fd,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISDIR(named_cache.st_mode)
+                or (named_cache.st_dev, named_cache.st_ino)
+                != (cache_info.st_dev, cache_info.st_ino)
+            ):
+                raise ArtifactValidationError(
+                    "managed graph query cache is invalid"
+                )
+        except ArtifactValidationError:
+            raise
+        except OSError:
+            raise ArtifactValidationError(
+                "managed graph query cache is invalid"
+            ) from None
+        finally:
+            os.close(cache_fd)
+    finally:
+        os.close(root_fd)
 
 
 def _read_regular_bytes(path: Path) -> bytes:
@@ -1411,7 +1535,7 @@ def _validate_graph_health(
         and recorded_integrity.collapsed_edges is not None
     ):
         raise ArtifactValidationError(
-            "Graphify 0.9.48 collapsed edge evidence must remain unknown"
+            "navigation-only Graphify collapsed edge evidence must remain unknown"
         )
     try:
         computed = analyze_graph(
@@ -1817,10 +1941,14 @@ def _json_payload(document: Mapping[str, Any]) -> bytes:
     return (json.dumps(document, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
 
-def _snapshot(root: Path) -> tuple[tuple[PurePosixPath, str], ...]:
+def _snapshot(
+    root: Path, *, exclude_managed_query_cache: bool = False
+) -> tuple[tuple[PurePosixPath, str], ...]:
     return tuple(
         (relative, hashlib.sha256(_read_regular_bytes(path)).hexdigest())
-        for relative, path in _candidate_files(root)
+        for relative, path in _candidate_files(
+            root, exclude_managed_query_cache=exclude_managed_query_cache
+        )
     )
 
 
@@ -2027,7 +2155,7 @@ def _owned_target_identity(target: Path) -> tuple[str, str, int | None] | None:
     if type(value) is not str or _HEX_DIGEST.fullmatch(value) is None:
         return None
     try:
-        captured = _capture_candidate(target)
+        captured = _capture_owned_artifacts(target)
         by_path = {relative.as_posix(): payload for relative, _, payload in captured}
         if document.get("schema_version") == 2:
             artifacts = document.get("artifacts")

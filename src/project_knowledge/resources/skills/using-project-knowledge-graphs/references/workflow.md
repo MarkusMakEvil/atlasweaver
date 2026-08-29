@@ -41,9 +41,12 @@ fingerprint, and review reason.
 
 ## Bootstrap or refresh
 
-If `project-knowledge` is unavailable, run the reviewed repository onboarding
-command once: `python3 scripts/install-project-knowledge-tool`. Then verify
-`command -v project-knowledge` before continuing.
+If `project-knowledge` is unavailable in a reviewed AtlasWeaver checkout, run
+the repository onboarding command once:
+`python3 scripts/install-project-knowledge-tool`. It installs AtlasWeaver and
+the compatibility-registry Graphify release into one uv tool environment. Then
+verify both `command -v project-knowledge` and `command -v graphify` before
+continuing.
 
 Before mutation, show the repository, include roots, immutable global deny set,
 project output, and optional destinations. Obtain exact approval for the
@@ -137,8 +140,8 @@ project-knowledge fleet query --workspace <fleet.yaml> query <term> --json
 
 Fleet output preserves configuration order. A failed repository does not roll
 back another completed repository. Fleet query reads one atomic verified
-registry snapshot and never performs an implicit sync. Treat Graphify 0.9.48
-fleet query results as navigation and source-verify every impact conclusion.
+registry snapshot and never performs an implicit sync. Treat navigation-trust
+fleet query results as orientation and source-verify every impact conclusion.
 
 ## Obsidian export
 

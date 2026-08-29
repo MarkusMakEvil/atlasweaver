@@ -19,9 +19,9 @@ from project_knowledge.health import (
     safe_input_snapshot,
 )
 from project_knowledge.locking import RepositoryAccess
-from project_knowledge.models import ProjectManifest
+from project_knowledge.models import ArtifactIntent, ProjectManifest
 from project_knowledge.staging import inspect_projection
-from tests.support import manifest_v2
+from tests.support import manifest_v2, write_manifest_v2
 from tests.test_manifest import write_manifest as write_v1_manifest_file
 
 
@@ -55,7 +55,7 @@ def healthy_state(**changes: object) -> KnowledgeState:
 def test_disabled_optional_features_do_not_lower_core_health() -> None:
     health = assess_health(healthy_state())
 
-    assert health.schema_version == 2
+    assert health.schema_version == 3
     assert health.core_status == health.status == "healthy"
     assert health.features["atlas"].status == "disabled"
     assert health.issues == ()
@@ -185,6 +185,31 @@ def test_direct_health_inspection_is_noncreating_and_tree_read_only(
     assert not (repo / ".project-knowledge").exists()
 
 
+def test_valid_enabled_artifact_provider_is_configured_without_network_verification(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "src/app.py").write_text("safe\n", encoding="utf-8")
+    artifacts = ArtifactIntent(
+        provider="github-release",
+        host="github.com",
+        repository="acme/widgets",
+        repository_id=123456789,
+        channel="main",
+        source_ref="refs/heads/main",
+        signer_workflow="acme/widgets/.github/workflows/release.yml",
+        signer_digest="a" * 40,
+    )
+    write_manifest_v2(repo, artifacts=artifacts)
+
+    state = inspect_project_state(repo, manifest_v2(artifacts=artifacts))
+    health = assess_health(state)
+
+    assert health.features["artifacts"] == FeatureHealth("configured")
+    assert "artifact_provider_invalid" not in health.warnings
+
+
 def manifest() -> ProjectManifest:
     return ProjectManifest(
         schema_version=1,
@@ -281,7 +306,7 @@ def test_health_issues_are_stable_codes_not_paths_or_raw_diagnostics() -> None:
     assert health.warnings == ("atlas_unavailable", "registry_mismatch")
     assert health.source_matches is False
     assert health.to_dict() == {
-        "schema_version": 2,
+        "schema_version": 3,
         "core_status": "stale",
         "status": "stale",
         "project_id": "demo",
@@ -513,8 +538,8 @@ def test_inspection_treats_source_digest_mismatch_as_authoritative(
     assert assess_health(inspected).source_matches is False
 
 
-def test_inspection_rejects_unowned_graphify_query_cache(tmp_path: Path) -> None:
-    """Only ownership-bound artifact bytes can enter live health."""
+def test_inspection_allows_exact_graphify_query_cache(tmp_path: Path) -> None:
+    """Graphify's exact runtime sidecar cannot invalidate owned artifacts."""
     repo = tmp_path / "repo"
     (repo / "src").mkdir(parents=True)
     (repo / "src/app.py").write_text("current\n", encoding="utf-8")
@@ -530,9 +555,7 @@ def test_inspection_rejects_unowned_graphify_query_cache(tmp_path: Path) -> None
         registry_matches=True,
     )
 
-    assert inspected.graph_valid is False
-    assert assess_health(inspected).status == "error"
-    assert assess_health(inspected).issues == ("graph_invalid",)
+    assert inspected.graph_valid is True
 
 
 def test_inspection_rejects_tampered_owned_report(tmp_path: Path) -> None:

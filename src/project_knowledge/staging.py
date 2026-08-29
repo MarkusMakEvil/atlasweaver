@@ -23,6 +23,7 @@ from .models import (
 )
 from .privacy import (
     classify_path,
+    decision_affects_projection_identity,
     effective_excludes,
     is_denied,
     repository_ignores,
@@ -60,7 +61,7 @@ class StagedInput:
 
 SOURCE_DIGEST_DOMAIN = b"atlasweaver-source-v2\0"
 PROJECTION_DIGEST_DOMAIN = b"atlasweaver-projection-v2\0"
-POLICY_VERSION = 2
+POLICY_VERSION = 3
 
 
 def stage_input(
@@ -334,7 +335,6 @@ def _inspect_projection_base(
                 source_digest=source_digest,
                 decisions=ordered_decisions,
                 ignore_digests=ignores.digests(),
-                reason_counts=reason_counts,
                 secret_exception_digest=secret_exception_digest,
                 coverage_digest=coverage_digest,
             ),
@@ -542,10 +542,15 @@ def _projection_digest(
     source_digest: str,
     decisions: tuple[PrivacyDecision, ...],
     ignore_digests: tuple[str, ...],
-    reason_counts: tuple[tuple[str, int], ...],
     secret_exception_digest: str | None,
     coverage_digest: str | None,
 ) -> str:
+    identity_decisions = tuple(
+        item for item in decisions if decision_affects_projection_identity(item)
+    )
+    identity_reason_counts = Counter(
+        f"{item.action}:{item.rule_id}" for item in identity_decisions
+    )
     payload = {
         "policy_version": POLICY_VERSION,
         "manifest": {
@@ -562,11 +567,11 @@ def _projection_digest(
                 "action": item.action,
                 "rule_id": item.rule_id,
             }
-            for item in decisions
+            for item in identity_decisions
         ],
         "ignore_digests": list(ignore_digests),
         "secret_exception_digest": secret_exception_digest,
-        "reason_counts": dict(reason_counts),
+        "reason_counts": dict(sorted(identity_reason_counts.items())),
         "coverage_digest": coverage_digest,
         "source_digest": source_digest,
     }

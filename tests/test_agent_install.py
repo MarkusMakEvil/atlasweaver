@@ -24,8 +24,8 @@ from project_knowledge.agent_install import (
     uninstall_agent,
 )
 from project_knowledge.compatibility import (
+    production_graphify_compatibility,
     render_graphify_agent_install,
-    resolve_graphify_compatibility,
 )
 from project_knowledge.graphify import (
     ResolvedGraphifyExecutable,
@@ -60,7 +60,7 @@ class AgentRunner:
     def __init__(
         self,
         *,
-        version: str = "0.9.48",
+        version: str = production_graphify_compatibility().version,
         omit_probe_platform: str | None = None,
         fail_install_home: Path | None = None,
         create_unmanaged_atlas_home: Path | None = None,
@@ -276,7 +276,7 @@ def test_install_delegates_graphify_then_atomically_installs_owned_skill(
     runner = AgentRunner()
     resolved = resolved_graphify_executable(tmp_path)
     rendered = render_graphify_agent_install(
-        resolve_graphify_compatibility("0.9.48"),
+        production_graphify_compatibility(),
         binary=resolved.path,
         platform=platform,  # type: ignore[arg-type]
     )

@@ -754,10 +754,6 @@ def _read_tool(path: Path) -> tuple[os.stat_result, str]:
     return after, digest.hexdigest()
 
 
-if __name__ == "__main__":  # pragma: no cover - exercised via the module CLI
-    raise SystemExit(main())
-
-
 def _is_compatible_graphify_wheel(
     item: object, version: Version, supported_tags: frozenset[Tag]
 ) -> bool:
@@ -843,3 +839,7 @@ def _strict_json_mapping(payload: bytes) -> Mapping[str, Any]:
     if not isinstance(document, Mapping):
         raise ProbeError("pypi_response_invalid")
     return document
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised via the module CLI
+    raise SystemExit(main())

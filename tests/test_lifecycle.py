@@ -21,7 +21,7 @@ from project_knowledge.lifecycle import (
     RefreshOptions,
     refresh_project,
 )
-from project_knowledge.artifacts import validate_owned_graph
+from project_knowledge.artifacts import ArtifactValidationError, validate_owned_graph
 from project_knowledge.locking import TransactionLockError, open_repository_access
 from tests.support import manifest_v2, write_manifest_v2
 from tests.test_graphify_adapter import ProbeRunner, _REQUIRED_HELP
@@ -121,10 +121,17 @@ def test_operation_refuses_mismatched_argv_zero(tmp_path: Path) -> None:
 class Official0948FixtureRunner(ProbeRunner):
     """Materialize the official fixture for probe and refresh commands."""
 
-    def __init__(self, executable: Path, *, raw_diagnosis: bool = False) -> None:
+    def __init__(
+        self,
+        executable: Path,
+        *,
+        raw_diagnosis: bool = False,
+        version: str = "0.9.48",
+    ) -> None:
         super().__init__()
         self.raw_diagnosis = raw_diagnosis
-        self.answer((str(executable), "--version"), stdout="graphify 0.9.48\n")
+        self.version = version
+        self.answer((str(executable), "--version"), stdout=f"graphify {version}\n")
         self.answer((str(executable), "--help"), stdout=_REQUIRED_HELP)
         self.refresh_operations: list[str] = []
         self.refresh_environments: list[dict[str, str]] = []
@@ -145,7 +152,10 @@ class Official0948FixtureRunner(ProbeRunner):
             )
             self.refresh_environments.append(dict(options["env"]))
             fixture = json.loads(
-                Path("src/project_knowledge/compatibility_fixtures/graphify_0_9_48.json")
+                Path(
+                    "src/project_knowledge/compatibility_fixtures/"
+                    f"graphify_{self.version.replace('.', '_')}.json"
+                )
                 .read_text(encoding="utf-8")
             )
             if operation == "extract":
@@ -405,6 +415,49 @@ def test_changed_projection_promotes_next_owned_epoch(tmp_path: Path) -> None:
     assert second.build_epoch == owned.build_epoch == 2
     assert second.generation_digest == owned.generation_digest
     assert second.generation_digest != first.generation_digest
+
+
+def test_refresh_migrates_an_owned_graph_to_a_new_supported_contract(
+    tmp_path: Path,
+) -> None:
+    repo, selected = _source_repository(tmp_path)
+    executable = _fixture_graphify(tmp_path)
+    first = refresh_project(
+        repo,
+        selected,
+        RefreshOptions(None, None, False, True),
+        runner=Official0948FixtureRunner(executable.resolve()),
+        ambient={},
+        graphify_binary=executable,
+    )
+    upgraded = replace(selected, graphify_version="0.9.51")
+    with pytest.raises(ArtifactValidationError, match="ownership identity mismatch"):
+        validate_owned_graph(repo / "graphify-out", upgraded)
+    write_manifest_v2(
+        repo,
+        include_roots=upgraded.include_roots,
+        graphify_version=upgraded.graphify_version,
+    )
+
+    second = refresh_project(
+        repo,
+        upgraded,
+        RefreshOptions(None, None, False, True),
+        runner=Official0948FixtureRunner(
+            executable.resolve(), version=upgraded.graphify_version
+        ),
+        ambient={},
+        graphify_binary=executable,
+    )
+
+    ownership = json.loads(
+        (repo / "graphify-out/.project-knowledge-ownership.json").read_text()
+    )
+    assert first.build_epoch == 1
+    assert second.status == "refreshed"
+    assert second.build_epoch == 2
+    assert ownership["graphify_version"] == "0.9.51"
+    assert ownership["adapter_id"] == "graphify-0.9.51"
 
 
 def test_refresh_records_every_state_machine_boundary(tmp_path: Path) -> None:

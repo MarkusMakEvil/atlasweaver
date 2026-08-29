@@ -18,7 +18,7 @@ def test_public_product_metadata_and_docs_are_complete() -> None:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
 
     assert project["name"] == "atlasweaver"
-    assert project["version"] == "0.3.4"
+    assert project["version"] == "0.3.5"
     assert project["scripts"]["project-knowledge"] == "project_knowledge.cli:main"
     assert project["license"] == "Apache-2.0"
     for relative in (
@@ -83,6 +83,7 @@ def test_built_wheel_contains_managed_agent_skill_resources(tmp_path: Path) -> N
         names = set(archive.namelist())
     assert {
         "project_knowledge/compatibility_fixtures/graphify_0_9_48.json",
+        "project_knowledge/compatibility_fixtures/graphify_0_9_51.json",
         "project_knowledge/compatibility_fixtures/runtime_probe.py",
         "project_knowledge/resources/skills/using-project-knowledge-graphs/SKILL.md",
         "project_knowledge/resources/skills/using-project-knowledge-graphs/agents/openai.yaml",
@@ -97,9 +98,9 @@ def test_compatibility_workflow_is_read_only_and_digest_pinned() -> None:
 
     assert "contents: read" in text
     assert "pull-requests: write" not in text
-    assert "actions/checkout@11d5960a326750d5838078e36cf38b85af677262" in text
-    assert "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065" in text
-    assert "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02" in text
+    assert "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1" in text
+    assert "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97" in text
+    assert "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a" in text
     assert "uv==0.8.14" in text
     assert "project_knowledge.compat_probe" in text
     assert "pull_request_target" not in text
@@ -121,6 +122,7 @@ def test_compatibility_workflow_separates_supported_and_scheduled_checks() -> No
     assert "retention-days: 14" in text
     assert "tests/test_compatibility.py" in text
     assert "tests/test_graphify_0_9_48_adapter.py" in text
+    assert "tests/test_graphify_0_9_51_adapter.py" in text
     assert "0.9.48" not in text
 
 
@@ -148,7 +150,7 @@ def test_primary_ci_resolves_graphify_from_registry_and_keeps_adoption_gates() -
     assert "production_graphify_compatibility as p" in text
     assert 'uv tool install "graphifyy==$GRAPHIFY_VERSION"' in text
     assert "graphifyy==0.9.48" not in text
-    assert "tests/test_compatibility.py tests/test_graphify_0_9_48_adapter.py tests/test_evidence.py" in text
+    assert "tests/test_compatibility.py tests/test_graphify_0_9_48_adapter.py tests/test_graphify_0_9_51_adapter.py tests/test_evidence.py" in text
     assert "tests/test_real_graphify_pipeline.py tests/test_cli_adoption.py tests/test_queries.py" in text
     assert "tests/test_bundles_pack.py tests/test_bundles_parse.py tests/test_agent_install.py tests/test_fleet.py tests/test_workflows.py" in text
 
@@ -158,6 +160,7 @@ def test_dogfood_and_example_manifests_are_v2_and_optional_by_default() -> None:
 
     dogfood = load_manifest(ROOT / ".graphify-project.yaml", ROOT)
     assert dogfood.schema_version == 2
+    assert dogfood.graphify_version == "0.9.51"
     assert dogfood.project_uid is not None
     assert dogfood.features.atlas == "disabled"
     assert dogfood.features.registry == "disabled"
@@ -177,6 +180,7 @@ def test_dogfood_and_example_manifests_are_v2_and_optional_by_default() -> None:
         ROOT / "examples/.graphify-project.yaml", ROOT / "examples"
     )
     assert example.schema_version == 2
+    assert example.graphify_version == "0.9.51"
     assert example.project_uid is not None
     assert example.features.atlas == "disabled"
     assert example.features.registry == "disabled"

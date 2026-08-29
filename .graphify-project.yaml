@@ -10,10 +10,12 @@ obsidian_namespace: "Projects/atlasweaver/Generated"
 excludes:
   - "tests/test_secrets_scan.py"
   - "src/project_knowledge/compatibility_fixtures/graphify_0_9_48.json"
+  - "src/project_knowledge/compatibility_fixtures/graphify_0_9_51.json"
   - "src/project_knowledge/resources/skills"
   - "tests/fixtures/graphify/0.9.48/source/.atlasweaver-fixture-source.json"
+  - "tests/fixtures/graphify/0.9.51/source/.atlasweaver-fixture-source.json"
 track_html: false
-graphify_version: "0.9.48"
+graphify_version: "0.9.51"
 features:
   atlas: disabled
   registry: disabled

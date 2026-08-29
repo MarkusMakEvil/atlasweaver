@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from hashlib import sha256
 import json
+import os
 from pathlib import Path
 from subprocess import CompletedProcess
 
@@ -292,3 +293,49 @@ def test_capture_and_query_registry_use_only_validated_snapshot_bytes(
     assert snapshot.entries[0].project_uid == DEMO_UID
     assert envelope.command == "query"
     assert envelope.trust == "navigation"
+
+
+def test_registry_sync_accepts_bounded_runtime_query_stamp(tmp_path: Path) -> None:
+    repo, selected, executable = owned_registry_repository(tmp_path)
+    cache = repo / "graphify-out/cache"
+    cache.mkdir()
+    (cache / "last_query_stamp").write_text("runtime only\n", encoding="utf-8")
+
+    result = registry_sync(
+        repo,
+        selected,
+        user_root=tmp_path / "user",
+        runner=GlobalFixtureRunner(),
+        graphify_binary=executable,
+    )
+
+    assert result.status == "synced"
+
+
+@pytest.mark.parametrize("invalid", ["unknown", "stamp-symlink", "cache-symlink"])
+def test_registry_sync_rejects_unbounded_runtime_query_cache(
+    tmp_path: Path, invalid: str,
+) -> None:
+    repo, selected, executable = owned_registry_repository(tmp_path)
+    cache = repo / "graphify-out/cache"
+    outside = tmp_path / "outside"
+    outside.write_text("untrusted\n", encoding="utf-8")
+    if invalid == "cache-symlink":
+        os.symlink(outside, cache)
+    else:
+        cache.mkdir()
+        if invalid == "stamp-symlink":
+            os.symlink(outside, cache / "last_query_stamp")
+        else:
+            (cache / "unknown").write_text("untrusted\n", encoding="utf-8")
+
+    with pytest.raises(RegistryError) as raised:
+        registry_sync(
+            repo,
+            selected,
+            user_root=tmp_path / "user",
+            runner=GlobalFixtureRunner(),
+            graphify_binary=executable,
+        )
+
+    assert raised.value.code == "registry_source_changed"

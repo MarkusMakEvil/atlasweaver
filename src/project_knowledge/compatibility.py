@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 from pathlib import Path, PurePosixPath
@@ -11,8 +11,6 @@ import re
 from types import MappingProxyType
 from typing import Literal
 from uuid import UUID
-
-from .secrets_scan import has_secret_shape
 
 
 class CompatibilityError(ValueError):
@@ -166,6 +164,7 @@ _GRAPHIFY_0_9_48_SOURCE_SUFFIXES = frozenset({
 # Reviewed separately from the packaged fixture. Updated only after deterministic
 # fixture capture and an explicit byte-for-byte comparison of two independent runs.
 _GRAPHIFY_0_9_48_FIXTURE_SHA256 = "8b02c146e5c352adbbcefbda8496e0c5effa85d6353d073073a5fb56f7bf0c28"
+_GRAPHIFY_0_9_51_FIXTURE_SHA256 = "31769f6a5b467720112de5d20e8b251923acd12f1fd537544ac22dc2c4f8036d"
 
 _GRAPHIFY_0_9_48 = GraphifyCompatibility(
     version="0.9.48",
@@ -219,10 +218,21 @@ _GRAPHIFY_0_9_48 = GraphifyCompatibility(
     }),
     lineage_reason_codes=frozenset(),
     structured_query_commands=frozenset(),
+    production=False,
+)
+
+_GRAPHIFY_0_9_51 = replace(
+    _GRAPHIFY_0_9_48,
+    version="0.9.51",
+    adapter_id="graphify-0.9.51",
+    fixture_resource="graphify_0_9_51.json",
+    compatibility_fixture_digest=_GRAPHIFY_0_9_51_FIXTURE_SHA256,
     production=True,
 )
 
-_REGISTRY: Mapping[str, GraphifyCompatibility] = MappingProxyType({"0.9.48": _GRAPHIFY_0_9_48})
+_REGISTRY: Mapping[str, GraphifyCompatibility] = MappingProxyType(
+    {"0.9.48": _GRAPHIFY_0_9_48, "0.9.51": _GRAPHIFY_0_9_51}
+)
 
 
 def _validate_registry() -> None:
@@ -297,6 +307,8 @@ def _require_backend_and_model(
 
 def validate_public_model_identifier(model: object) -> str:
     """Validate the public, non-secret model identifier used in argv/evidence."""
+    from .secrets_scan import has_secret_shape
+
     if type(model) is not str or not 1 <= len(model) <= 128:
         raise CompatibilityError("semantic_model_required")
     try:

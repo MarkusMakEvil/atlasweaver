@@ -30,7 +30,7 @@ from .staging import inspect_projection, iter_safe_files
 CoreStatus = Literal["error", "missing", "stale", "partial", "healthy"]
 HealthStatus = CoreStatus
 FeatureStatus = Literal[
-    "disabled", "available", "unavailable", "misconfigured"
+    "disabled", "configured", "available", "unavailable", "misconfigured"
 ]
 _STABLE_ERROR_CODES = frozenset(
     {"source_inspection_failed", "registry_inspection_failed", "inspection_failed"}
@@ -53,6 +53,7 @@ class FeatureHealth:
     def __post_init__(self) -> None:
         if self.status not in {
             "disabled",
+            "configured",
             "available",
             "unavailable",
             "misconfigured",
@@ -133,7 +134,7 @@ class KnowledgeHealth:
     trust: TrustHealth
     issues: tuple[str, ...]
     warnings: tuple[str, ...]
-    schema_version: int = 2
+    schema_version: int = 3
 
     @property
     def status(self) -> CoreStatus:
@@ -153,7 +154,7 @@ class KnowledgeHealth:
 
     def to_dict(self) -> dict[str, object]:
         return {
-            "schema_version": 2,
+            "schema_version": 3,
             "core_status": self.core_status,
             "status": self.core_status,
             "project_id": self.project_id,
@@ -476,11 +477,12 @@ def _feature_health(
             registry_matches,
             "registry_mismatch",
         ),
-        "artifacts": optional(
-            artifacts,
-            artifact_enabled,
-            None,
-            "artifact_provider_invalid",
+        "artifacts": (
+            artifacts
+            if artifacts is not None
+            else FeatureHealth("configured")
+            if artifact_enabled
+            else FeatureHealth("disabled")
         ),
     }
 

@@ -26,18 +26,26 @@ or treat inferred graph relationships as proof.
 
 - Python 3.10+
 - [uv](https://docs.astral.sh/uv/)
-- `graphifyy==0.9.48`
+- `graphifyy==0.9.51`
 - Obsidian is optional
 
 ## Install
 
+Install the reviewed release stack as one uv tool. This exposes
+`project-knowledge`, `graphify`, and `graphify-mcp` from the same environment:
+
 ```sh
-uv tool install 'git+https://github.com/MarkusMakEvil/atlasweaver.git@v0.3.4'
-uv tool install 'graphifyy==0.9.48'
-graphify install --platform codex
-git clone --depth 1 --branch v0.3.4 https://github.com/MarkusMakEvil/atlasweaver.git
+uv tool install --force --with-executables-from 'graphifyy==0.9.51' 'https://github.com/MarkusMakEvil/atlasweaver/releases/download/v0.3.5/atlasweaver-0.3.5-py3-none-any.whl'
+project-knowledge install-agent --platform codex --json
+```
+
+For a reviewed source checkout instead:
+
+```sh
+git clone --depth 1 --branch v0.3.5 https://github.com/MarkusMakEvil/atlasweaver.git
 cd atlasweaver
-scripts/install-project-knowledge-skill --codex-home "${CODEX_HOME:-$HOME/.codex}"
+python3 scripts/install-project-knowledge-tool
+project-knowledge install-agent --platform codex --json
 ```
 
 ## Add a project
@@ -183,18 +191,19 @@ into a live vault.
 ## Graphify compatibility and evidence
 
 The compatibility registry is the sole authority for supported Graphify
-versions. For Graphify 0.9.48 AtlasWeaver runs the reviewed official sequence:
-code-only `extract --no-cluster`, `diagnose multigraph --undirected --json`,
-then normalized `cluster-only --no-label --no-viz` when HTML is disabled.
-The resulting schema-2 graph is bound to `GRAPH_EVIDENCE.json`, its extraction
+versions. AtlasWeaver supports reviewed 0.9.48 manifests and uses 0.9.51 for
+new projects. Both run the reviewed official sequence: code-only
+`extract --no-cluster`, `diagnose multigraph --undirected --json`, then
+normalized `cluster-only --no-label --no-viz` when HTML is disabled. The
+resulting schema-2 graph is bound to `GRAPH_EVIDENCE.json`, its extraction
 invocation, source and projection digests, and the ownership record.
 
-Graphify 0.9.48 remains navigation-only because its post-dedup artifact cannot
-prove complete pre-dedup occurrence lineage. A new production adapter therefore
-requires sanitized official fixtures, an explicit complete-lineage capability,
-a reviewed fixture digest, compatibility tests, and reviewed adapter code.
-Scheduled upstream-probe reports are advisory and never declare a version
-supported; support changes only through the reviewed registry.
+Graphify 0.9.51 remains navigation-only because its post-dedup artifact cannot
+prove complete pre-dedup occurrence lineage. A future trusted-impact adapter
+therefore requires sanitized official fixtures, an explicit complete-lineage
+capability, a reviewed fixture digest, compatibility tests, and reviewed
+adapter code. Scheduled upstream-probe reports are advisory and never declare
+a version supported; support changes only through the reviewed registry.
 
 ## Health and trust
 
@@ -207,13 +216,15 @@ project-knowledge health --repo /path/to/project --json
   successful promotion followed by immediate drift exits with status 3.
 - `atlas_available:false` means strict generated-namespace ownership failed.
 - `registry_matches:false` means the global graph copy differs.
+- `features.artifacts.status:configured` means a remote provider passed strict
+  configuration validation; it does not claim that a network pull was attempted.
 - `partial` can be an honest accepted state when approved files are bound into
   the source digest but unsupported by the pinned extractor.
 - `impact_analysis_trusted:false` or `graph_integrity_degraded` means the graph
   is suitable for navigation only; impact conclusions require source
   verification.
 
-Graphify 0.9.48 does not persist enough pre-build evidence to prove that no
+Graphify 0.9.51 does not persist enough pre-build evidence to prove that no
 same-endpoint edges collapsed. AtlasWeaver therefore records unknown collapsed
 edge evidence and keeps impact analysis untrusted while still rejecting final
 graphs with missing or dangling endpoints.

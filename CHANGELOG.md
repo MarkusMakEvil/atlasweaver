@@ -2,6 +2,29 @@
 
 All notable changes to AtlasWeaver are documented here.
 
+## 0.3.5 - 2026-08-29
+
+- Added a fixture-bound Graphify 0.9.51 production adapter while retaining exact
+  0.9.48 support for existing manifests; both remain navigation-only.
+- Fixed the scheduled compatibility probe module entrypoint so helper functions
+  are defined before its exact `python -m` invocation executes.
+- Kept managed graphs valid when Graphify writes its exact bounded runtime
+  query stamp while continuing to reject every unknown output entry; cache
+  validation is descriptor-bound against concurrent symlink substitution.
+- Allowed a fully validated owned generation to migrate between declared,
+  supported Graphify contracts while keeping ordinary ownership validation
+  pinned to the current manifest.
+- Made projection identity stable across local bytecode, virtual environments,
+  dependency trees, and build outputs without removing them from privacy audit
+  decisions.
+- Reported valid remote artifact providers as configured rather than falsely
+  invalid when no network verification was requested, with health payloads
+  versioned as schema 3 for the new closed status value.
+- Preserved the documented query error across descriptor-bound snapshot
+  failures instead of leaking a frozen-dataclass traceback error.
+- Updated every workflow action to a reviewed immutable Node 24 release and
+  added a one-command AtlasWeaver/Graphify runtime installer.
+
 ## 0.3.4 - 2026-08-27
 
 - Isolated GitHub CLI capability probes as well as attestation verification,

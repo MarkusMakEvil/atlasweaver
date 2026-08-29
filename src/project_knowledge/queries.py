@@ -77,7 +77,7 @@ DOCUMENTED_QUERY_ERROR_CODES = frozenset({
 })
 
 
-@dataclass(frozen=True)
+@dataclass
 class QueryError(Exception):
     code: str
     message: str
@@ -549,7 +549,10 @@ def _capture_owned_output(
             names = sorted(entry.name for entry in entries)
         for name in names:
             info = os.stat(name, dir_fd=output_fd, follow_symlinks=False)
-            if name == "cache" and stat.S_ISDIR(info.st_mode):
+            if name == "cache":
+                if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                    raise QueryError("query_graph_invalid", "owned graph entry is invalid")
+                _validate_managed_query_cache(output_fd)
                 continue
             if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
                 raise QueryError("query_graph_invalid", "owned graph entry is invalid")
@@ -574,6 +577,34 @@ def _capture_owned_output(
             os.close(directory)
     finally:
         os.close(output_fd)
+
+
+def _validate_managed_query_cache(output_fd: int) -> None:
+    """Check Graphify's query sidecar without copying it into a snapshot."""
+    try:
+        cache_fd = os.open(
+            "cache",
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=output_fd,
+        )
+    except OSError:
+        raise QueryError("query_graph_invalid", "owned graph entry is invalid") from None
+    try:
+        with os.scandir(os.dup(cache_fd)) as entries:
+            names = sorted(entry.name for entry in entries)
+        if names != ["last_query_stamp"]:
+            raise QueryError("query_graph_invalid", "owned graph entry is invalid")
+        info = os.stat(
+            "last_query_stamp",
+            dir_fd=cache_fd,
+            follow_symlinks=False,
+        )
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise QueryError("query_graph_invalid", "owned graph entry is invalid")
+    except OSError:
+        raise QueryError("query_graph_invalid", "owned graph entry is invalid") from None
+    finally:
+        os.close(cache_fd)
 
 
 def _snapshot_from_owned(

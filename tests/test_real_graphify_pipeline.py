@@ -136,6 +136,7 @@ def test_real_graphify_pipeline_builds_navigation_evidence_and_owned_graph(
             "Projects/integration-demo/Generated"
         ),
         track_html=False,
+        graphify_version=contract.version,
     )
     _write(repo / ".graphify-project.yaml", render_manifest_v2(selected))
 

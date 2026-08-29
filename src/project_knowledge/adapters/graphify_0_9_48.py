@@ -58,12 +58,14 @@ class Graphify0948Adapter:
     def parse_post_dedup(self, artifact: CapturedArtifact) -> NativeGraph:
         document = _strict_json_object(artifact.payload, "native graph")
         if set(document) & _WRAPPER_FIELDS or "links" in document:
-            raise AdapterContractError("Graphify 0.9.48 native schema is invalid")
+            raise AdapterContractError(
+                f"Graphify {self.contract.version} native schema is invalid"
+            )
         try:
             fingerprint = _validate_native_document(document)
         except CompatibilityError as error:
             raise AdapterContractError(
-                "Graphify 0.9.48 native schema is invalid"
+                f"Graphify {self.contract.version} native schema is invalid"
             ) from error
         nodes = document["nodes"]
         edges = document["edges"]
@@ -72,10 +74,12 @@ class Graphify0948Adapter:
             or any(not isinstance(node, dict) for node in nodes)
             or any(not isinstance(edge, dict) for edge in edges)
         ):
-            raise AdapterContractError("Graphify 0.9.48 native schema is invalid")
+            raise AdapterContractError(
+                f"Graphify {self.contract.version} native schema is invalid"
+            )
         if fingerprint != self.contract.native_schema_fingerprint:
             raise AdapterContractError(
-                "Graphify 0.9.48 native schema fingerprint is invalid"
+                f"Graphify {self.contract.version} native schema fingerprint is invalid"
             )
         return NativeGraph(
             document=document,
@@ -156,16 +160,18 @@ class Graphify0948Adapter:
         _require_staged_files(staged_files, self.contract)
         document = _strict_json_object(artifact.payload, "clustered graph")
         if "edges" in document or _contains_wrapper_metadata(document):
-            raise AdapterContractError("Graphify 0.9.48 clustered schema is invalid")
+            raise AdapterContractError(
+                f"Graphify {self.contract.version} clustered schema is invalid"
+            )
         try:
             fingerprint = _validate_clustered_document(document)
         except CompatibilityError as error:
             raise AdapterContractError(
-                "Graphify 0.9.48 clustered schema is invalid"
+                f"Graphify {self.contract.version} clustered schema is invalid"
             ) from error
         if fingerprint != self.contract.clustered_schema_fingerprint:
             raise AdapterContractError(
-                "Graphify 0.9.48 clustered schema fingerprint is invalid"
+                f"Graphify {self.contract.version} clustered schema fingerprint is invalid"
             )
 
         nodes = document["nodes"]
@@ -175,7 +181,9 @@ class Graphify0948Adapter:
             or any(not isinstance(node, dict) for node in nodes)
             or any(not isinstance(edge, dict) for edge in edges)
         ):
-            raise AdapterContractError("Graphify 0.9.48 clustered schema is invalid")
+            raise AdapterContractError(
+                f"Graphify {self.contract.version} clustered schema is invalid"
+            )
 
         _remove_empty_path_sentinels(nodes, edges)
         _validate_source_fields(nodes, edges, staged_files)

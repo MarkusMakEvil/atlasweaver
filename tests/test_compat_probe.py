@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 from subprocess import CompletedProcess
+import subprocess
 import sys
 from typing import Any
 
@@ -221,6 +222,86 @@ def test_pypi_fetch_rejects_bounded_protocol_failures(
 def test_pypi_fetch_rejects_non_strict_json(payload: bytes) -> None:
     with pytest.raises(ProbeError, match="pypi_response_invalid"):
         fetch_pypi_document(RecordingFactory(FakeConnection(FakeResponse(payload))))
+
+
+def test_module_entrypoint_defines_helpers_before_running_main(tmp_path: Path) -> None:
+    injector = tmp_path / "injector"
+    injector.mkdir()
+    injector.joinpath("sitecustomize.py").write_text(
+        """\
+import http.client
+
+
+class Response:
+    status = 200
+
+    def __init__(self):
+        self.payload = b'{"releases":{}}'
+        self.offset = 0
+
+    def getheader(self, name, default=None):
+        headers = {
+            "Content-Type": "application/json",
+            "Content-Length": str(len(self.payload)),
+        }
+        return headers.get(name, default)
+
+    def read(self, amount):
+        chunk = self.payload[self.offset:self.offset + amount]
+        self.offset += len(chunk)
+        return chunk
+
+    def close(self):
+        pass
+
+
+class Connection:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def request(self, method, path, *, headers):
+        pass
+
+    def getresponse(self):
+        return Response()
+
+    def close(self):
+        pass
+
+
+http.client.HTTPSConnection = Connection
+""",
+        encoding="utf-8",
+    )
+    output = tmp_path / "report.json"
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = str(injector)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "project_knowledge.compat_probe",
+            "--output",
+            str(output),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=10,
+        env=environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(output.read_text(encoding="utf-8")) == {
+        "candidate_version": None,
+        "executable_version": None,
+        "limitations": ["pypi_no_compatible_release"],
+        "outcome": "inconclusive",
+        "production_version": "0.9.51",
+        "schema_version": 1,
+        "support_declared": False,
+    }
 
 
 CANONICAL_COMMANDS = (

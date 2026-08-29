@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -13,8 +14,15 @@ from project_knowledge.queries import (
     _synthetic_validated,
     affected_nodes,
     explain_node,
+    open_query_snapshot,
     query_nodes,
     shortest_path,
+)
+from project_knowledge.lifecycle import RefreshOptions, refresh_project
+from tests.test_lifecycle import (
+    Official0948FixtureRunner,
+    _fixture_graphify,
+    _source_repository,
 )
 
 
@@ -71,6 +79,57 @@ def snapshot(**changes: object):
         nodes,
         edges,
     )
+
+
+def owned_repository(tmp_path: Path):
+    repo, manifest = _source_repository(tmp_path)
+    executable = _fixture_graphify(tmp_path)
+    refresh_project(
+        repo,
+        manifest,
+        RefreshOptions(None, None, False, True),
+        runner=Official0948FixtureRunner(executable.resolve()),
+        ambient={},
+        graphify_binary=executable,
+    )
+    return repo, manifest
+
+
+def test_query_snapshot_accepts_bounded_runtime_stamp_without_copying_it(
+    tmp_path: Path,
+) -> None:
+    repo, manifest = owned_repository(tmp_path)
+    cache = repo / "graphify-out/cache"
+    cache.mkdir()
+    (cache / "last_query_stamp").write_text("runtime only\n", encoding="utf-8")
+
+    with open_query_snapshot(repo, manifest) as selected:
+        assert selected.nodes
+        assert not (selected.root / "cache").exists()
+
+
+@pytest.mark.parametrize("invalid", ["unknown", "stamp-symlink", "cache-symlink"])
+def test_query_snapshot_rejects_unbounded_runtime_cache(
+    tmp_path: Path, invalid: str,
+) -> None:
+    repo, manifest = owned_repository(tmp_path)
+    cache = repo / "graphify-out/cache"
+    outside = tmp_path / "outside"
+    outside.write_text("untrusted\n", encoding="utf-8")
+    if invalid == "cache-symlink":
+        os.symlink(outside, cache)
+    else:
+        cache.mkdir()
+        if invalid == "stamp-symlink":
+            os.symlink(outside, cache / "last_query_stamp")
+        else:
+            (cache / "unknown").write_text("untrusted\n", encoding="utf-8")
+
+    with pytest.raises(QueryError) as raised:
+        with open_query_snapshot(repo, manifest):
+            pass
+
+    assert raised.value.code == "query_graph_invalid"
 
 
 def test_exact_id_wins_and_duplicate_labels_require_explicit_id() -> None:

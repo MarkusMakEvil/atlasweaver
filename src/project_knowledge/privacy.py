@@ -94,6 +94,25 @@ GLOBAL_DENY_RULES: tuple[tuple[str, str], ...] = (
     ("human_notes", "Projects/*/Notes/**"),
 )
 
+# These globally denied trees are reproducible local/runtime products rather
+# than project or privacy inputs.  Their inventory remains auditable, but only
+# this explicit, closed set is neutral to projection identity.  Unknown and
+# newly added deny rules therefore remain identity-bearing by default.
+IDENTITY_NEUTRAL_DENY_RULE_IDS = frozenset({
+    "virtual_environment",
+    "dependency_tree",
+    "build_output",
+    "bytecode_cache",
+})
+
+
+def decision_affects_projection_identity(decision: PrivacyDecision) -> bool:
+    """Return whether an audited privacy decision belongs in artifact identity."""
+    return not (
+        decision.action == "deny"
+        and decision.rule_id in IDENTITY_NEUTRAL_DENY_RULE_IDS
+    )
+
 
 def classify_path(
     path: PurePosixPath,

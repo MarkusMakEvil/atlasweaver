@@ -300,6 +300,132 @@ def test_owned_schema2_graph_recomputes_every_bound_artifact(tmp_path: Path) -> 
         validate_owned_graph(repo / "graphify-out", selected_manifest)
 
 
+def test_owned_schema2_graph_allows_exact_graphify_runtime_query_cache(
+    tmp_path: Path,
+) -> None:
+    raw, staged_input, selected_manifest, evidence = evidenced_inputs(tmp_path)
+    adapted = adapt_candidate(
+        raw, tmp_path / "adapted-schema2", staged_input, selected_manifest,
+        evidence=evidence,
+    )
+    validated = validate_candidate(
+        adapted.root,
+        staged_input,
+        selected_manifest,
+        expected_projection_digest=evidence.projection_digest,
+        expected_evidence_digest=evidence.digest,
+        build_epoch=7,
+    )
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    promote_with_lifecycle(validated, repo)
+    cache = repo / "graphify-out/cache"
+    cache.mkdir()
+    (cache / "last_query_stamp").write_text("runtime query state\n", encoding="utf-8")
+
+    owned = validate_owned_graph(
+        repo / "graphify-out",
+        selected_manifest,
+        expected_source_digest=evidence.source_digest,
+        expected_projection_digest=evidence.projection_digest,
+    )
+
+    assert owned.generation_digest == validated.generation_digest
+
+
+@pytest.mark.parametrize("entry", ["unexpected", "nested"])
+def test_owned_schema2_graph_rejects_unmanaged_query_cache(
+    tmp_path: Path, entry: str
+) -> None:
+    raw, staged_input, selected_manifest, evidence = evidenced_inputs(tmp_path)
+    adapted = adapt_candidate(
+        raw, tmp_path / "adapted-schema2", staged_input, selected_manifest,
+        evidence=evidence,
+    )
+    validated = validate_candidate(
+        adapted.root,
+        staged_input,
+        selected_manifest,
+        expected_projection_digest=evidence.projection_digest,
+        expected_evidence_digest=evidence.digest,
+        build_epoch=7,
+    )
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    promote_with_lifecycle(validated, repo)
+    cache = repo / "graphify-out/cache"
+    cache.mkdir()
+    if entry == "nested":
+        (cache / entry).mkdir()
+    else:
+        (cache / entry).write_text("untrusted\n", encoding="utf-8")
+
+    with pytest.raises(ArtifactValidationError, match="managed graph query cache"):
+        validate_owned_graph(repo / "graphify-out", selected_manifest)
+
+
+def test_owned_schema2_graph_rejects_query_cache_swapped_to_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw, staged_input, selected_manifest, evidence = evidenced_inputs(tmp_path)
+    adapted = adapt_candidate(
+        raw, tmp_path / "adapted-schema2", staged_input, selected_manifest,
+        evidence=evidence,
+    )
+    validated = validate_candidate(
+        adapted.root,
+        staged_input,
+        selected_manifest,
+        expected_projection_digest=evidence.projection_digest,
+        expected_evidence_digest=evidence.digest,
+        build_epoch=7,
+    )
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    promote_with_lifecycle(validated, repo)
+    cache = repo / "graphify-out/cache"
+    cache.mkdir()
+    (cache / "last_query_stamp").write_text("local\n", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "last_query_stamp").write_text("outside\n", encoding="utf-8")
+    original_stat = Path.stat
+    original_open = os.open
+    calls = 0
+
+    def swap_after_stat(path: Path, *args: object, **kwargs: object):
+        nonlocal calls
+        if path == cache:
+            if calls:
+                cache.unlink()
+                cache.mkdir()
+                (cache / "last_query_stamp").write_text(
+                    "local\n", encoding="utf-8"
+                )
+            info = original_stat(path, *args, **kwargs)
+            shutil.rmtree(cache)
+            os.symlink(outside, cache)
+            calls += 1
+            return info
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", swap_after_stat)
+
+    def swap_before_descriptor_open(
+        path: object, flags: int, *args: object, **kwargs: object
+    ) -> int:
+        if path == "cache" and kwargs.get("dir_fd") is not None:
+            if not cache.is_symlink():
+                shutil.rmtree(cache)
+                os.symlink(outside, cache)
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", swap_before_descriptor_open)
+
+    with pytest.raises(ArtifactValidationError, match="managed graph query cache"):
+        validate_owned_graph(repo / "graphify-out", selected_manifest)
+
+
 def test_valid_candidate_is_bound_to_project_version_and_staged_source(
     candidate: Path, staged: StagedInput, manifest: ProjectManifest
 ) -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path, PurePosixPath
 
 import pytest
@@ -125,6 +126,59 @@ def test_projection_binds_ignore_policy_but_not_denied_payload(
     third = inspect_projection(repo, manifest_v2())
     assert third.source_digest == second.source_digest
     assert third.projection_digest != second.projection_digest
+
+
+@pytest.mark.parametrize(("relative", "rule_id"), [
+    ("src/__pycache__/app.cpython-313.pyc", "bytecode_cache"),
+    ("src/.venv/lib/site.py", "virtual_environment"),
+    ("src/node_modules/tool/index.js", "dependency_tree"),
+    ("src/dist/app.js", "build_output"),
+])
+def test_ambient_generated_denies_are_audited_without_changing_projection_identity(
+    tmp_path: Path, relative: str, rule_id: str,
+) -> None:
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "src/app.py").write_text("safe\n", encoding="utf-8")
+    before = inspect_projection(repo, manifest_v2())
+
+    denied = repo / relative
+    denied.parent.mkdir(parents=True, exist_ok=True)
+    denied.write_text("generated locally\n", encoding="utf-8")
+    after = inspect_projection(repo, manifest_v2())
+
+    assert after.source_digest == before.source_digest
+    assert after.projection_digest == before.projection_digest
+    assert after.decisions != before.decisions
+    assert (f"deny:{rule_id}", 1) in after.reason_counts
+
+
+@pytest.mark.parametrize(("relative", "rule_id", "project_excludes"), [
+    ("src/private/note.md", "private_content", ()),
+    ("src/auth-token.yaml", "sensitive_data_name", ()),
+    ("src/runtime/job.json", "runtime_state", ()),
+    ("src/generated/result.md", "project_exclude", ("src/generated/**",)),
+])
+def test_security_and_project_denies_remain_projection_identity_bearing(
+    tmp_path: Path,
+    relative: str,
+    rule_id: str,
+    project_excludes: tuple[str, ...],
+) -> None:
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "src/app.py").write_text("safe\n", encoding="utf-8")
+    manifest = replace(manifest_v2(), excludes=project_excludes)
+    before = inspect_projection(repo, manifest)
+
+    denied = repo / relative
+    denied.parent.mkdir(parents=True, exist_ok=True)
+    denied.write_text("denied material\n", encoding="utf-8")
+    after = inspect_projection(repo, manifest)
+
+    assert after.source_digest == before.source_digest
+    assert after.projection_digest != before.projection_digest
+    assert (f"deny:{rule_id}", 1) in after.reason_counts
 
 
 def test_projection_and_stage_stay_on_open_root_after_path_swap(

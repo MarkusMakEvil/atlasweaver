@@ -7,6 +7,8 @@ from pathlib import Path
 import subprocess
 import sys
 
+from project_knowledge.compatibility import production_graphify_compatibility
+
 
 ROOT = Path(__file__).resolve().parents[1]
 CANONICAL = ROOT / "skills/using-project-knowledge-graphs"
@@ -67,7 +69,7 @@ with Path({str(calls)!r}).open("a", encoding="utf-8") as stream:
     stream.write(json.dumps(call) + "\\n")
 arguments = sys.argv[1:]
 if arguments == ["--version"]:
-    print("graphify 0.9.48")
+    print("graphify {production_graphify_compatibility().version}")
 elif arguments == ["--help"]:
     print("Usage: graphify <command>\\n\\nCommands:\\n  extract <path>\\n  diagnose multigraph\\n  cluster-only <path>\\n  query <question>\\n  explain <node>\\n  path <source> <target>\\n  global add <graph>\\n  export callflow-html\\n  install --platform codex")
 elif arguments and arguments[0] == "extract":

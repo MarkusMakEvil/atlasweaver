@@ -21,6 +21,20 @@ PINNED_REUSABLE_WORKFLOW = re.compile(
     r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/\.github/workflows/"
     r"[A-Za-z0-9_.-]+\.ya?ml@[0-9a-f]{40}$"
 )
+NODE24_ACTION_PINS = {
+    "actions/attest-build-provenance": (
+        "4d101475d8b20a2381f78447822ac1eab6504dd8"
+    ),
+    "actions/checkout": "3d3c42e5aac5ba805825da76410c181273ba90b1",
+    "actions/download-artifact": (
+        "3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
+    ),
+    "actions/setup-python": "5fda3b95a4ea91299a34e894583c3862153e4b97",
+    "actions/upload-artifact": (
+        "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
+    ),
+    "astral-sh/setup-uv": "20cfd1bf945f4377ade1205e4dbc17946fc9a30d",
+}
 
 
 class WorkflowLoader(yaml.SafeLoader):
@@ -112,6 +126,21 @@ def test_every_external_action_reference_is_a_full_commit_sha() -> None:
                 PINNED_ACTION.fullmatch(uses)
                 or PINNED_REUSABLE_WORKFLOW.fullmatch(uses)
             ), (path, uses)
+
+
+def test_every_runtime_action_is_pinned_to_reviewed_node24_release() -> None:
+    observed: dict[str, set[str]] = {}
+    for path in WORKFLOWS.glob("*.yml"):
+        for uses in action_uses(load_workflow(path.name)):
+            match = re.fullmatch(
+                r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)@([0-9a-f]{40})", uses
+            )
+            if match is not None:
+                observed.setdefault(match.group(1), set()).add(match.group(2))
+
+    assert observed == {
+        action: {digest} for action, digest in NODE24_ACTION_PINS.items()
+    }
 
 
 def test_ci_fetches_history_and_derives_graphify_version_from_registry() -> None:

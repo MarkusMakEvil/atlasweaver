@@ -15,8 +15,22 @@ def main() -> int:
     if uv is None:
         print("install-project-knowledge-tool: uv is required", file=sys.stderr)
         return 1
+    sys.path.insert(0, str(root / "src"))
+    from project_knowledge.compatibility import production_graphify_compatibility
+
+    graphify_requirement = (
+        f"graphifyy=={production_graphify_compatibility().version}"
+    )
     result = subprocess.run(
-        [uv, "tool", "install", "--force", str(root)],
+        [
+            uv,
+            "tool",
+            "install",
+            "--force",
+            "--with-executables-from",
+            graphify_requirement,
+            str(root),
+        ],
         env=os.environ.copy(),
         check=False,
     )

@@ -74,6 +74,7 @@ def _run_capture_tool(
             "--binary", str(launcher),
             "--source", str(source),
             "--output", str(output),
+            "--expected-version", "0.9.48",
         ],
         text=True,
         capture_output=True,
@@ -157,28 +158,49 @@ else:
 
 
 def test_registry_resolves_only_exact_declared_versions() -> None:
-    contract = resolve_graphify_compatibility("0.9.48")
-    assert contract.adapter_id == "graphify-0.9.48"
+    legacy = resolve_graphify_compatibility("0.9.48")
+    contract = resolve_graphify_compatibility("0.9.51")
+    assert legacy.adapter_id == "graphify-0.9.48"
+    assert legacy.production is False
+    assert contract.adapter_id == "graphify-0.9.51"
     assert contract.production is True
-    assert contract.evidence == EvidenceCapabilities(True, False, False)
-    assert contract.structured_query_commands == frozenset()
-    assert contract.required_cli_commands == frozenset({
-        "extract", "diagnose", "cluster-only", "query", "explain", "path",
-        "global", "export", "install",
-    })
-    assert contract.agent_installs == (
+    assert legacy.evidence == contract.evidence == EvidenceCapabilities(
+        True, False, False
+    )
+    assert (
+        legacy.structured_query_commands
+        == contract.structured_query_commands
+        == frozenset()
+    )
+    assert legacy.required_cli_commands == contract.required_cli_commands == frozenset(
+        {
+            "extract", "diagnose", "cluster-only", "query", "explain", "path",
+            "global", "export", "install",
+        }
+    )
+    assert legacy.agent_installs == contract.agent_installs == (
         AgentInstallContract("codex", PurePosixPath(".codex/skills/graphify/SKILL.md")),
         AgentInstallContract("agents", PurePosixPath(".agents/skills/graphify/SKILL.md")),
     )
-    assert contract.coverage_reason_codes == frozenset({"not_represented_by_graphify"})
-    assert contract.normalization_reason_codes == frozenset({
-        "unique_exact_node_alias", "missing_endpoint", "ambiguous_endpoint_alias",
-        "dangling_endpoint",
-    })
-    assert contract.lineage_reason_codes == frozenset()
-    assert supported_graphify_versions() == ("0.9.48",)
+    assert (
+        legacy.coverage_reason_codes
+        == contract.coverage_reason_codes
+        == frozenset({"not_represented_by_graphify"})
+    )
+    assert (
+        legacy.normalization_reason_codes
+        == contract.normalization_reason_codes
+        == frozenset(
+            {
+                "unique_exact_node_alias", "missing_endpoint",
+                "ambiguous_endpoint_alias", "dangling_endpoint",
+            }
+        )
+    )
+    assert legacy.lineage_reason_codes == contract.lineage_reason_codes == frozenset()
+    assert supported_graphify_versions() == ("0.9.48", "0.9.51")
     assert production_graphify_compatibility() is contract
-    for invalid in ("0.9.49", ">=0.9.48", "0.9.48rc1", "latest", ""):
+    for invalid in ("0.9.49", "0.9.50", ">=0.9.48", "0.9.51rc1", "latest", ""):
         with pytest.raises(CompatibilityError, match="unsupported Graphify version"):
             resolve_graphify_compatibility(invalid)
 
@@ -370,6 +392,7 @@ def test_capture_tool_strips_ambient_secrets_and_writes_only_sanitized_output(
             "--binary", str(launcher),
             "--source", str(source),
             "--output", str(output),
+            "--expected-version", "0.9.48",
         ],
         text=True,
         capture_output=True,

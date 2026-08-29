@@ -887,6 +887,7 @@ def _current_owned_generation(
         expected_source_digest=staged.source_digest,
         expected_projection_digest=staged.projection_digest,
         repository_access=repository_access,
+        allow_compatible_configuration=True,
     )
     if owned.artifact_schema_version != 2:
         return None

@@ -9,6 +9,7 @@ import pytest
 from project_knowledge.doctor import doctor_project
 from project_knowledge.locking import TransactionLockError, open_repository_access
 from project_knowledge.manifest import ManifestError
+from project_knowledge.models import ArtifactIntent
 from tests.support import manifest_v2, write_manifest_v2
 from tests.test_graphify_adapter import ProbeRunner, _REQUIRED_HELP
 
@@ -74,6 +75,40 @@ def test_doctor_is_repository_read_only_path_free_and_versioned(
     assert str(repo) not in json.dumps(document)
     assert _tree_snapshot(repo) == before
     assert not (repo / ".project-knowledge").exists()
+
+
+def test_doctor_reports_valid_artifact_provider_as_configured(
+    tmp_path: Path,
+) -> None:
+    artifacts = ArtifactIntent(
+        provider="github-release",
+        host="github.com",
+        repository="acme/widgets",
+        repository_id=123456789,
+        channel="main",
+        source_ref="refs/heads/main",
+        signer_workflow="acme/widgets/.github/workflows/release.yml",
+        signer_digest="a" * 40,
+    )
+    repo = _configured_repository(tmp_path / "repo")
+    write_manifest_v2(repo, artifacts=artifacts)
+    executable = _graphify_fixture(tmp_path)
+
+    result = doctor_project(
+        repo,
+        graphify_binary=executable,
+        runner=_capability_runner(executable),
+        package_version="test",
+    ).to_dict()
+
+    assert result["health"]["features"]["artifacts"] == {
+        "status": "configured",
+        "issues": [],
+    }
+    assert "artifact_provider_invalid" not in result["health"]["warnings"]
+    assert "artifact_provider_invalid" not in [
+        item["code"] for item in result["diagnostics"]
+    ]
 
 
 def test_doctor_reports_recovery_required_without_touching_corrupt_journal(
